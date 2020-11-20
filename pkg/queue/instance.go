@@ -115,6 +115,7 @@ func (q *queueImpl) Run(stop <-chan struct{}) {
 
 		if err := task(); err != nil {
 			log.Infof("Work item handle failed (%v), retry after delay %v", err, q.delay)
+			// 如果执行失败在放到队列中继续消费
 			time.AfterFunc(q.delay, func() {
 				q.Push(task)
 			})

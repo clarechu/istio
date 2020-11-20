@@ -224,6 +224,7 @@ func verifyPostInstall(enableVerbose bool, istioNamespaceFlag string,
 	return crdCount, istioDeploymentCount, nil
 }
 
+// todo clare 用于验证的安装的命令
 // NewVerifyCommand creates a new command for verifying Istio Installation Status
 func NewVerifyCommand() *cobra.Command {
 	var (

@@ -217,7 +217,7 @@ func NewServer(args *PilotArgs) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	//初始化 initControllers
 	if err := s.initControllers(args); err != nil {
 		return nil, err
 	}

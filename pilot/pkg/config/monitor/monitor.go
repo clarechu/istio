@@ -55,7 +55,7 @@ func NewMonitor(name string, delegateStore model.ConfigStore, getSnapshotFunc fu
 
 const watchDebounceDelay = 50 * time.Millisecond
 
-// Trigger notifications when a file is mutated
+//fileTrigger Trigger notifications when a file is mutated
 func fileTrigger(path string, ch chan struct{}, stop <-chan struct{}) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {

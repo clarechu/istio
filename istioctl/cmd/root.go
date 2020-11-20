@@ -236,6 +236,7 @@ debug and diagnose their Istio mesh.
 	rootCmd.AddCommand(manifestCmd)
 	operatorCmd := mesh.OperatorCmd()
 	rootCmd.AddCommand(operatorCmd)
+	//todo clare 安装集群 在这个地方
 	installCmd := mesh.InstallCmd(loggingOptions)
 	hideInheritedFlags(installCmd, "namespace", "istioNamespace")
 	rootCmd.AddCommand(installCmd)

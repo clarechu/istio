@@ -65,6 +65,7 @@ const (
 	requiredMCPCertCheckFreq = 500 * time.Millisecond
 )
 
+//Overview
 // initConfigController creates the config controller in the pilotConfig.
 func (s *Server) initConfigController(args *PilotArgs) error {
 	meshConfig := s.environment.Mesh()

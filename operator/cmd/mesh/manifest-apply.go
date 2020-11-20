@@ -62,6 +62,7 @@ type installArgs struct {
 	revision string
 }
 
+// todo clare 安装集群的时候适用的东西
 func addInstallFlags(cmd *cobra.Command, args *installArgs) {
 	cmd.PersistentFlags().StringSliceVarP(&args.inFilenames, "filename", "f", nil, filenameFlagHelpStr)
 	cmd.PersistentFlags().StringVarP(&args.kubeConfigPath, "kubeconfig", "c", "", "Path to kube config.")
@@ -76,6 +77,7 @@ func addInstallFlags(cmd *cobra.Command, args *installArgs) {
 	cmd.PersistentFlags().StringVarP(&args.revision, "revision", "r", "", revisionFlagHelpStr)
 }
 
+//安装集群 生成Istio安装清单并将其应用于群集
 // InstallCmd generates an Istio install manifest and applies it to a cluster
 func InstallCmd(logOpts *log.Options) *cobra.Command {
 	rootArgs := &rootArgs{}
@@ -108,6 +110,7 @@ func InstallCmd(logOpts *log.Options) *cobra.Command {
 	return ic
 }
 
+//todo clare 安装
 func runApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *installArgs, logOpts *log.Options) error {
 	l := clog.NewConsoleLogger(cmd.OutOrStdout(), cmd.ErrOrStderr(), installerScope)
 	// Warn users if they use `istioctl install` without any config args.
@@ -134,7 +137,7 @@ func runApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *installArgs, log
 //  dryRun  all operations are done but nothing is written
 func InstallManifests(setOverlay []string, inFilenames []string, force bool, dryRun bool,
 	kubeConfigPath string, context string, waitTimeout time.Duration, l clog.Logger) error {
-
+	//todo 开始安装
 	restConfig, clientset, client, err := K8sConfig(kubeConfigPath, context)
 	if err != nil {
 		return err

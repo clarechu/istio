@@ -130,6 +130,7 @@ func (d discoveryServerV2Adapter) DeltaAggregatedResources(server discoveryv2.Ag
 	return status.Errorf(codes.Unimplemented, "not implemented")
 }
 
+// 在这个地方下发策略
 func (s *DiscoveryServer) createV2Adapter() discoveryv2.AggregatedDiscoveryServiceServer {
 	return &discoveryServerV2Adapter{s}
 }

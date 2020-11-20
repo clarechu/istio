@@ -20,6 +20,7 @@ import (
 	"istio.io/pkg/log"
 )
 
+// 多集群的安装
 // initClusterRegistries starts the secret controller to watch for remote
 // clusters and initialize the multicluster structures.
 func (s *Server) initClusterRegistries(args *PilotArgs) (err error) {
