@@ -77,6 +77,17 @@ var defaultOptions = &Options{
 }
 
 // NewHelmReconciler creates a HelmReconciler and returns a ptr to it
+// 初始化 HelmReconciler ---->
+/*
+	return &HelmReconciler{
+		client:           client,
+		restConfig:       restConfig,
+		clientSet:        cs,
+		iop:              iop,
+		opts:             opts,
+		dependencyWaitCh: initDependencies(),
+	}, nil
+*/
 func NewHelmReconciler(client client.Client, restConfig *rest.Config, iop *valuesv1alpha1.IstioOperator, opts *Options) (*HelmReconciler, error) {
 	if opts == nil {
 		opts = defaultOptions
@@ -149,6 +160,9 @@ func (h *HelmReconciler) Reconcile() (*v1alpha1.InstallStatus, error) {
 
 // processRecursive processes the given manifests in an order of dependencies defined in h. Dependencies are a tree,
 // where a child must wait for the parent to complete before starting.
+// Reconciler 协调器
+//processRecursive按h中定义的依赖项顺序处理给定的清单。依赖项是一个树，
+//其中子项必须等待父项完成后才能开始。
 func (h *HelmReconciler) processRecursive(manifests name.ManifestMap) *v1alpha1.InstallStatus {
 	componentStatus := make(map[string]*v1alpha1.InstallStatus_VersionStatus)
 

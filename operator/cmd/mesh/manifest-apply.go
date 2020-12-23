@@ -64,9 +64,11 @@ type installArgs struct {
 
 // todo clare 安装集群的时候适用的东西
 func addInstallFlags(cmd *cobra.Command, args *installArgs) {
+	// 可以多次将包含此自定义资源的文件的ISTIERATH标志指定为多个。多个文件按从左到右的顺序覆盖。
 	cmd.PersistentFlags().StringSliceVarP(&args.inFilenames, "filename", "f", nil, filenameFlagHelpStr)
 	cmd.PersistentFlags().StringVarP(&args.kubeConfigPath, "kubeconfig", "c", "", "Path to kube config.")
 	cmd.PersistentFlags().StringVar(&args.context, "context", "", "The name of the kubeconfig context to use.")
+	//等待每个组件中的Istio资源准备就绪的最长时间。
 	cmd.PersistentFlags().DurationVar(&args.readinessTimeout, "readiness-timeout", 300*time.Second,
 		"Maximum time to wait for Istio resources in each component to be ready.")
 	cmd.PersistentFlags().BoolVarP(&args.skipConfirmation, "skip-confirmation", "y", false, skipConfirmationFlagHelpStr)
@@ -114,6 +116,7 @@ func InstallCmd(logOpts *log.Options) *cobra.Command {
 func runApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *installArgs, logOpts *log.Options) error {
 	l := clog.NewConsoleLogger(cmd.OutOrStdout(), cmd.ErrOrStderr(), installerScope)
 	// Warn users if they use `istioctl install` without any config args.
+	//todo clare 这个地方数据校验
 	if len(iArgs.inFilenames) == 0 && len(iArgs.set) == 0 && !rootArgs.dryRun && !iArgs.skipConfirmation {
 		if !confirm("This will install the default Istio profile into the cluster. Proceed? (y/N)", cmd.OutOrStdout()) {
 			cmd.Print("Cancelled.\n")
@@ -137,7 +140,7 @@ func runApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *installArgs, log
 //  dryRun  all operations are done but nothing is written
 func InstallManifests(setOverlay []string, inFilenames []string, force bool, dryRun bool,
 	kubeConfigPath string, context string, waitTimeout time.Duration, l clog.Logger) error {
-	//todo 开始安装
+	//todo 开始安装 获取client ---- restConfig clientset
 	restConfig, clientset, client, err := K8sConfig(kubeConfigPath, context)
 	if err != nil {
 		return err
@@ -164,10 +167,12 @@ func InstallManifests(setOverlay []string, inFilenames []string, force bool, dry
 	cache.FlushObjectCaches()
 	opts := &helmreconciler.Options{DryRun: dryRun, Log: l, WaitTimeout: waitTimeout, ProgressLog: progress.NewLog(),
 		Force: force}
+	// init Secret
 	reconciler, err := helmreconciler.NewHelmReconciler(client, restConfig, iop, opts)
 	if err != nil {
 		return err
 	}
+	// apply 所有的资源清单
 	status, err := reconciler.Reconcile()
 	if err != nil {
 		return fmt.Errorf("errors occurred during operation")
@@ -183,6 +188,6 @@ func InstallManifests(setOverlay []string, inFilenames []string, force bool, dry
 	if err != nil {
 		return err
 	}
-
+//保存iop资源
 	return saveIOPToCluster(reconciler, iopStr)
 }

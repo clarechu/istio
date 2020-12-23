@@ -28,6 +28,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"istio.io/istio/operator/pkg/cache"
+
+
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/object"
 	"istio.io/istio/operator/pkg/util"
@@ -142,6 +144,7 @@ func (h *HelmReconciler) ApplyManifest(manifest name.Manifest) (object.K8sObject
 
 // ApplyObject creates or updates an object in the API server depending on whether it already exists.
 // It mutates obj.
+//根据对象是否已存在，在API服务器中创建或更新该对象。
 func (h *HelmReconciler) ApplyObject(obj *unstructured.Unstructured) error {
 	if obj.GetKind() == "List" {
 		var errs util.Errors

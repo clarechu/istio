@@ -119,6 +119,7 @@ func ParseYAMLToK8sObject(yaml []byte) (*K8sObject, error) {
 	decoder := k8syaml.NewYAMLOrJSONDecoder(r, 1024)
 
 	out := &unstructured.Unstructured{}
+	//给这个 out 赋值了
 	err := decoder.Decode(out)
 	if err != nil {
 		return nil, fmt.Errorf("error decoding object %v: %v", string(yaml), err)
