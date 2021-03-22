@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
+//istioctl operator init
 // OperatorCmd is a group of commands related to installation and management of the operator controller.
 func OperatorCmd() *cobra.Command {
 	oc := &cobra.Command{

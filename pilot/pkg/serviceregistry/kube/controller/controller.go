@@ -218,7 +218,7 @@ type Controller struct {
 }
 
 // NewController creates a new Kubernetes controller
-// Created by bootstrap and multicluster (see secretcontroler).
+// Created by bootstrap and multi cluster (see secret controller).
 func NewController(kubeClient kubelib.Client, options Options) *Controller {
 	log.Infof("Initializing Kubernetes service registry %q", options.ClusterID)
 
