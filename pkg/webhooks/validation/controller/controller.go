@@ -434,7 +434,7 @@ func (c *Controller) isDryRunOfInvalidConfigRejected() (rejected bool, reason st
 		_, err = c.dynamicResourceInterface.Update(context.TODO(), invalid, updateOptions)
 	}
 	if err == nil {
-		return false, "dummy invalid config not rejected"
+		return true, "dummy invalid config not rejected"
 	}
 	// We expect to get deniedRequestMessageFragment (the config was rejected, as expected)
 	if strings.Contains(err.Error(), deniedRequestMessageFragment) {

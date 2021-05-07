@@ -41,7 +41,7 @@ else
     exit 1
 fi
 
-LOCAL_OS=$(uname)
+LOCAL_OS=Linux
 export LOCAL_OS
 # Pass environment set target operating-system to build system
 if [[ ${TARGET_OS} ]]; then
