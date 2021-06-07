@@ -316,6 +316,7 @@ func validateBool(value string) error {
 	return err
 }
 
+//todo clarechu 我们需要改这个地方就行了
 func injectRequired(ignored []string, config *Config, podSpec *corev1.PodSpec, metadata *metav1.ObjectMeta) bool { // nolint: lll
 	// Skip injection when host networking is enabled. The problem is
 	// that the iptables changes are assumed to be within the pod when,
