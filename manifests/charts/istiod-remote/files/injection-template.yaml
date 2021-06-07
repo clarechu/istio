@@ -19,7 +19,7 @@ template: |
     - "-z"
     - "15006"
     - "-u"
-    - 1337
+    - 0
     - "-m"
     - "{{ annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode }}"
     - "-i"
@@ -261,10 +261,12 @@ template: |
       failureThreshold: {{ annotation .ObjectMeta `readiness.status.sidecar.istio.io/failureThreshold` .Values.global.proxy.readinessFailureThreshold }}
     {{ end -}}
     securityContext:
-      allowPrivilegeEscalation: {{ .Values.global.proxy.privileged }}
+      # allowPrivilegeEscalation: {{ .Values.global.proxy.privileged }}
       capabilities:
         {{ if or (eq (annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode) `TPROXY`) (eq (annotation .ObjectMeta `sidecar.istio.io/capNetBindService` .Values.global.proxy.capNetBindService) `true`) -}}
         add:
+        - NET_ADMIN
+        - NET_RAW
         {{ if eq (annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode) `TPROXY` -}}
         - NET_ADMIN
         {{- end }}
@@ -275,15 +277,19 @@ template: |
         drop:
         - ALL
       privileged: {{ .Values.global.proxy.privileged }}
-      readOnlyRootFilesystem: {{ not .Values.global.proxy.enableCoreDump }}
-      runAsGroup: 1337
-      fsGroup: 1337
+      # readOnlyRootFilesystem: {{ not .Values.global.proxy.enableCoreDump }}
+      # runAsGroup: 1337
+      # fsGroup: 1337
+      runAsGroup: 0
+      fsGroup: 0
       {{ if or (eq (annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode) `TPROXY`) (eq (annotation .ObjectMeta `sidecar.istio.io/capNetBindService` .Values.global.proxy.capNetBindService) `true`) -}}
       runAsNonRoot: false
       runAsUser: 0
       {{- else -}}
-      runAsNonRoot: true
-      runAsUser: 1337
+      # runAsNonRoot: true
+      #  runAsUser: 1337
+      runAsNonRoot: false
+      runAsUser: 0
       {{- end }}
     resources:
   {{- if or (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPU`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemory`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPULimit`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemoryLimit`) }}
