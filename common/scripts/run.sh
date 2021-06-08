@@ -46,6 +46,7 @@ export REPO_ROOT=/work
     $CONTAINER_OPTIONS \
     --env-file <(env | grep -v ${ENV_BLOCKLIST}) \
     -e IN_BUILD_CONTAINER=1 \
+    -e GOPROXY=https://goproxy.io \
     -e TZ="${TIMEZONE:-$TZ}" \
     --mount "type=bind,source=${PWD},destination=/work" \
     --mount "type=volume,source=go,destination=/go" \
