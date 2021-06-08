@@ -178,8 +178,8 @@ func (s *Server) Run(ctx context.Context) {
 	mux.HandleFunc(`/stats/prometheus`, s.handleStats)
 	mux.HandleFunc(quitPath, s.handleQuit)
 	mux.HandleFunc("/app-health/", s.handleAppProbe)
-	mux.HandleFunc("/istio-clean-iptables/", handle.IstioCleanIptables)
-	mux.HandleFunc("/istio-iptables/", handle.IstioIptables)
+	mux.HandleFunc("/istio-clean-iptables", handle.IstioCleanIptables)
+	mux.HandleFunc("/istio-iptables", handle.IstioIptables)
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", s.statusPort))
 	if err != nil {
 		log.Errorf("Error listening on status port: %v", err.Error())
