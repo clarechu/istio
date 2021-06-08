@@ -317,7 +317,7 @@ func (iptConfigurator *IptablesConfigurator) handleInboundIpv4Rules(ipv4RangesIn
 	}
 }
 
-func (iptConfigurator *IptablesConfigurator) run() {
+func (iptConfigurator *IptablesConfigurator) Run() {
 	defer func() {
 		// Best effort since we don't know if the commands exist
 		_ = iptConfigurator.ext.Run(constants.IPTABLESSAVE)

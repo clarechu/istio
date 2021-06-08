@@ -88,7 +88,7 @@ func TestRulesWithIpRange(t *testing.T) {
 	iptConfigurator.cfg.EnableInboundIPv6 = false
 	iptConfigurator.cfg.ProxyGID = "1,2"
 	iptConfigurator.cfg.ProxyUID = "3,4"
-	iptConfigurator.run()
+	iptConfigurator.Run()
 	actual := FormatIptablesCommands(iptConfigurator.iptables.BuildV4())
 	expected := []string{
 		"iptables -t nat -N ISTIO_REDIRECT",
@@ -565,14 +565,14 @@ func TestHandleInboundPortsIncludeWithWildcardInboundPortsAndTproxy(t *testing.T
 }
 
 func TestHandleInboundIpv4RulesWithUidGid(t *testing.T) {
-	cfg := constructConfig()
+	cfg := ConstructConfig()
 	cfg.DryRun = true
 	dnsVar.DefaultValue = "ALL"
 	iptConfigurator := NewIptablesConfigurator(cfg, &dep.StdoutStubDependencies{})
 	iptConfigurator.cfg.EnableInboundIPv6 = false
 	iptConfigurator.cfg.ProxyGID = "1,2"
 	iptConfigurator.cfg.ProxyUID = "3,4"
-	iptConfigurator.run()
+	iptConfigurator.Run()
 	actual := FormatIptablesCommands(iptConfigurator.iptables.BuildV4())
 	expected := []string{
 		"iptables -t nat -N ISTIO_REDIRECT",

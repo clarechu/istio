@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"istio.io/istio/pilot/cmd/pilot-agent/handle"
 	"net"
 	"net/http"
 	"os"
@@ -166,6 +167,7 @@ func FormatProberURL(container string) (string, string) {
 }
 
 // Run opens a the status port and begins accepting probes.
+// this http server
 func (s *Server) Run(ctx context.Context) {
 	log.Infof("Opening status port %d\n", s.statusPort)
 
@@ -176,7 +178,8 @@ func (s *Server) Run(ctx context.Context) {
 	mux.HandleFunc(`/stats/prometheus`, s.handleStats)
 	mux.HandleFunc(quitPath, s.handleQuit)
 	mux.HandleFunc("/app-health/", s.handleAppProbe)
-
+	mux.HandleFunc("/istio-clean-iptables/", handle.IstioCleanIptables)
+	mux.HandleFunc("/istio-iptables/", handle.IstioIptables)
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", s.statusPort))
 	if err != nil {
 		log.Errorf("Error listening on status port: %v", err.Error())

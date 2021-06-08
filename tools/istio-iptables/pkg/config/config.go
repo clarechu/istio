@@ -25,26 +25,26 @@ import (
 // Command line options
 // nolint: maligned
 type Config struct {
-	ProxyPort               string        `json:"PROXY_PORT"`
-	InboundCapturePort      string        `json:"INBOUND_CAPTURE_PORT"`
-	ProxyUID                string        `json:"PROXY_UID"`
-	ProxyGID                string        `json:"PROXY_GID"`
-	InboundInterceptionMode string        `json:"INBOUND_INTERCEPTION_MODE"`
-	InboundTProxyMark       string        `json:"INBOUND_TPROXY_MARK"`
-	InboundTProxyRouteTable string        `json:"INBOUND_TPROXY_ROUTE_TABLE"`
-	InboundPortsInclude     string        `json:"INBOUND_PORTS_INCLUDE"`
-	InboundPortsExclude     string        `json:"INBOUND_PORTS_EXCLUDE"`
-	OutboundPortsExclude    string        `json:"OUTBOUND_PORTS_EXCLUDE"`
-	OutboundIPRangesInclude string        `json:"OUTBOUND_IPRANGES_INCLUDE"`
-	OutboundIPRangesExclude string        `json:"OUTBOUND_IPRANGES_EXCLUDE"`
-	KubevirtInterfaces      string        `json:"KUBEVIRT_INTERFACES"`
-	IptablesProbePort       uint16        `json:"IPTABLES_PROBE_PORT"`
-	ProbeTimeout            time.Duration `json:"PROBE_TIMEOUT"`
-	DryRun                  bool          `json:"DRY_RUN"`
-	RestoreFormat           bool          `json:"RESTORE_FORMAT"`
-	SkipRuleApply           bool          `json:"SKIP_RULE_APPLY"`
-	RunValidation           bool          `json:"RUN_VALIDATION"`
-	EnableInboundIPv6       bool          `json:"ENABLE_INBOUND_IPV6"`
+	ProxyPort               string        `json:"PROXY_PORT,omitempty"`
+	InboundCapturePort      string        `json:"INBOUND_CAPTURE_PORT,omitempty"`
+	ProxyUID                string        `json:"PROXY_UID,omitempty"`
+	ProxyGID                string        `json:"PROXY_GID,omitempty"`
+	InboundInterceptionMode string        `json:"INBOUND_INTERCEPTION_MODE,omitempty"`
+	InboundTProxyMark       string        `json:"INBOUND_TPROXY_MARK,omitempty"`
+	InboundTProxyRouteTable string        `json:"INBOUND_TPROXY_ROUTE_TABLE,omitempty"`
+	InboundPortsInclude     string        `json:"INBOUND_PORTS_INCLUDE,omitempty"`
+	InboundPortsExclude     string        `json:"INBOUND_PORTS_EXCLUDE,omitempty"`
+	OutboundPortsExclude    string        `json:"OUTBOUND_PORTS_EXCLUDE,omitempty"`
+	OutboundIPRangesInclude string        `json:"OUTBOUND_IPRANGES_INCLUDE,omitempty"`
+	OutboundIPRangesExclude string        `json:"OUTBOUND_IPRANGES_EXCLUDE,omitempty"`
+	KubevirtInterfaces      string        `json:"KUBEVIRT_INTERFACES,omitempty"`
+	IptablesProbePort       uint16        `json:"IPTABLES_PROBE_PORT,omitempty"`
+	ProbeTimeout            time.Duration `json:"PROBE_TIMEOUT,omitempty"`
+	DryRun                  bool          `json:"DRY_RUN,omitempty"`
+	RestoreFormat           bool          `json:"RESTORE_FORMAT,omitempty"`
+	SkipRuleApply           bool          `json:"SKIP_RULE_APPLY,omitempty"`
+	RunValidation           bool          `json:"RUN_VALIDATION,omitempty"`
+	EnableInboundIPv6       bool          `json:"ENABLE_INBOUND_IPV6,omitempty"`
 }
 
 func (c *Config) String() string {

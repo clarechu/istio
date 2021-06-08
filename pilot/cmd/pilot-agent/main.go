@@ -454,6 +454,7 @@ func init() {
 
 	cmd.AddFlags(rootCmd)
 
+	// 添加子命令 这个地方
 	rootCmd.AddCommand(proxyCmd)
 	rootCmd.AddCommand(version.CobraCommand())
 	rootCmd.AddCommand(iptables.GetCommand())

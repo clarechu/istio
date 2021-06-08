@@ -51,7 +51,7 @@ var rootCmd = &cobra.Command{
 	Short: "Set up iptables rules for Istio Sidecar",
 	Long:  "Script responsible for setting up port forwarding for Istio sidecar.",
 	Run: func(cmd *cobra.Command, args []string) {
-		cfg := constructConfig()
+		cfg := ConstructConfig()
 		var ext dep.Dependencies
 		if cfg.DryRun {
 			ext = &dep.StdoutStubDependencies{}
@@ -61,10 +61,10 @@ var rootCmd = &cobra.Command{
 
 		iptConfigurator := NewIptablesConfigurator(cfg, ext)
 		if !cfg.SkipRuleApply {
-			iptConfigurator.run()
+			iptConfigurator.Run()
 		}
 		if cfg.RunValidation {
-			hostIP, err := getLocalIP()
+			hostIP, err := GetLocalIP()
 			if err != nil {
 				// Assume it is not handled by istio-cni and won't reuse the ValidationErrorCode
 				panic(err)
@@ -78,7 +78,7 @@ var rootCmd = &cobra.Command{
 	},
 }
 
-func constructConfig() *config.Config {
+func ConstructConfig() *config.Config {
 	cfg := &config.Config{
 		DryRun:                  viper.GetBool(constants.DryRun),
 		RestoreFormat:           viper.GetBool(constants.RestoreFormat),
@@ -121,7 +121,7 @@ func constructConfig() *config.Config {
 	}
 
 	// Detect whether IPv6 is enabled by checking if the pod's IP address is IPv4 or IPv6.
-	podIP, err := getLocalIP()
+	podIP, err := GetLocalIP()
 	if err != nil {
 		panic(err)
 	}
@@ -130,8 +130,8 @@ func constructConfig() *config.Config {
 	return cfg
 }
 
-// getLocalIP returns the local IP address
-func getLocalIP() (net.IP, error) {
+// GetLocalIP returns the local IP address
+func GetLocalIP() (net.IP, error) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return nil, err
