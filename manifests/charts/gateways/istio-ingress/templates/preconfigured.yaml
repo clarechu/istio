@@ -13,7 +13,7 @@ spec:
     istio: ingressgateway
   servers:
   - hosts:
-    - "*.{{ .Values.global.multiCluster.globalDomainSuffix | trim }}"
+    - "*.global"
     port:
       name: tls
       number: 15443
