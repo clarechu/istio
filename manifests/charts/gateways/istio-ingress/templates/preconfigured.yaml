@@ -62,7 +62,7 @@ metadata:
 {{ $gateway.labels | toYaml | indent 4 }}
     release: {{ .Release.Name }}
 spec:
-  host: "*.{{ .Values.global.multiCluster.globalDomainSuffix | trim }}"
+  host: "*.global"
   {{- if .Values.global.defaultConfigVisibilitySettings }}
   exportTo:
   - '*'
