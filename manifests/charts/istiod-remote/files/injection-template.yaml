@@ -293,7 +293,7 @@ template: |
       # runAsNonRoot: true
       #  runAsUser: 1337
       runAsNonRoot: false
-      runAsUser: 0
+      runAsUser: 1337
       {{- end }}
     resources:
   {{- if or (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPU`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemory`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPULimit`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemoryLimit`) }}
