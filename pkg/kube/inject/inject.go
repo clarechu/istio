@@ -310,6 +310,7 @@ func validateBool(value string) error {
 	return err
 }
 
+// injectRequired 是否需要注入sidecar
 func injectRequired(ignored []string, config *Config, podSpec *corev1.PodSpec, metadata *metav1.ObjectMeta) bool { // nolint: lll
 	// Skip injection when host networking is enabled. The problem is
 	// that the iptable changes are assumed to be within the pod when,

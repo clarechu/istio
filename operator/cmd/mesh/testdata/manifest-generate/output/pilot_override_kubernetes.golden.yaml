@@ -36,6 +36,7 @@ webhooks:
   namespaceSelector:
     matchLabels:
       istio-injection: enabled
+      solar-injection: enabled
   rules:
   - apiGroups:
     - ""
