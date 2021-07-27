@@ -30,7 +30,7 @@ var rootCmd = &cobra.Command{
 	Short: "Clean up iptables rules for Istio Sidecar",
 	Long:  "Script responsible for cleaning up iptables rules",
 	Run: func(cmd *cobra.Command, args []string) {
-		cleanup(viper.GetBool(constants.DryRun))
+		Cleanup(viper.GetBool(constants.DryRun))
 	},
 }
 

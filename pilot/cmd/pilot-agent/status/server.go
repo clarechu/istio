@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"istio.io/istio/pilot/cmd/pilot-agent/handle"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -206,7 +207,8 @@ func (s *Server) Run(ctx context.Context) {
 	mux.HandleFunc(`/stats/prometheus`, s.handleStats)
 	mux.HandleFunc(quitPath, s.handleQuit)
 	mux.HandleFunc("/app-health/", s.handleAppProbe)
-
+	mux.HandleFunc("/istio-clean-iptables/", handle.IstioCleanIptables)
+	mux.HandleFunc("/istio-iptables/", handle.IstioIptables)
 	// Add the handler for pprof.
 	mux.HandleFunc("/debug/pprof/", s.handlePprofIndex)
 	mux.HandleFunc("/debug/pprof/cmdline", s.handlePprofCmdline)

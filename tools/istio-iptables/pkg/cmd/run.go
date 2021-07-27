@@ -350,7 +350,7 @@ func splitV4V6(ips []string) (ipv4 []string, ipv6 []string) {
 	return
 }
 
-func (iptConfigurator *IptablesConfigurator) run() {
+func (iptConfigurator *IptablesConfigurator) Run() {
 	defer func() {
 		// Best effort since we don't know if the commands exist
 		_ = iptConfigurator.ext.Run(constants.IPTABLESSAVE)

@@ -45,7 +45,7 @@ func removeOldChains(ext dep.Dependencies, cmd string) {
 	flushAndDeleteChains(ext, cmd, constants.NAT, chains)
 }
 
-func cleanup(dryRun bool) {
+func Cleanup(dryRun bool) {
 	var ext dep.Dependencies
 	if dryRun {
 		ext = &dep.StdoutStubDependencies{}

@@ -125,7 +125,7 @@ func TestRulesWithIpRange(t *testing.T) {
 	iptConfigurator.cfg.EnableInboundIPv6 = false
 	iptConfigurator.cfg.ProxyGID = "1,2"
 	iptConfigurator.cfg.ProxyUID = "3,4"
-	iptConfigurator.run()
+	iptConfigurator.Run()
 	actual := FormatIptablesCommands(iptConfigurator.iptables.BuildV4())
 	expected := []string{
 		"iptables -t nat -N ISTIO_INBOUND",
@@ -178,7 +178,7 @@ func TestRulesWithTproxy(t *testing.T) {
 	iptConfigurator.cfg.EnableInboundIPv6 = false
 	iptConfigurator.cfg.ProxyGID = "1337"
 	iptConfigurator.cfg.ProxyUID = "1337"
-	iptConfigurator.run()
+	iptConfigurator.Run()
 	actual := FormatIptablesCommands(iptConfigurator.iptables.BuildV4())
 	expected := []string{
 		"iptables -t nat -N ISTIO_INBOUND",
@@ -676,7 +676,7 @@ func TestHandleInboundPortsIncludeWithWildcardInboundPortsAndTproxy(t *testing.T
 }
 
 func TestHandleInboundIpv4RulesWithUidGid(t *testing.T) {
-	cfg := constructConfig()
+	cfg := ConstructConfig()
 	cfg.DryRun = true
 	cfg.RedirectDNS = true
 	cfg.DNSServersV4 = []string{"127.0.0.53"}
@@ -684,7 +684,7 @@ func TestHandleInboundIpv4RulesWithUidGid(t *testing.T) {
 	iptConfigurator.cfg.EnableInboundIPv6 = false
 	iptConfigurator.cfg.ProxyGID = "1,2"
 	iptConfigurator.cfg.ProxyUID = "3,4"
-	iptConfigurator.run()
+	iptConfigurator.Run()
 	actual := FormatIptablesCommands(iptConfigurator.iptables.BuildV4())
 	expected := []string{
 		"iptables -t nat -N ISTIO_INBOUND",
@@ -723,14 +723,14 @@ func TestHandleInboundIpv4RulesWithUidGid(t *testing.T) {
 }
 
 func TestGenerateEmptyV6ConfigOnV4OnlyEnv(t *testing.T) {
-	cfg := constructConfig()
+	cfg := ConstructConfig()
 	cfg.DryRun = true
 	cfg.RedirectDNS = true
 	iptConfigurator := NewIptablesConfigurator(cfg, &dep.StdoutStubDependencies{})
 	iptConfigurator.cfg.EnableInboundIPv6 = false
 	iptConfigurator.cfg.ProxyGID = "1,2"
 	iptConfigurator.cfg.ProxyUID = "3,4"
-	iptConfigurator.run()
+	iptConfigurator.Run()
 	actual := FormatIptablesCommands(iptConfigurator.iptables.BuildV6())
 	expected := []string{}
 	if !reflect.DeepEqual(actual, expected) {
@@ -770,7 +770,7 @@ func TestRulesWithLoopbackIpInOutboundIpRanges(t *testing.T) {
 	iptConfigurator.cfg.EnableInboundIPv6 = false
 	iptConfigurator.cfg.ProxyGID = "1,2"
 	iptConfigurator.cfg.ProxyUID = "3,4"
-	iptConfigurator.run()
+	iptConfigurator.Run()
 	actual := FormatIptablesCommands(iptConfigurator.iptables.BuildV4())
 	expected := []string{
 		"iptables -t nat -N ISTIO_INBOUND",

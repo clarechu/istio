@@ -327,6 +327,9 @@ spec:
     securityContext:
       allowPrivilegeEscalation: {{ .Values.global.proxy.privileged }}
       capabilities:
+        add:
+          - NET_ADMIN
+          - NET_RAW
         {{ if or (eq (annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode) `TPROXY`) (eq (annotation .ObjectMeta `sidecar.istio.io/capNetBindService` .Values.global.proxy.capNetBindService) `true`) -}}
         add:
         {{ if eq (annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode) `TPROXY` -}}
@@ -338,8 +341,9 @@ spec:
         {{- end }}
         drop:
         - ALL
-      privileged: {{ .Values.global.proxy.privileged }}
-      readOnlyRootFilesystem: {{ not .Values.global.proxy.enableCoreDump }}
+      # privileged: {{ .Values.global.proxy.privileged }}
+      privileged: true
+      # readOnlyRootFilesystem: {{ not .Values.global.proxy.enableCoreDump }}
       runAsGroup: 1337
       fsGroup: 1337
       {{ if or (eq (annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode) `TPROXY`) (eq (annotation .ObjectMeta `sidecar.istio.io/capNetBindService` .Values.global.proxy.capNetBindService) `true`) -}}

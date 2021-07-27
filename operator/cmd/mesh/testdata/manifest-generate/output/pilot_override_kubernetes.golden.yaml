@@ -41,6 +41,7 @@ webhooks:
   namespaceSelector:
     matchLabels:
       istio-injection: enabled
+      solar-injection: enabled
   objectSelector:
     matchExpressions:
     - key: sidecar.istio.io/inject
