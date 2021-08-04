@@ -325,7 +325,7 @@ spec:
       failureThreshold: {{ annotation .ObjectMeta `readiness.status.sidecar.istio.io/failureThreshold` .Values.global.proxy.readinessFailureThreshold }}
     {{ end -}}
     securityContext:
-      allowPrivilegeEscalation: {{ .Values.global.proxy.privileged }}
+      # allowPrivilegeEscalation: {{ .Values.global.proxy.privileged }}
       capabilities:
         add:
           - NET_ADMIN
