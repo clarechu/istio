@@ -1,7 +1,7 @@
 # prepare a distroless source context to copy files from
-# FROM gcr.io/distroless/static-debian10@sha256:34cb7dca899f9f40f576509977cd43b093cf13eeec2ce6333f9b9b2db331f937 as distroless_source
+FROM gcr.io/distroless/static-debian10@sha256:34cb7dca899f9f40f576509977cd43b093cf13eeec2ce6333f9b9b2db331f937 as distroless_source
 
-FROM registry.cn-shenzhen.aliyuncs.com/solarmesh/distroless as distroless
+# FROM registry.cn-shenzhen.aliyuncs.com/solarmesh/distroless as distroless
 
 # prepare a base dev to modify file contents
 FROM ubuntu:bionic as ubuntu_source
