@@ -42,6 +42,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+var (
+	UpstreamLocalAddressIPv4 = &net.TCPAddr{IP: net.ParseIP("127.0.0.6")}
+	UpstreamLocalAddressIPv6 = &net.TCPAddr{IP: net.ParseIP("::6")}
+)
+
 const (
 	// readyPath is for the pilot agent readiness itself.
 	readyPath = "/healthz/ready"
@@ -61,6 +66,11 @@ var (
 	appProberPattern = regexp.MustCompile(`^/app-health/[^/]+/(livez|readyz)$`)
 )
 
+const (
+	localHostIPv4 = "127.0.0.1"
+	localHostIPv6 = "[::1]"
+)
+
 // KubeAppProbers holds the information about a Kubernetes pod prober.
 // It's a map from the prober URL path to the Kubernetes Prober config.
 // For example, "/app-health/hello-world/livez" entry contains liveness prober config for
@@ -69,8 +79,9 @@ type KubeAppProbers map[string]*Prober
 
 // Prober represents a single container prober
 type Prober struct {
-	HTTPGet        *corev1.HTTPGetAction `json:"httpGet"`
-	TimeoutSeconds int32                 `json:"timeoutSeconds,omitempty"`
+	HTTPGet        *corev1.HTTPGetAction   `json:"httpGet"`
+	TimeoutSeconds int32                   `json:"timeoutSeconds,omitempty"`
+	TCPSocket      *corev1.TCPSocketAction `json:"tcpSocket,omitempty"`
 }
 
 // Config for the status server.
@@ -81,24 +92,60 @@ type Config struct {
 	NodeType       model.NodeType
 	StatusPort     uint16
 	AdminPort      uint16
+	IPv6           bool
+	NoEnvoy        bool
+	PodIP          string
+	Context        context.Context
 }
 
 // Server provides an endpoint for handling status probes.
 type Server struct {
-	ready               *ready.Probe
-	prometheus          *PrometheusScrapeConfiguration
-	mutex               sync.RWMutex
-	appKubeProbers      KubeAppProbers
-	appProbeClient      map[string]*http.Client
-	statusPort          uint16
-	lastProbeSuccessful bool
-	envoyStatsPort      int
+	ready                 *ready.Probe
+	prometheus            *PrometheusScrapeConfiguration
+	mutex                 sync.RWMutex
+	appKubeProbers        KubeAppProbers
+	appProbeClient        map[string]*http.Client
+	statusPort            uint16
+	lastProbeSuccessful   bool
+	envoyStatsPort        int
+	upstreamLocalAddress  *net.TCPAddr
+	appProbersDestination string
+	localhost             string
+}
+
+// wrapIPv6 wraps the ip into "[]" in case of ipv6
+func wrapIPv6(ipAddr string) string {
+	addr := net.ParseIP(ipAddr)
+	if addr == nil {
+		return ipAddr
+	}
+	if addr.To4() != nil {
+		return ipAddr
+	}
+	return fmt.Sprintf("[%s]", ipAddr)
 }
 
 // NewServer creates a new status server.
 func NewServer(config Config) (*Server, error) {
+	localhost := localHostIPv4
+	upstreamLocalAddress := UpstreamLocalAddressIPv4
+	if config.IPv6 {
+		localhost = localHostIPv6
+		upstreamLocalAddress = UpstreamLocalAddressIPv6
+	}
+	probes := make([]*ready.Probe, 0)
+	if !config.NoEnvoy {
+		probes = append(probes, &ready.Probe{
+			LocalHostAddr: localhost,
+			AdminPort:     config.AdminPort,
+			Context:       config.Context,
+			NoEnvoy:       config.NoEnvoy,
+		})
+	}
 	s := &Server{
-		statusPort: config.StatusPort,
+		statusPort:            config.StatusPort,
+		upstreamLocalAddress:  upstreamLocalAddress,
+		appProbersDestination: wrapIPv6(config.PodIP),
 		ready: &ready.Probe{
 			LocalHostAddr: config.LocalHostAddr,
 			AdminPort:     config.AdminPort,
@@ -115,26 +162,27 @@ func NewServer(config Config) (*Server, error) {
 
 	s.appProbeClient = make(map[string]*http.Client, len(s.appKubeProbers))
 	// Validate the map key matching the regex pattern.
-	for path, prober := range s.appKubeProbers {
-		if !appProberPattern.Match([]byte(path)) {
-			return nil, fmt.Errorf(`invalid key, must be in form of regex pattern ^/app-health/[^\/]+/(livez|readyz)$`)
+	/*	for path, prober := range s.appKubeProbers {
+		err := validateAppKubeProber(path, prober)
+		if err != nil {
+			return nil, err
 		}
-		if prober.HTTPGet == nil {
-			return nil, fmt.Errorf(`invalid prober type, must be of type httpGet`)
+		if prober.HTTPGet != nil {
+			d := &net.Dialer{
+				LocalAddr: s.upstreamLocalAddress,
+			}
+			// Construct a http client and cache it in order to reuse the connection.
+			s.appProbeClient[path] = &http.Client{
+				Timeout: time.Duration(prober.TimeoutSeconds) * time.Second,
+				// We skip the verification since kubelet skips the verification for HTTPS prober as well
+				// https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-probes/#configure-probes
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+					DialContext:     d.DialContext,
+				},
+			}
 		}
-		if prober.HTTPGet.Port.Type != intstr.Int {
-			return nil, fmt.Errorf("invalid prober config for %v, the port must be int type", path)
-		}
-		// Construct a http client and cache it in order to reuse the connection.
-		s.appProbeClient[path] = &http.Client{
-			Timeout: time.Duration(prober.TimeoutSeconds) * time.Second,
-			// We skip the verification since kubelet skips the verification for HTTPS prober as well
-			// https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-probes/#configure-probes
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
-	}
+	}*/
 
 	// Enable prometheus server if its configured and a sidecar
 	// Because port 15020 is exposed in the gateway Services, we cannot safely serve this endpoint
@@ -154,8 +202,43 @@ func NewServer(config Config) (*Server, error) {
 		if s.prometheus.Port == "" {
 			s.prometheus.Port = "80"
 		}
+		if s.prometheus.Port == strconv.Itoa(int(config.StatusPort)) {
+			return nil, fmt.Errorf("invalid prometheus scrape configuration: "+
+				"application port is the same as agent port, which may lead to a recursive loop. "+
+				"Ensure pod does not have prometheus.io/port=%d label, or that injection is not happening multiple times", config.StatusPort)
+		}
 	}
 
+	if config.KubeAppProbers == "" {
+		return s, nil
+	}
+	if err := json.Unmarshal([]byte(config.KubeAppProbers), &s.appKubeProbers); err != nil {
+		return nil, fmt.Errorf("failed to decode app prober err = %v, json string = %v", err, config.KubeAppProbers)
+	}
+
+	s.appProbeClient = make(map[string]*http.Client, len(s.appKubeProbers))
+	// Validate the map key matching the regex pattern.
+	for path, prober := range s.appKubeProbers {
+		err := validateAppKubeProber(path, prober)
+		if err != nil {
+			return nil, err
+		}
+		if prober.HTTPGet != nil {
+			d := &net.Dialer{
+				LocalAddr: s.upstreamLocalAddress,
+			}
+			// Construct a http client and cache it in order to reuse the connection.
+			s.appProbeClient[path] = &http.Client{
+				Timeout: time.Duration(prober.TimeoutSeconds) * time.Second,
+				// We skip the verification since kubelet skips the verification for HTTPS prober as well
+				// https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-probes/#configure-probes
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+					DialContext:     d.DialContext,
+				},
+			}
+		}
+	}
 	return s, nil
 }
 
@@ -207,6 +290,25 @@ func (s *Server) Run(ctx context.Context) {
 	// Wait for the agent to be shut down.
 	<-ctx.Done()
 	log.Info("Status server has successfully terminated")
+}
+
+func validateAppKubeProber(path string, prober *Prober) error {
+	if !appProberPattern.Match([]byte(path)) {
+		return fmt.Errorf(`invalid path, must be in form of regex pattern %v`, appProberPattern)
+	}
+	if prober.HTTPGet == nil && prober.TCPSocket == nil {
+		return fmt.Errorf(`invalid prober type, must be of type httpGet or tcpSocket`)
+	}
+	if prober.HTTPGet != nil && prober.TCPSocket != nil {
+		return fmt.Errorf(`invalid prober, type must be either httpGet or tcpSocket`)
+	}
+	if prober.HTTPGet != nil && prober.HTTPGet.Port.Type != intstr.Int {
+		return fmt.Errorf("invalid prober config for %v, the port must be int type", path)
+	}
+	if prober.TCPSocket != nil && prober.TCPSocket.Port.Type != intstr.Int {
+		return fmt.Errorf("invalid prober config for %v, the port must be int type", path)
+	}
+	return nil
 }
 
 func (s *Server) handleReadyProbe(w http.ResponseWriter, _ *http.Request) {
@@ -364,13 +466,26 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if prober.HTTPGet != nil {
+		s.handleAppProbeHTTPGet(w, req, prober, path)
+	}
+	if prober.TCPSocket != nil {
+		s.handleAppProbeTCPSocket(w, prober)
+	}
+}
+
+func (s *Server) handleAppProbeHTTPGet(w http.ResponseWriter, req *http.Request, prober *Prober, path string) {
+	proberPath := prober.HTTPGet.Path
+	if !strings.HasPrefix(proberPath, "/") {
+		proberPath = "/" + proberPath
+	}
 	var url string
 	if prober.HTTPGet.Scheme == corev1.URISchemeHTTPS {
-		url = fmt.Sprintf("https://localhost:%v%s", prober.HTTPGet.Port.IntValue(), prober.HTTPGet.Path)
+		url = fmt.Sprintf("https://%s:%v%s", s.appProbersDestination, prober.HTTPGet.Port.IntValue(), proberPath)
 	} else {
-		url = fmt.Sprintf("http://localhost:%v%s", prober.HTTPGet.Port.IntValue(), prober.HTTPGet.Path)
+		url = fmt.Sprintf("http://%s:%v%s", s.appProbersDestination, prober.HTTPGet.Port.IntValue(), proberPath)
 	}
-	appReq, err := http.NewRequest("GET", url, nil)
+	appReq, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		log.Errorf("Failed to create request to probe app %v, original url %v", err, path)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -384,20 +499,29 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 		appReq.Header[name] = newValues
 	}
 
-	for _, h := range prober.HTTPGet.HTTPHeaders {
-		if h.Name == "Host" || h.Name == ":authority" {
-			// Probe has specific host header override; honor it
-			appReq.Host = h.Value
-			break
+	// If there are custom HTTPHeaders, it will override the forwarding header
+	if headers := prober.HTTPGet.HTTPHeaders; len(headers) != 0 {
+		for _, h := range headers {
+			delete(appReq.Header, h.Name)
+		}
+		for _, h := range headers {
+			if h.Name == "Host" || h.Name == ":authority" {
+				// Probe has specific host header override; honor it
+				appReq.Host = h.Value
+				appReq.Header.Set(h.Name, h.Value)
+			} else {
+				appReq.Header.Add(h.Name, h.Value)
+			}
 		}
 	}
 
 	// get the http client must exist because
 	httpClient := s.appProbeClient[path]
+
 	// Send the request.
 	response, err := httpClient.Do(appReq)
 	if err != nil {
-		log.Errorf("Request to probe app failed: %v, original URL path = %v\napp URL path = %v", err, path, prober.HTTPGet.Path)
+		log.Errorf("Request to probe app failed: %v, original URL path = %v\napp URL path = %v", err, path, proberPath)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -409,6 +533,24 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 
 	// We only write the status code to the response.
 	w.WriteHeader(response.StatusCode)
+}
+
+func (s *Server) handleAppProbeTCPSocket(w http.ResponseWriter, prober *Prober) {
+	port := prober.TCPSocket.Port.IntValue()
+	timeout := time.Duration(prober.TimeoutSeconds) * time.Second
+
+	d := &net.Dialer{
+		LocalAddr: s.upstreamLocalAddress,
+		Timeout:   timeout,
+	}
+
+	conn, err := d.Dial("tcp", fmt.Sprintf("%s:%d", s.appProbersDestination, port))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	} else {
+		w.WriteHeader(http.StatusOK)
+		conn.Close()
+	}
 }
 
 // notifyExit sends SIGTERM to itself

@@ -15,6 +15,7 @@
 package ready
 
 import (
+	"context"
 	"fmt"
 
 	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
@@ -31,6 +32,8 @@ type Probe struct {
 	receivedFirstUpdate bool
 	// Indicates that Envoy is ready atleast once so that we can cache and reuse that probe.
 	atleastOnceReady bool
+	NoEnvoy          bool
+	Context          context.Context
 }
 
 // Check executes the probe and returns an error if the probe fails.

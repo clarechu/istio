@@ -32,6 +32,11 @@ import (
 // ShouldRewriteAppHTTPProbers returns if we should rewrite apps' probers config.
 func ShouldRewriteAppHTTPProbers(annotations map[string]string, spec *SidecarInjectionSpec) bool {
 	if annotations != nil {
+		if value, ok := annotations["solar.io/rewriteAppProbers"]; ok {
+			if isSetInAnnotation, err := strconv.ParseBool(value); err == nil {
+				return isSetInAnnotation
+			}
+		}
 		if value, ok := annotations[annotation.SidecarRewriteAppHTTPProbers.Name]; ok {
 			if isSetInAnnotation, err := strconv.ParseBool(value); err == nil {
 				return isSetInAnnotation
@@ -77,15 +82,22 @@ func convertAppProber(probe *corev1.Probe, newURL string, statusPort int) *corev
 func DumpAppProbers(podspec *corev1.PodSpec) string {
 	out := status.KubeAppProbers{}
 	updateNamedPort := func(p *status.Prober, portMap map[string]int32) *status.Prober {
-		if p == nil || p.HTTPGet == nil {
+		if p == nil {
 			return nil
 		}
-		if p.HTTPGet.Port.Type == intstr.String {
+		if p.HTTPGet != nil && p.HTTPGet.Port.Type == intstr.String {
 			port, exists := portMap[p.HTTPGet.Port.StrVal]
 			if !exists {
 				return nil
 			}
 			p.HTTPGet.Port = intstr.FromInt(int(port))
+		}
+		if p.TCPSocket != nil && p.TCPSocket.Port.Type == intstr.String {
+			port, exists := portMap[p.TCPSocket.Port.StrVal]
+			if !exists {
+				return nil
+			}
+			p.TCPSocket.Port = intstr.FromInt(int(port))
 		}
 		return p
 	}
@@ -209,12 +221,19 @@ func kubeProbeToInternalProber(probe *corev1.Probe) *status.Prober {
 		return nil
 	}
 
-	if probe.HTTPGet == nil {
-		return nil
+	if probe.HTTPGet != nil {
+		return &status.Prober{
+			HTTPGet:        probe.HTTPGet,
+			TimeoutSeconds: probe.TimeoutSeconds,
+		}
 	}
 
-	return &status.Prober{
-		HTTPGet:        probe.HTTPGet,
-		TimeoutSeconds: probe.TimeoutSeconds,
+	if probe.TCPSocket != nil {
+		return &status.Prober{
+			TimeoutSeconds: probe.TimeoutSeconds,
+			TCPSocket:      probe.TCPSocket,
+		}
 	}
+
+	return nil
 }
