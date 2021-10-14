@@ -14,6 +14,7 @@
 package inject
 
 import (
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"testing"
 
 	"istio.io/api/annotation"
@@ -96,6 +97,18 @@ func TestShouldRewriteAppHTTPProbers(t *testing.T) {
 			expected:             false,
 		},
 		{
+			name:                 "RewriteAppHTTPProbe-set-in-annotations",
+			sidecarInjectionSpec: SidecarInjectionSpec{RewriteAppHTTPProbe: false},
+			annotations:          map[string]string{"solar.io/rewriteAppProbers": "true"},
+			expected:             true,
+		},
+		{
+			name:                 "RewriteAppHTTPProbe-set-in-annotations",
+			sidecarInjectionSpec: SidecarInjectionSpec{RewriteAppHTTPProbe: false},
+			annotations:          map[string]string{"solar.io/rewriteAppProbers": "false"},
+			expected:             false,
+		},
+		{
 			name:                 "RewriteAppHTTPProbe-set-in-sidecar-injection-spec-&-annotations",
 			sidecarInjectionSpec: SidecarInjectionSpec{RewriteAppHTTPProbe: true},
 			annotations:          map[string]string{annotation.SidecarRewriteAppHTTPProbers.Name: "false"},
@@ -108,4 +121,179 @@ func TestShouldRewriteAppHTTPProbers(t *testing.T) {
 			t.Errorf("[%v] failed, want %v, got %v", tc.name, want, got)
 		}
 	}
+}
+
+func TestDumpAppProbers(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		spec     *corev1.PodSpec
+		expected string
+	}{
+		{
+			name: "http-80",
+			spec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "foo",
+						ReadinessProbe: &corev1.Probe{
+							TimeoutSeconds: 1,
+							Handler: corev1.Handler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   "/",
+									Scheme: corev1.URISchemeHTTP,
+									Port:   intstr.FromInt(80),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "{\"/app-health/foo/readyz\":{\"httpGet\":{\"path\":\"/\",\"port\":80,\"scheme\":\"HTTP\"},\"timeoutSeconds\":1}}",
+		},
+		{
+			name: "http-liveness-80",
+			spec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "foo",
+						LivenessProbe: &corev1.Probe{
+							TimeoutSeconds: 1,
+							Handler: corev1.Handler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   "/",
+									Scheme: corev1.URISchemeHTTP,
+									Port:   intstr.FromInt(80),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "{\"/app-health/foo/livez\":{\"httpGet\":{\"path\":\"/\",\"port\":80,\"scheme\":\"HTTP\"},\"timeoutSeconds\":1}}",
+		},
+		{
+			name: "http-tcp-liveness-80",
+			spec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "foo",
+						LivenessProbe: &corev1.Probe{
+							TimeoutSeconds: 1,
+							Handler: corev1.Handler{
+								TCPSocket: &corev1.TCPSocketAction{
+									Port: intstr.FromInt(80),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "{\"/app-health/foo/livez\":{\"timeoutSeconds\":1,\"tcpSocket\":{\"port\":80}}}",
+		},
+		{
+			name: "http-tcp-liveness-80",
+			spec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "foo",
+						ReadinessProbe: &corev1.Probe{
+							TimeoutSeconds: 1,
+							Handler: corev1.Handler{
+								TCPSocket: &corev1.TCPSocketAction{
+									Port: intstr.FromInt(80),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "{\"/app-health/foo/readyz\":{\"timeoutSeconds\":1,\"tcpSocket\":{\"port\":80}}}",
+		},
+		{
+			name: "http-http-tcp-liveness-80",
+			spec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "foo",
+						ReadinessProbe: &corev1.Probe{
+							TimeoutSeconds: 1,
+							Handler: corev1.Handler{
+								TCPSocket: &corev1.TCPSocketAction{
+									Port: intstr.FromInt(80),
+								},
+							},
+						},
+					},
+					{
+						Name: "bar",
+						ReadinessProbe: &corev1.Probe{
+							TimeoutSeconds: 10,
+							Handler: corev1.Handler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   "/xx",
+									Scheme: corev1.URISchemeHTTPS,
+									Port:   intstr.FromInt(8080),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "{\"/app-health/bar/readyz\":{\"httpGet\":{\"path\":\"/xx\",\"port\":8080,\"scheme\":\"HTTPS\"},\"timeoutSeconds\":10}," +
+				"\"/app-health/foo/readyz\":{\"timeoutSeconds\":1,\"tcpSocket\":{\"port\":80}}}",
+		},
+		{
+			name: "http-80,8080",
+			spec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "foo",
+						ReadinessProbe: &corev1.Probe{
+							TimeoutSeconds: 1,
+							Handler: corev1.Handler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   "/",
+									Scheme: corev1.URISchemeHTTP,
+									Port:   intstr.FromInt(80),
+								},
+							},
+						},
+					},
+					{
+						Name: "bar",
+						ReadinessProbe: &corev1.Probe{
+							TimeoutSeconds: 10,
+							Handler: corev1.Handler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   "/xx",
+									Scheme: corev1.URISchemeHTTPS,
+									Port:   intstr.FromInt(8080),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "{\"/app-health/bar/readyz\":{\"httpGet\":{\"path\":\"/xx\",\"port\":8080,\"scheme\":\"HTTPS\"},\"timeoutSeconds\":10}," +
+				"\"/app-health/foo/readyz\":{\"httpGet\":{\"path\":\"/\",\"port\":80,\"scheme\":\"HTTP\"},\"timeoutSeconds\":1}}",
+		},
+		{
+			name: "http-nil",
+			spec: &corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: "foo",
+					},
+				},
+			},
+			expected: "{}",
+		},
+	} {
+		got := DumpAppProbers(tc.spec)
+		want := tc.expected
+		if got != want {
+			t.Errorf("[%v] failed, want %v, got %v", tc.name, want, got)
+		}
+	}
+
 }

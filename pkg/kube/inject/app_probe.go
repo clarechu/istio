@@ -64,6 +64,7 @@ func convertAppProber(probe *corev1.Probe, newURL string, statusPort int) *corev
 	if probe == nil || probe.HTTPGet == nil {
 		return nil
 	}
+	//copy
 	p := probe.DeepCopy()
 	// Change the application container prober config.
 	p.HTTPGet.Port = intstr.FromInt(statusPort)

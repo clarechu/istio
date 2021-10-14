@@ -79,7 +79,7 @@ type KubeAppProbers map[string]*Prober
 
 // Prober represents a single container prober
 type Prober struct {
-	HTTPGet        *corev1.HTTPGetAction   `json:"httpGet"`
+	HTTPGet        *corev1.HTTPGetAction   `json:"httpGet,omitempty"`
 	TimeoutSeconds int32                   `json:"timeoutSeconds,omitempty"`
 	TCPSocket      *corev1.TCPSocketAction `json:"tcpSocket,omitempty"`
 }
