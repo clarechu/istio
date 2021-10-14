@@ -125,12 +125,14 @@ func DumpAppProbers(podspec *corev1.PodSpec) string {
 		log.Errorf("failed to serialize the app prober config %v", err)
 		return ""
 	}
+	log.Debugf("DumpAppProbers APP to %s", string(b))
 	return string(b)
 }
 
 // rewriteAppHTTPProbes modifies the app probers in place for kube-inject.
 func rewriteAppHTTPProbe(annotations map[string]string, podSpec *corev1.PodSpec, spec *SidecarInjectionSpec, port int32) {
 	if !ShouldRewriteAppHTTPProbers(annotations, spec) {
+		log.Debugf("Should Rewrite App HTTP Probers ..")
 		return
 	}
 	sidecar := FindSidecar(podSpec.Containers)
