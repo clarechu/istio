@@ -15,6 +15,7 @@ package inject
 
 import (
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"reflect"
 	"testing"
 
 	"istio.io/api/annotation"
@@ -296,4 +297,86 @@ func TestDumpAppProbers(t *testing.T) {
 		}
 	}
 
+}
+
+func TestConvertAppProber(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		probe      *corev1.Probe
+		newURL     string
+		statusPort int
+		expected   *corev1.Probe
+	}{
+		{
+			name: "readiness-http-80",
+			probe: &corev1.Probe{
+				Handler: corev1.Handler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/xx",
+						Scheme: corev1.URISchemeHTTPS,
+						Port:   intstr.FromInt(8080),
+					},
+				},
+			},
+			newURL:     "/app-health/nginx/readyz",
+			statusPort: 15020,
+			expected: &corev1.Probe{
+				Handler: corev1.Handler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/app-health/nginx/readyz",
+						Scheme: corev1.URISchemeHTTP,
+						Port:   intstr.FromInt(15020),
+					},
+				},
+			},
+		},
+		{
+			name: "readiness-tcp-80",
+			probe: &corev1.Probe{
+				Handler: corev1.Handler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: intstr.FromInt(8080),
+					},
+				},
+			},
+			newURL:     "/app-health/nginx/readyz",
+			statusPort: 15020,
+			expected: &corev1.Probe{
+				Handler: corev1.Handler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/app-health/nginx/readyz",
+						Scheme: corev1.URISchemeHTTP,
+						Port:   intstr.FromInt(15020),
+					},
+				},
+			},
+		},
+		{
+			name: "readiness-tcp-8080",
+			probe: &corev1.Probe{
+				Handler: corev1.Handler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: intstr.FromInt(8080),
+					},
+				},
+			},
+			newURL:     "/app-health/nginx/livez",
+			statusPort: 15020,
+			expected: &corev1.Probe{
+				Handler: corev1.Handler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/app-health/nginx/livez",
+						Scheme: corev1.URISchemeHTTP,
+						Port:   intstr.FromInt(15020),
+					},
+				},
+			},
+		},
+	} {
+		got := convertAppProber(tc.probe, tc.newURL, tc.statusPort)
+		want := tc.expected
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("[%v] failed, want %v, got %v", tc.name, want, got)
+		}
+	}
 }
