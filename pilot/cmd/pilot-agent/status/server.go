@@ -480,10 +480,13 @@ func (s *Server) handleAppProbeHTTPGet(w http.ResponseWriter, req *http.Request,
 		proberPath = "/" + proberPath
 	}
 	var url string
+	//todo 这个地方先改成localhost
+
 	if prober.HTTPGet.Scheme == corev1.URISchemeHTTPS {
-		url = fmt.Sprintf("https://%s:%v%s", s.appProbersDestination, prober.HTTPGet.Port.IntValue(), proberPath)
+		//s.appProbersDestination
+		url = fmt.Sprintf("https://%s:%v%s", "localhost", prober.HTTPGet.Port.IntValue(), proberPath)
 	} else {
-		url = fmt.Sprintf("http://%s:%v%s", s.appProbersDestination, prober.HTTPGet.Port.IntValue(), proberPath)
+		url = fmt.Sprintf("http://%s:%v%s", "localhost", prober.HTTPGet.Port.IntValue(), proberPath)
 	}
 	appReq, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {

@@ -50,7 +50,7 @@ func (se *statusError) Error() string {
 	return fmt.Sprintf("rpc error: code = %s desc = %s", codes.Code(p.GetCode()), p.GetMessage())
 }
 
-// Status converts the gogo/statusError to a grpc/status.
+// GRPCStatus converts the gogo/statusError to a grpc/status.
 func (se *statusError) GRPCStatus() *status.Status {
 	p := (*rpc.Status)(se)
 	s := &spb.Status{
