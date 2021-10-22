@@ -61,7 +61,7 @@ func FindSidecar(containers []corev1.Container) *corev1.Container {
 
 // convertAppProber returns an overwritten `Probe` for pilot agent to take over.
 func convertAppProber(probe *corev1.Probe, newURL string, statusPort int) *corev1.Probe {
-	if probe == nil || probe.Exec != nil {
+	if probe == nil || probe.TCPSocket == nil {
 		return nil
 	}
 	if probe.HTTPGet == nil {
