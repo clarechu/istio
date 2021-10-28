@@ -459,7 +459,6 @@ func init() {
 	rootCmd.AddCommand(version.CobraCommand())
 	rootCmd.AddCommand(iptables.GetCommand())
 	rootCmd.AddCommand(cleaniptables.GetCommand())
-
 	rootCmd.AddCommand(collateral.CobraCommand(rootCmd, &doc.GenManHeader{
 		Title:   "Istio Pilot Agent",
 		Section: "pilot-agent CLI",
