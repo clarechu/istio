@@ -59,6 +59,22 @@ func FindSidecar(containers []corev1.Container) *corev1.Container {
 	return nil
 }
 
+// convertAppLifecycle returns an overwritten `lifecycle` for pilot agent to take over.
+func convertAppLifecycle(lifecycle *corev1.Lifecycle) (*corev1.Lifecycle, string) {
+	if lifecycle == nil {
+		return &corev1.Lifecycle{
+			PostStart: &corev1.Handler{
+				Exec: &corev1.ExecAction{
+					Command: []string{
+						"pilot-agent", "wait",
+					},
+				},
+			},
+		}, "add"
+	}
+	return lifecycle, "replace"
+}
+
 // convertAppProber returns an overwritten `Probe` for pilot agent to take over.
 func convertAppProber(probe *corev1.Probe, newURL string, statusPort int) *corev1.Probe {
 	if probe == nil || probe.TCPSocket == nil {
@@ -82,6 +98,24 @@ func convertAppProber(probe *corev1.Probe, newURL string, statusPort int) *corev
 		p.HTTPGet.Scheme = corev1.URISchemeHTTP
 	}
 	return p
+}
+
+// DumpLifecycle 处理函数调用的问题
+func DumpLifecycle(podspec *corev1.PodSpec) {
+	for i, c := range podspec.Containers {
+		if c.Name == ProxyContainerName {
+			continue
+		}
+		podspec.Containers[i].Lifecycle = &corev1.Lifecycle{
+			PostStart: &corev1.Handler{
+				Exec: &corev1.ExecAction{
+					Command: []string{
+						"pilot-agent", "wait",
+					},
+				},
+			},
+		}
+	}
 }
 
 // DumpAppProbers returns a json encoded string as `status.KubeAppProbers`.
@@ -220,6 +254,28 @@ func createProbeRewritePatch(annotations map[string]string, podSpec *corev1.PodS
 				Value: *probePatch,
 			})
 		}
+	}
+	return podPatches
+}
+
+// createProbeRewritePatch generates the patch for webhook.
+func createLifecycleRewritePatch(podSpec *corev1.PodSpec, spec *SidecarInjectionSpec) []rfc6902PatchOperation {
+	podPatches := []rfc6902PatchOperation{}
+	sidecar := FindSidecar(spec.Containers)
+	if sidecar == nil {
+		return nil
+	}
+	for i, c := range podSpec.Containers {
+		// Skip sidecar container.
+		if c.Name == ProxyContainerName {
+			continue
+		}
+		patch, op := convertAppLifecycle(c.Lifecycle)
+		podPatches = append(podPatches, rfc6902PatchOperation{
+			Op:    op,
+			Path:  fmt.Sprintf("/spec/containers/%v/lifecycle", i),
+			Value: *patch,
+		})
 	}
 	return podPatches
 }
