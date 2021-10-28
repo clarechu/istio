@@ -382,6 +382,24 @@ func removeImagePullSecrets(imagePullSecrets []corev1.LocalObjectReference, remo
 	return patch
 }
 
+const (
+	// ValidationContainerName is the name of the init container that validates
+	// if CNI has made the necessary changes to iptables
+	ValidationContainerName = "istio-validation"
+)
+
+func shouldBeInjectedInFront(container corev1.Container) bool {
+	switch container.Name {
+	case ValidationContainerName:
+		return true
+	case ProxyContainerName:
+		//return sic.HoldApplicationUntilProxyStarts
+		return true
+	default:
+		return false
+	}
+}
+
 func addContainer(target, added []corev1.Container, basePath string) (patch []rfc6902PatchOperation) {
 	saJwtSecretMountName := ""
 	var saJwtSecretMount corev1.VolumeMount
@@ -415,7 +433,7 @@ func addContainer(target, added []corev1.Container, basePath string) (patch []rf
 		if first {
 			first = false
 			value = []corev1.Container{add}
-		} else if add.Name == "istio-validation" {
+		} else if shouldBeInjectedInFront(add) {
 			path += "/0"
 		} else {
 			path += "/-"
@@ -607,7 +625,7 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 	}
 
 	patch = append(patch, addContainer(pod.Spec.InitContainers, sic.InitContainers, "/spec/initContainers")...)
-	patch = append(patch, addContainer(pod.Spec.Containers, sic.Containers, "/spec/containers")...)
+	patch = append(addContainer(pod.Spec.Containers, sic.Containers, "/spec/containers"), patch...)
 	patch = append(patch, addVolume(pod.Spec.Volumes, sic.Volumes, "/spec/volumes")...)
 	patch = append(patch, addImagePullSecrets(pod.Spec.ImagePullSecrets, sic.ImagePullSecrets, "/spec/imagePullSecrets")...)
 
