@@ -267,7 +267,7 @@ func createLifecycleRewritePatch(podSpec *corev1.PodSpec, spec *SidecarInjection
 	}
 	for i, c := range podSpec.Containers {
 		// Skip sidecar container.
-		if c.Name == ProxyContainerName {
+		if c.Name != ProxyContainerName {
 			continue
 		}
 		patch, op := convertAppLifecycle(c.Lifecycle)

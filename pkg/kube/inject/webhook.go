@@ -623,7 +623,7 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 	if rewrite {
 		patch = append(patch, createProbeRewritePatch(pod.Annotations, &pod.Spec, sic, mesh.GetDefaultConfig().GetStatusPort())...)
 	}
-	// lifecycle
+	// lifecycle 添加服务的启动顺序
 	patch = append(patch, createLifecycleRewritePatch(&pod.Spec, sic)...)
 
 	return json.Marshal(patch)
