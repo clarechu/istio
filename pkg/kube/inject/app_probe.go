@@ -75,6 +75,22 @@ func convertAppLifecycle(lifecycle *corev1.Lifecycle) (*corev1.Lifecycle, string
 	return lifecycle, "replace"
 }
 
+// convertAppLifecycle returns an overwritten `lifecycle` for pilot agent to take over.
+func convertAppLifecycleBy(lifecycle *corev1.Lifecycle) *corev1.Lifecycle {
+	if lifecycle == nil {
+		return &corev1.Lifecycle{
+			PostStart: &corev1.Handler{
+				Exec: &corev1.ExecAction{
+					Command: []string{
+						"pilot-agent", "wait",
+					},
+				},
+			},
+		}
+	}
+	return lifecycle
+}
+
 // convertAppProber returns an overwritten `Probe` for pilot agent to take over.
 func convertAppProber(probe *corev1.Probe, newURL string, statusPort int) *corev1.Probe {
 	if probe == nil || probe.TCPSocket == nil {

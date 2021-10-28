@@ -404,6 +404,12 @@ func addContainer(target, added []corev1.Container, basePath string) (patch []rf
 			// so that envoy could fetch/pass k8s sa jwt and pass to sds server, which will be used to request workload identity for the pod.
 			add.VolumeMounts = append(add.VolumeMounts, saJwtSecretMount)
 		}
+		if add.Name == "istio-proxy" {
+			// add service account secret volume mount(/var/run/secrets/kubernetes.io/serviceaccount,
+			// https://kubernetes.io/docs/reference/access-authn-authz/service-accounts-admin/#service-account-automation) to istio-proxy container,
+			// so that envoy could fetch/pass k8s sa jwt and pass to sds server, which will be used to request workload identity for the pod.
+			add.Lifecycle = convertAppLifecycleBy(add.Lifecycle)
+		}
 		value = add
 		path := basePath
 		if first {
@@ -420,6 +426,8 @@ func addContainer(target, added []corev1.Container, basePath string) (patch []rf
 			Value: value,
 		})
 	}
+	// lifecycle 添加服务的启动顺序
+	//patch = append(patch, createLifecycleRewritePatch(&pod.Spec, sic)...)
 	return patch
 }
 
@@ -623,8 +631,6 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 	if rewrite {
 		patch = append(patch, createProbeRewritePatch(pod.Annotations, &pod.Spec, sic, mesh.GetDefaultConfig().GetStatusPort())...)
 	}
-	// lifecycle 添加服务的启动顺序
-	patch = append(patch, createLifecycleRewritePatch(&pod.Spec, sic)...)
 
 	return json.Marshal(patch)
 }
