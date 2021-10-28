@@ -82,7 +82,7 @@ func convertAppLifecycleBy(lifecycle *corev1.Lifecycle) *corev1.Lifecycle {
 			PostStart: &corev1.Handler{
 				Exec: &corev1.ExecAction{
 					Command: []string{
-						"istio-proxy", "wait",
+						"pilot-agent", "wait",
 					},
 				},
 			},
