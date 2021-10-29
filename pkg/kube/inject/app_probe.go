@@ -258,15 +258,16 @@ func createProbeRewritePatch(annotations map[string]string, podSpec *corev1.PodS
 		readyz, livez := status.FormatProberURL(c.Name)
 		if probePatch := convertAppProber(c.ReadinessProbe, readyz, statusPort); probePatch != nil {
 			podPatches = append(podPatches, rfc6902PatchOperation{
-				Op:    "replace",
-				Path:  fmt.Sprintf("/spec/containers/%v/readinessProbe", i),
+				Op: "replace",
+				//sidecar 变成了第一个 所以+1 替换sidecar
+				Path:  fmt.Sprintf("/spec/containers/%v/readinessProbe", i+1),
 				Value: *probePatch,
 			})
 		}
 		if probePatch := convertAppProber(c.LivenessProbe, livez, statusPort); probePatch != nil {
 			podPatches = append(podPatches, rfc6902PatchOperation{
 				Op:    "replace",
-				Path:  fmt.Sprintf("/spec/containers/%v/livenessProbe", i),
+				Path:  fmt.Sprintf("/spec/containers/%v/livenessProbe", i+1),
 				Value: *probePatch,
 			})
 		}
