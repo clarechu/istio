@@ -587,6 +587,11 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 	sic *SidecarInjectionSpec, workloadName string, mesh *meshconfig.MeshConfig) ([]byte, error) {
 
 	var patch []rfc6902PatchOperation
+	rewrite := ShouldRewriteAppHTTPProbers(pod.Annotations, sic)
+
+	if rewrite {
+		patch = append(patch, createProbeRewritePatch(pod.Annotations, &pod.Spec, sic, mesh.GetDefaultConfig().GetStatusPort())...)
+	}
 
 	// Remove any containers previously injected by kube-inject using
 	// container and volume name as unique key for removal.
@@ -594,8 +599,6 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 	patch = append(patch, removeContainers(pod.Spec.Containers, prevStatus.Containers, "/spec/containers")...)
 	patch = append(patch, removeVolumes(pod.Spec.Volumes, prevStatus.Volumes, "/spec/volumes")...)
 	patch = append(patch, removeImagePullSecrets(pod.Spec.ImagePullSecrets, prevStatus.ImagePullSecrets, "/spec/imagePullSecrets")...)
-
-	rewrite := ShouldRewriteAppHTTPProbers(pod.Annotations, sic)
 
 	sidecar := FindSidecar(sic.Containers)
 	// We don't have to escape json encoding here when using golang libraries.
@@ -625,7 +628,7 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 	}
 
 	patch = append(patch, addContainer(pod.Spec.InitContainers, sic.InitContainers, "/spec/initContainers")...)
-	patch = append(addContainer(pod.Spec.Containers, sic.Containers, "/spec/containers"), patch...)
+	patch = append(patch, addContainer(pod.Spec.Containers, sic.Containers, "/spec/containers")...)
 	patch = append(patch, addVolume(pod.Spec.Volumes, sic.Volumes, "/spec/volumes")...)
 	patch = append(patch, addImagePullSecrets(pod.Spec.ImagePullSecrets, sic.ImagePullSecrets, "/spec/imagePullSecrets")...)
 
@@ -645,10 +648,6 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 		model.IstioCanonicalServiceLabelName:         canonicalSvc,
 		label.IstioRev:                               revision,
 		model.IstioCanonicalServiceRevisionLabelName: canonicalRev})...)
-
-	if rewrite {
-		patch = append(patch, createProbeRewritePatch(pod.Annotations, &pod.Spec, sic, mesh.GetDefaultConfig().GetStatusPort())...)
-	}
 
 	return json.Marshal(patch)
 }

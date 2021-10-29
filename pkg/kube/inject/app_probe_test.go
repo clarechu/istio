@@ -106,6 +106,12 @@ func TestShouldRewriteAppHTTPProbers(t *testing.T) {
 		{
 			name:                 "RewriteAppHTTPProbe-set-in-annotations",
 			sidecarInjectionSpec: SidecarInjectionSpec{RewriteAppHTTPProbe: false},
+			annotations:          map[string]string{},
+			expected:             false,
+		},
+		{
+			name:                 "RewriteAppHTTPProbe-set-in-annotations",
+			sidecarInjectionSpec: SidecarInjectionSpec{RewriteAppHTTPProbe: false},
 			annotations:          map[string]string{"solar.io/rewriteAppProbers": "false"},
 			expected:             false,
 		},
