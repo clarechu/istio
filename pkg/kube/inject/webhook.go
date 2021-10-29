@@ -588,7 +588,7 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 
 	var patch []rfc6902PatchOperation
 	rewrite := ShouldRewriteAppHTTPProbers(pod.Annotations, sic)
-
+	sidecar := FindSidecar(sic.Containers)
 	if rewrite {
 		patch = append(patch, createProbeRewritePatch(pod.Annotations, &pod.Spec, sic, mesh.GetDefaultConfig().GetStatusPort())...)
 	}
@@ -600,7 +600,6 @@ func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision s
 	patch = append(patch, removeVolumes(pod.Spec.Volumes, prevStatus.Volumes, "/spec/volumes")...)
 	patch = append(patch, removeImagePullSecrets(pod.Spec.ImagePullSecrets, prevStatus.ImagePullSecrets, "/spec/imagePullSecrets")...)
 
-	sidecar := FindSidecar(sic.Containers)
 	// We don't have to escape json encoding here when using golang libraries.
 	if rewrite && sidecar != nil {
 		if prober := DumpAppProbers(&pod.Spec); prober != "" {
