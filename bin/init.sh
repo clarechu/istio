@@ -106,6 +106,8 @@ function download_wasm_if_necessary () {
 
     # Copy the webassembly file to the output location
     cp "${download_file_path}" "$2"
+   #  grpc_file_wasm = http://release.solarmesh.cn/wasm/grpc_logging.wasm
+
     popd
   fi
 }
@@ -143,6 +145,10 @@ do
   FILTER_WASM_URL="${ISTIO_ENVOY_BASE_URL}/${plugin}-${ISTIO_ENVOY_VERSION}.compiled.wasm"
   download_wasm_if_necessary "${FILTER_WASM_URL}" "${WASM_RELEASE_DIR}"/"${plugin//_/-}"-filter.compiled.wasm
 done
+
+# Download WebAssembly grpc-logging plugin files
+download_wasm_if_necessary http://release.solarmesh.cn/wasm/grpc_logging.wasm /work/out/linux_amd64/release/
+
 
 # Copy native envoy binary to ISTIO_OUT
 echo "Copying ${ISTIO_ENVOY_NATIVE_PATH} to ${ISTIO_OUT}/${SIDECAR}"
