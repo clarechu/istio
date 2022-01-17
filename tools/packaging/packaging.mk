@@ -48,7 +48,7 @@ SIDECAR_CENTOS_7_FILES+=${REPO_ROOT}/tools/packaging/common/envoy_bootstrap.json
 ISTIO_EXTENSIONS:=stats-filter.wasm \
                   stats-filter.compiled.wasm \
                   metadata-exchange-filter.wasm \
-                  grpc-logging.wasm \
+                  grpc_logging.wasm \
                   metadata-exchange-filter.compiled.wasm
 
 $(foreach EXT,$(ISTIO_EXTENSIONS),\
