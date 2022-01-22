@@ -65,7 +65,7 @@ spec:
                     local:
                       #  inline_string: envoy.wasm.grpx_logging
                       filename: /etc/istio/extensions/grpc_logging.wasm
-                  runtime: envoy.wasm.runtime.null
+                  runtime: envoy.wasm.runtime.v8
                   vm_id: grpc_logging
 
 
