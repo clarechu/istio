@@ -245,6 +245,15 @@ func modifyContainers(cl []corev1.Container, name string, modifier ContainerReor
 			containers = append(containers, c)
 		} else {
 			match = &c
+			match.Lifecycle = &corev1.Lifecycle{
+				PostStart: &corev1.Handler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"pilot-agent", "wait",
+						},
+					},
+				},
+			}
 		}
 	}
 	if match == nil {
