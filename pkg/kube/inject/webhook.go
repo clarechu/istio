@@ -245,6 +245,32 @@ func modifyContainers(cl []corev1.Container, name string, modifier ContainerReor
 			containers = append(containers, c)
 		} else {
 			match = &c
+		}
+	}
+	if match == nil {
+		return containers
+	}
+	switch modifier {
+	case MoveFirst:
+		return append([]corev1.Container{*match}, containers...)
+	case MoveLast:
+		return append(containers, *match)
+	case Remove:
+		return containers
+	default:
+		return cl
+	}
+}
+
+func modifyContainersIstoProxy(cl []corev1.Container, name string, modifier ContainerReorder) []corev1.Container {
+	containers := []corev1.Container{}
+	var match *corev1.Container
+	for _, c := range cl {
+		c := c
+		if c.Name != name {
+			containers = append(containers, c)
+		} else {
+			match = &c
 			match.Lifecycle = &corev1.Lifecycle{
 				PostStart: &corev1.Handler{
 					Exec: &corev1.ExecAction{
@@ -642,7 +668,7 @@ func reorderPod(pod *corev1.Pod, req InjectionParameters) error {
 
 	// Proxy container should be last, unless HoldApplicationUntilProxyStarts is set
 	// This is to ensure `kubectl exec` and similar commands continue to default to the user's container
-	pod.Spec.Containers = modifyContainers(pod.Spec.Containers, ProxyContainerName, proxyLocation)
+	pod.Spec.Containers = modifyContainersIstoProxy(pod.Spec.Containers, ProxyContainerName, proxyLocation)
 	// Validation container must be first to block any user containers
 	pod.Spec.InitContainers = modifyContainers(pod.Spec.InitContainers, ValidationContainerName, MoveFirst)
 	// Init container must be last to allow any traffic to pass before iptables is setup
