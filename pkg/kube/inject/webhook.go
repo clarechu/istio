@@ -624,7 +624,7 @@ func reorderPod(pod *corev1.Pod, req InjectionParameters) error {
 	// nolint: staticcheck
 	holdPod := mc.GetDefaultConfig().GetHoldApplicationUntilProxyStarts().GetValue() ||
 		valuesStruct.GetGlobal().GetProxy().GetHoldApplicationUntilProxyStarts().GetValue()
-
+	holdPod = true
 	proxyLocation := MoveLast
 	// If HoldApplicationUntilProxyStarts is set, reorder the proxy location
 	if holdPod {
