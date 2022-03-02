@@ -787,7 +787,6 @@ func (a *ADSC) handleEDS(eds []*endpoint.ClusterLoadAssignment) {
 			TypeUrl: v3.ListenerType,
 		})
 	}
-
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 	a.eds = la
