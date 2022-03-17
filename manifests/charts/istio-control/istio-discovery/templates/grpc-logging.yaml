@@ -84,7 +84,7 @@ spec:
 {{/*                  value: |*/}}
 {{/*                    {*/}}
 {{/*                      "logging_service": "networking-agent.service-mesh.svc.cluster.local:8888",*/}}
-{{/*                      "is_inbound": false,*/}}
+{{/*                      "is_inbound": "false",*/}}
 {{/*                    }*/}}
 {{/*                vm_config:*/}}
 {{/*                  code:*/}}
@@ -127,7 +127,7 @@ spec:
                   value: |
                     {
                       "logging_service": "networking-agent.service-mesh.svc.cluster.local:8888",
-                      "is_inbound": true,
+                      "is_inbound": "true",
                     }
                 vm_config:
                   code:
