@@ -25,8 +25,10 @@ docker: docker.all
 
 DOCKER_TARGETS ?= docker.pilot docker.proxyv2 docker.app docker.app_sidecar_ubuntu_xenial \
 docker.app_sidecar_ubuntu_bionic docker.app_sidecar_ubuntu_focal docker.app_sidecar_debian_9 \
-docker.app_sidecar_debian_10 docker.app_sidecar_centos_8 docker.app_sidecar_centos_7 \
+docker.app_sidecar_debian_10 \
+docker.app_sidecar_centos_7 \
 docker.istioctl docker.operator docker.install-cni
+# docker.app_sidecar_centos_8 \
 
 # Echo docker directory and the template to pass image name and version to for VM testing
 ECHO_DOCKER ?= pkg/test/echo/docker
