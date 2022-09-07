@@ -18,14 +18,14 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
-	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
-	"istio.io/pkg/log"
-
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube"
+	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller/filter"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 )
@@ -36,14 +36,18 @@ type endpointsController struct {
 
 var _ kubeEndpointsController = &endpointsController{}
 
-func newEndpointsController(c *Controller, informer coreinformers.EndpointsInformer) *endpointsController {
+func newEndpointsController(c *Controller) *endpointsController {
+	informer := filter.NewFilteredSharedIndexInformer(
+		c.opts.DiscoveryNamespacesFilter.Filter,
+		c.client.KubeInformer().Core().V1().Endpoints().Informer(),
+	)
 	out := &endpointsController{
 		kubeEndpoints: kubeEndpoints{
 			c:        c,
-			informer: informer.Informer(),
+			informer: informer,
 		},
 	}
-	registerHandlers(informer.Informer(), c.queue, "Endpoints", out.onEvent, endpointsEqual)
+	c.registerHandlers(informer, "Endpoints", out.onEvent, endpointsEqual)
 	return out
 }
 
@@ -53,7 +57,7 @@ func (e *endpointsController) GetProxyServiceInstances(c *Controller, proxy *mod
 		log.Errorf("Get endpoints by index failed: %v", err)
 		return nil
 	}
-	out := make([]*model.ServiceInstance, 0)
+	var out []*model.ServiceInstance
 	for _, ep := range eps {
 		instances := endpointServiceInstances(c, ep, proxy)
 		out = append(out, instances...)
@@ -63,17 +67,13 @@ func (e *endpointsController) GetProxyServiceInstances(c *Controller, proxy *mod
 }
 
 func endpointServiceInstances(c *Controller, endpoints *v1.Endpoints, proxy *model.Proxy) []*model.ServiceInstance {
-	out := make([]*model.ServiceInstance, 0)
+	var out []*model.ServiceInstance
 
-	hostname := kube.ServiceHostname(endpoints.Name, endpoints.Namespace, c.domainSuffix)
-	c.RLock()
-	svc := c.servicesMap[hostname]
-	c.RUnlock()
-
-	if svc != nil {
-		podIP := proxy.IPAddresses[0]
-		pod := c.pods.getPodByIP(podIP)
+	for _, svc := range c.servicesForNamespacedName(kube.NamespacedNameForK8sObject(endpoints)) {
+		pod := c.pods.getPodByProxy(proxy)
 		builder := NewEndpointBuilder(c, pod)
+
+		discoverabilityPolicy := c.exports.EndpointDiscoverabilityPolicy(svc)
 
 		for _, ss := range endpoints.Subsets {
 			for _, port := range ss.Ports {
@@ -85,7 +85,7 @@ func endpointServiceInstances(c *Controller, endpoints *v1.Endpoints, proxy *mod
 				// consider multiple IP scenarios
 				for _, ip := range proxy.IPAddresses {
 					if hasProxyIP(ss.Addresses, ip) || hasProxyIP(ss.NotReadyAddresses, ip) {
-						istioEndpoint := builder.buildIstioEndpoint(ip, port.Port, svcPort.Name)
+						istioEndpoint := builder.buildIstioEndpoint(ip, port.Port, svcPort.Name, discoverabilityPolicy)
 						out = append(out, &model.ServiceInstance{
 							Endpoint:    istioEndpoint,
 							ServicePort: svcPort,
@@ -94,8 +94,8 @@ func endpointServiceInstances(c *Controller, endpoints *v1.Endpoints, proxy *mod
 					}
 
 					if hasProxyIP(ss.NotReadyAddresses, ip) {
-						if c.metrics != nil {
-							c.metrics.AddMetric(model.ProxyStatusEndpointNotReady, proxy.ID, proxy, "")
+						if c.opts.Metrics != nil {
+							c.opts.Metrics.AddMetric(model.ProxyStatusEndpointNotReady, proxy.ID, proxy.ID, "")
 						}
 					}
 				}
@@ -106,62 +106,39 @@ func endpointServiceInstances(c *Controller, endpoints *v1.Endpoints, proxy *mod
 	return out
 }
 
-func (e *endpointsController) InstancesByPort(c *Controller, svc *model.Service, reqSvcPort int,
-	labelsList labels.Collection) ([]*model.ServiceInstance, error) {
-	item, exists, err := e.informer.GetStore().GetByKey(kube.KeyFunc(svc.Attributes.Name, svc.Attributes.Namespace))
+func (e *endpointsController) InstancesByPort(c *Controller, svc *model.Service, reqSvcPort int, labels labels.Instance) []*model.ServiceInstance {
+	item, exists, err := e.informer.GetIndexer().GetByKey(kube.KeyFunc(svc.Attributes.Name, svc.Attributes.Namespace))
 	if err != nil {
 		log.Infof("get endpoints(%s, %s) => error %v", svc.Attributes.Name, svc.Attributes.Namespace, err)
-		return nil, nil
+		return nil
 	}
 	if !exists {
-		return nil, nil
+		return nil
 	}
+
+	discoverabilityPolicy := c.exports.EndpointDiscoverabilityPolicy(svc)
 
 	// Locate all ports in the actual service
 	svcPort, exists := svc.Ports.GetByPort(reqSvcPort)
 	if !exists {
-		return nil, nil
+		return nil
 	}
 	ep := item.(*v1.Endpoints)
 	var out []*model.ServiceInstance
 	for _, ss := range ep.Subsets {
-		for _, ea := range ss.Addresses {
-			var podLabels labels.Instance
-			pod := c.pods.getPodByIP(ea.IP)
-			if pod != nil {
-				podLabels = pod.Labels
-			}
-
-			// check that one of the input labels is a subset of the labels
-			if !labelsList.HasSubsetOf(podLabels) {
-				continue
-			}
-
-			builder := NewEndpointBuilder(c, pod)
-
-			// identify the port by name. K8S EndpointPort uses the service port name
-			for _, port := range ss.Ports {
-				if port.Name == "" || // 'name optional if single port is defined'
-					svcPort.Name == port.Name {
-					istioEndpoint := builder.buildIstioEndpoint(ea.IP, port.Port, svcPort.Name)
-					out = append(out, &model.ServiceInstance{
-						Endpoint:    istioEndpoint,
-						ServicePort: svcPort,
-						Service:     svc,
-					})
-				}
-			}
+		out = append(out, e.buildServiceInstances(ep, ss, ss.Addresses, svc, discoverabilityPolicy, labels, svcPort, model.Healthy)...)
+		if features.SendUnhealthyEndpoints.Load() {
+			out = append(out, e.buildServiceInstances(ep, ss, ss.NotReadyAddresses, svc, discoverabilityPolicy, labels, svcPort, model.UnHealthy)...)
 		}
 	}
-
-	return out, nil
+	return out
 }
 
-func (e *endpointsController) getInformer() cache.SharedIndexInformer {
+func (e *endpointsController) getInformer() filter.FilteredSharedIndexInformer {
 	return e.informer
 }
 
-func (e *endpointsController) onEvent(curr interface{}, event model.Event) error {
+func (e *endpointsController) onEvent(curr any, event model.Event) error {
 	ep, ok := curr.(*v1.Endpoints)
 	if !ok {
 		tombstone, ok := curr.(cache.DeletedFinalStateUnknown)
@@ -176,10 +153,10 @@ func (e *endpointsController) onEvent(curr interface{}, event model.Event) error
 		}
 	}
 
-	return processEndpointEvent(e.c, e, ep.Name, ep.Namespace, event, curr)
+	return processEndpointEvent(e.c, e, ep.Name, ep.Namespace, event, ep)
 }
 
-func (e *endpointsController) forgetEndpoint(endpoint interface{}) {
+func (e *endpointsController) forgetEndpoint(endpoint any) map[host.Name][]*model.IstioEndpoint {
 	ep := endpoint.(*v1.Endpoints)
 	key := kube.KeyFunc(ep.Name, ep.Namespace)
 	for _, ss := range ep.Subsets {
@@ -187,37 +164,100 @@ func (e *endpointsController) forgetEndpoint(endpoint interface{}) {
 			e.c.pods.endpointDeleted(key, ea.IP)
 		}
 	}
+	return make(map[host.Name][]*model.IstioEndpoint)
 }
 
-func (e *endpointsController) buildIstioEndpoints(endpoint interface{}, host host.Name) []*model.IstioEndpoint {
-	endpoints := make([]*model.IstioEndpoint, 0)
+func (e *endpointsController) buildIstioEndpoints(endpoint any, host host.Name) []*model.IstioEndpoint {
+	var endpoints []*model.IstioEndpoint
 	ep := endpoint.(*v1.Endpoints)
-	for _, ss := range ep.Subsets {
-		for _, ea := range ss.Addresses {
-			pod, expectedPod := getPod(e.c, ea.IP, &metav1.ObjectMeta{Name: ep.Name, Namespace: ep.Namespace}, ea.TargetRef, host)
-			if pod == nil && expectedPod {
-				continue
-			}
-			builder := NewEndpointBuilder(e.c, pod)
 
-			// EDS and ServiceEntry use name for service port - ADS will need to map to numbers.
-			for _, port := range ss.Ports {
-				istioEndpoint := builder.buildIstioEndpoint(ea.IP, port.Port, port.Name)
-				endpoints = append(endpoints, istioEndpoint)
-			}
+	discoverabilityPolicy := e.c.exports.EndpointDiscoverabilityPolicy(e.c.GetService(host))
+
+	for _, ss := range ep.Subsets {
+		endpoints = append(endpoints, e.buildIstioEndpointFromAddress(ep, ss, ss.Addresses, host, discoverabilityPolicy, model.Healthy)...)
+		if features.SendUnhealthyEndpoints.Load() {
+			endpoints = append(endpoints, e.buildIstioEndpointFromAddress(ep, ss, ss.NotReadyAddresses, host, discoverabilityPolicy, model.UnHealthy)...)
 		}
 	}
 	return endpoints
 }
 
-func (e *endpointsController) getServiceInfo(ep interface{}) (host.Name, string, string) {
+func (e *endpointsController) buildServiceInstances(ep *v1.Endpoints, ss v1.EndpointSubset, endpoints []v1.EndpointAddress,
+	svc *model.Service, discoverabilityPolicy model.EndpointDiscoverabilityPolicy, lbls labels.Instance,
+	svcPort *model.Port, health model.HealthStatus,
+) []*model.ServiceInstance {
+	var out []*model.ServiceInstance
+	for _, ea := range endpoints {
+		var podLabels labels.Instance
+		pod, expectedPod := getPod(e.c, ea.IP, &metav1.ObjectMeta{Name: ep.Name, Namespace: ep.Namespace}, ea.TargetRef, svc.Hostname)
+		if pod == nil && expectedPod {
+			continue
+		}
+		if pod != nil {
+			podLabels = pod.Labels
+		}
+		// check that one of the input labels is a subset of the labels
+		if !lbls.SubsetOf(podLabels) {
+			continue
+		}
+
+		builder := NewEndpointBuilder(e.c, pod)
+
+		// identify the port by name. K8S EndpointPort uses the service port name
+		for _, port := range ss.Ports {
+			if port.Name == "" || // 'name optional if single port is defined'
+				svcPort.Name == port.Name {
+				istioEndpoint := builder.buildIstioEndpoint(ea.IP, port.Port, svcPort.Name, discoverabilityPolicy)
+				istioEndpoint.HealthStatus = health
+				out = append(out, &model.ServiceInstance{
+					Endpoint:    istioEndpoint,
+					ServicePort: svcPort,
+					Service:     svc,
+				})
+			}
+		}
+	}
+	return out
+}
+
+func (e *endpointsController) buildIstioEndpointFromAddress(ep *v1.Endpoints, ss v1.EndpointSubset, endpoints []v1.EndpointAddress,
+	host host.Name, discoverabilityPolicy model.EndpointDiscoverabilityPolicy, health model.HealthStatus,
+) []*model.IstioEndpoint {
+	var istioEndpoints []*model.IstioEndpoint
+	for _, ea := range endpoints {
+		pod, expectedPod := getPod(e.c, ea.IP, &metav1.ObjectMeta{Name: ep.Name, Namespace: ep.Namespace}, ea.TargetRef, host)
+		if pod == nil && expectedPod {
+			continue
+		}
+		builder := NewEndpointBuilder(e.c, pod)
+		// EDS and ServiceEntry use name for service port - ADS will need to map to numbers.
+		for _, port := range ss.Ports {
+			istioEndpoint := builder.buildIstioEndpoint(ea.IP, port.Port, port.Name, discoverabilityPolicy)
+			istioEndpoint.HealthStatus = health
+			istioEndpoints = append(istioEndpoints, istioEndpoint)
+		}
+	}
+	return istioEndpoints
+}
+
+func (e *endpointsController) buildIstioEndpointsWithService(name, namespace string, host host.Name, _ bool) []*model.IstioEndpoint {
+	ep, err := listerv1.NewEndpointsLister(e.informer.GetIndexer()).Endpoints(namespace).Get(name)
+	if err != nil || ep == nil {
+		log.Debugf("endpoints(%s, %s) not found => error %v", name, namespace, err)
+		return nil
+	}
+
+	return e.buildIstioEndpoints(ep, host)
+}
+
+func (e *endpointsController) getServiceNamespacedName(ep any) types.NamespacedName {
 	endpoint := ep.(*v1.Endpoints)
-	return kube.ServiceHostname(endpoint.Name, endpoint.Namespace, e.c.domainSuffix), endpoint.Name, endpoint.Namespace
+	return kube.NamespacedNameForK8sObject(endpoint)
 }
 
 // endpointsEqual returns true if the two endpoints are the same in aspects Pilot cares about
 // This currently means only looking at "Ready" endpoints
-func endpointsEqual(first, second interface{}) bool {
+func endpointsEqual(first, second any) bool {
 	a := first.(*v1.Endpoints)
 	b := second.(*v1.Endpoints)
 	if len(a.Subsets) != len(b.Subsets) {

@@ -16,16 +16,14 @@ package helm
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/mholt/archiver"
-
 	"istio.io/istio/operator/pkg/httprequest"
+	"istio.io/istio/operator/pkg/util/tgz"
 	"istio.io/istio/operator/pkg/version"
 )
 
@@ -77,24 +75,18 @@ func (f *URLFetcher) Fetch() error {
 	if _, _, err := URLToDirname(f.url); err != nil {
 		return err
 	}
-	if _, err := os.Stat(f.destDirRoot); os.IsNotExist(err) {
-		err := os.Mkdir(f.destDirRoot, os.ModeDir|os.ModePerm)
-		if err != nil {
-			return err
-		}
-	}
 	saved, err := DownloadTo(f.url, f.destDirRoot)
 	if err != nil {
 		return err
 	}
-	file, err := os.Open(saved)
+
+	reader, err := os.Open(saved)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer reader.Close()
 
-	targz := archiver.TarGz{Tar: &archiver.Tar{OverwriteExisting: true}}
-	return targz.Unarchive(saved, f.destDirRoot)
+	return tgz.Extract(reader, f.destDirRoot)
 }
 
 // DownloadTo downloads from remote srcURL to dest local file path
@@ -110,7 +102,15 @@ func DownloadTo(srcURL, dest string) (string, error) {
 
 	name := filepath.Base(u.Path)
 	destFile := filepath.Join(dest, name)
-	if err := ioutil.WriteFile(destFile, data, 0666); err != nil {
+	dir := filepath.Dir(destFile)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		err := os.Mkdir(dir, 0o755)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	if err := os.WriteFile(destFile, data, 0o644); err != nil {
 		return destFile, err
 	}
 

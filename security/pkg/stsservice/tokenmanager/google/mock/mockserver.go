@@ -15,7 +15,6 @@
 package mock
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -30,10 +29,11 @@ import (
 )
 
 var (
-	FakeFederatedToken   = "FakeFederatedToken"
-	FakeAccessToken      = "FakeAccessToken"
-	FakeTrustDomain      = "FakeTrustDomain"
-	FakeSubjectToken     = "FakeSubjectToken"
+	FakeFederatedToken = "FakeFederatedToken"
+	FakeAccessToken    = "FakeAccessToken"
+	FakeTrustDomain    = "FakeTrustDomain"
+	// FakeSubjectToken is a fake JWT token without signing, anyone can change it if needed by base64 decoding or using online tool like https://jwt.io/.
+	FakeSubjectToken     = "eyJhbGciOiJSUzI1NiIsImtpZCI6IjNZemdPQnpLcENublNPSWVPZGNyWjktMGV5UXdRc2V3RHgtOWxmS20tMWcifQ.eyJhdWQiOlsiRmFrZVRydXN0RG9tYWluIl0sImV4cCI6MTU5Njg5NjI0NiwiaWF0IjoxNTk2ODUzMDQ2LCJpc3MiOiJodHRwczovL2NvbnRhaW5lci5nb29nbGVhcGlzLmNvbS92MS9wcm9qZWN0cy90ZXN0cHJvai9sb2NhdGlvbnMvdXMtY2VudHJhbDEtYy9jbHVzdGVycy9jbHVzdGVyLTEiLCJrdWJlcm5ldGVzLmlvIjp7Im5hbWVzcGFjZSI6ImRlZmF1bHQiLCJwb2QiOnsibmFtZSI6InByb2R1Y3RwYWdlLXYxLTdmNGNjOTg4YzYtZG1kcWciLCJ1aWQiOiIzYzUwMDYwZC05OGQwLTRmNzItYTM5Zi0zZmMyODFjNjdiM2EifSwic2VydmljZWFjY291bnQiOnsibmFtZSI6ImJvb2tpbmZvLXByb2R1Y3RwYWdlIiwidWlkIjoiYTlhNzE4NWUtZjhjOC00NGVlLTgzYzMtZDgyOWZjZDk4M2FiIn19LCJuYmYiOjE1OTY4NTMwNDYsInN1YiI6InN5c3RlbTpzZXJ2aWNlYWNjb3VudDpkZWZhdWx0OmJvb2tpbmZvLXByb2R1Y3RwYWdlIn0=.blablablafoofoofoofakesignature" // nolint: lll
 	FakeProjectNum       = "1234567"
 	FakeGKEClusterURL    = "https://container.googleapis.com/v1/projects/fakeproject/locations/fakelocation/clusters/fakecluster"
 	FakeExpiresInSeconds = 3600
@@ -204,10 +204,10 @@ func (ms *AuthorizationServer) NumGetFederatedTokenCalls() int {
 func (ms *AuthorizationServer) Start(port int) error {
 	atEndpoint := fmt.Sprintf("/v1/projects/-/serviceAccounts/service-%s@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken", FakeProjectNum)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/identitybindingtoken", ms.getFederatedToken)
+	mux.HandleFunc("/v1/token", ms.getFederatedToken)
 	mux.HandleFunc(atEndpoint, ms.getAccessToken)
-	ms.t.Logf("Registered handler for endpoints:\n%s\n%s", atEndpoint, "/v1/identitybindingtoken")
-	server := &http.Server{
+	ms.t.Logf("Registered handler for endpoints:\n%s\n%s", atEndpoint, "/v1/token")
+	ms.server = &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
 		Handler: mux,
 	}
@@ -223,7 +223,7 @@ func (ms *AuthorizationServer) Start(port int) error {
 	ms.URL = fmt.Sprintf("http://localhost:%d", port)
 
 	go func() {
-		if err := server.Serve(ln); err != nil {
+		if err := ms.server.Serve(ln); err != nil {
 			log.Errorf("Server failed to serve in %q: %v", ms.URL, err)
 		}
 	}()
@@ -239,7 +239,7 @@ func (ms *AuthorizationServer) Stop() error {
 	if ms.server == nil {
 		return nil
 	}
-	return ms.server.Shutdown(context.TODO())
+	return ms.server.Close()
 }
 
 func (ms *AuthorizationServer) getFederatedToken(w http.ResponseWriter, req *http.Request) {

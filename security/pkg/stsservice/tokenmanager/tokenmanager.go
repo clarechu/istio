@@ -19,7 +19,7 @@ import (
 	"fmt"
 
 	"istio.io/istio/pkg/bootstrap/platform"
-	"istio.io/istio/security/pkg/stsservice"
+	"istio.io/istio/pkg/security"
 	"istio.io/istio/security/pkg/stsservice/tokenmanager/google"
 )
 
@@ -30,8 +30,10 @@ const (
 
 // Plugin provides common interfaces for specific token exchange services.
 type Plugin interface {
-	ExchangeToken(parameters stsservice.StsRequestParameters) ([]byte, error)
+	ExchangeToken(parameters security.StsRequestParameters) ([]byte, error)
 	DumpPluginStatus() ([]byte, error)
+	// GetMetadata returns the metadata headers related to the token
+	GetMetadata(forCA bool, xdsAuthProvider, token string) (map[string]string, error)
 }
 
 type TokenManager struct {
@@ -39,6 +41,7 @@ type TokenManager struct {
 }
 
 type Config struct {
+	CredFetcher security.CredFetcher
 	TrustDomain string
 }
 
@@ -49,9 +52,10 @@ type GCPProjectInfo struct {
 	id              string
 	cluster         string
 	clusterLocation string
+	clusterURL      string
 }
 
-func getGCPProjectInfo() GCPProjectInfo {
+func GetGCPProjectInfo() GCPProjectInfo {
 	info := GCPProjectInfo{}
 	if platform.IsGCP() {
 		md := platform.NewGCP().Metadata()
@@ -67,30 +71,36 @@ func getGCPProjectInfo() GCPProjectInfo {
 		if clusterLocation, found := md[platform.GCPLocation]; found {
 			info.clusterLocation = clusterLocation
 		}
+		if clusterURL, found := md[platform.GCPClusterURL]; found {
+			info.clusterURL = clusterURL
+		}
 	}
 	return info
 }
 
 // CreateTokenManager creates a token manager with specified type and returns
 // that token manager
-func CreateTokenManager(tokenManagerType string, config Config) stsservice.TokenManager {
+func CreateTokenManager(tokenManagerType string, config Config) (security.TokenManager, error) {
 	tm := &TokenManager{
 		plugin: nil,
 	}
 	switch tokenManagerType {
 	case GoogleTokenExchange:
-		if projectInfo := getGCPProjectInfo(); len(projectInfo.Number) > 0 {
-			gkeClusterURL := fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
-				projectInfo.id, projectInfo.clusterLocation, projectInfo.cluster)
-			if p, err := google.CreateTokenManagerPlugin(config.TrustDomain, projectInfo.Number, gkeClusterURL, true); err == nil {
+		if projectInfo := GetGCPProjectInfo(); len(projectInfo.Number) > 0 {
+			if p, err := google.CreateTokenManagerPlugin(config.CredFetcher, config.TrustDomain,
+				projectInfo.Number, projectInfo.clusterURL, true); err == nil {
 				tm.plugin = p
+			} else {
+				return nil, err
 			}
+		} else {
+			return nil, fmt.Errorf("%v token manager specified but failed to ready GCP project information", GoogleTokenExchange)
 		}
 	}
-	return tm
+	return tm, nil
 }
 
-func (tm *TokenManager) GenerateToken(parameters stsservice.StsRequestParameters) ([]byte, error) {
+func (tm *TokenManager) GenerateToken(parameters security.StsRequestParameters) ([]byte, error) {
 	if tm.plugin != nil {
 		return tm.plugin.ExchangeToken(parameters)
 	}
@@ -102,6 +112,20 @@ func (tm *TokenManager) DumpTokenStatus() ([]byte, error) {
 		return tm.plugin.DumpPluginStatus()
 	}
 	return nil, errors.New("no plugin is found")
+}
+
+func (tm *TokenManager) GetMetadata(forCA bool, xdsAuthProvider, token string) (map[string]string, error) {
+	if tm.plugin != nil {
+		return tm.plugin.GetMetadata(forCA, xdsAuthProvider, token)
+	}
+	// If no plugin, for an non-empty token, place the token in the authorization header.
+	if len(token) > 0 {
+		return map[string]string{
+			"authorization": "Bearer " + token,
+		}, nil
+	}
+	// Otherwise, return an error
+	return nil, errors.New("no plugin is found and token is empty in token manager")
 }
 
 // SetPlugin sets token exchange plugin for testing purposes only.

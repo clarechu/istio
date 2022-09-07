@@ -17,73 +17,245 @@ package forwarder
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/lucas-clemente/quic-go"
+	"github.com/lucas-clemente/quic-go/http3"
 	"golang.org/x/net/http2"
 
-	"istio.io/istio/pkg/test/echo/common"
-	"istio.io/istio/pkg/test/echo/common/response"
+	"istio.io/istio/pkg/hbone"
+	"istio.io/istio/pkg/test/echo"
+	"istio.io/istio/pkg/test/echo/common/scheme"
+	"istio.io/istio/pkg/test/echo/proto"
 )
 
 var _ protocol = &httpProtocol{}
 
 type httpProtocol struct {
-	client *http.Client
-	do     common.HTTPDoFunc
+	e *executor
 }
 
-func (c *httpProtocol) setHost(r *http.Request, host string) {
-	r.Host = host
+func newHTTPProtocol(e *executor) *httpProtocol {
+	return &httpProtocol{e: e}
+}
 
-	if r.URL.Scheme == "https" {
-		// Set SNI value to be same as the request Host
-		// For use with SNI routing tests
-		httpTransport, ok := c.client.Transport.(*http.Transport)
-		if ok {
-			httpTransport.TLSClientConfig.ServerName = host
-		} else {
-			httpTransport := c.client.Transport.(*http2.Transport)
-			httpTransport.TLSClientConfig.ServerName = host
+type httpTransportGetter func() (http.RoundTripper, func(), error)
+
+func (c *httpProtocol) ForwardEcho(ctx context.Context, cfg *Config) (*proto.ForwardEchoResponse, error) {
+	var getTransport httpTransportGetter
+	var closeSharedTransport func()
+
+	switch {
+	case cfg.Request.Http3:
+		getTransport, closeSharedTransport = newHTTP3TransportGetter(cfg)
+	case cfg.Request.Http2:
+		getTransport, closeSharedTransport = newHTTP2TransportGetter(cfg)
+	default:
+		getTransport, closeSharedTransport = newHTTPTransportGetter(cfg)
+	}
+
+	defer closeSharedTransport()
+
+	call := &httpCall{
+		httpProtocol: c,
+		getTransport: getTransport,
+	}
+
+	return doForward(ctx, cfg, c.e, call.makeRequest)
+}
+
+func newHTTP3TransportGetter(cfg *Config) (httpTransportGetter, func()) {
+	newConn := func() *http3.RoundTripper {
+		return &http3.RoundTripper{
+			TLSClientConfig: cfg.tlsConfig,
+			QuicConfig:      &quic.Config{},
 		}
 	}
+	closeFn := func(conn *http3.RoundTripper) func() {
+		return func() {
+			_ = conn.Close()
+		}
+	}
+	noCloseFn := func() {}
+
+	if cfg.newConnectionPerRequest {
+		// Create a new transport (i.e. connection) for each request.
+		return func() (http.RoundTripper, func(), error) {
+			conn := newConn()
+			return conn, closeFn(conn), nil
+		}, noCloseFn
+	}
+
+	// Re-use the same transport for all requests. For HTTP3, this should result
+	// in multiplexing all requests over the same connection.
+	conn := newConn()
+	return func() (http.RoundTripper, func(), error) {
+		return conn, noCloseFn, nil
+	}, closeFn(conn)
 }
 
-func (c *httpProtocol) makeRequest(ctx context.Context, req *request) (string, error) {
-	httpReq, err := http.NewRequest("GET", req.URL, nil)
-	if err != nil {
-		return "", err
+func newHTTP2TransportGetter(cfg *Config) (httpTransportGetter, func()) {
+	newConn := func() *http2.Transport {
+		if cfg.scheme == scheme.HTTPS {
+			return &http2.Transport{
+				TLSClientConfig: cfg.tlsConfig,
+				DialTLS: func(network, addr string, tlsConfig *tls.Config) (net.Conn, error) {
+					return hbone.TLSDialWithDialer(newDialer(cfg), network, addr, tlsConfig)
+				},
+			}
+		}
+
+		return &http2.Transport{
+			// Golang doesn't have first class support for h2c, so we provide some workarounds
+			// See https://www.mailgun.com/blog/http-2-cleartext-h2c-client-example-go/
+			// So http2.Transport doesn't complain the URL scheme isn't 'https'
+			AllowHTTP: true,
+			// Pretend we are dialing a TLS endpoint. (Note, we ignore the passed tls.Config)
+			DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
+				return newDialer(cfg).Dial(network, addr)
+			},
+		}
 	}
+	closeFn := func(conn *http2.Transport) func() {
+		return conn.CloseIdleConnections
+	}
+	noCloseFn := func() {}
+
+	if cfg.newConnectionPerRequest {
+		// Create a new transport (i.e. connection) for each request.
+		return func() (http.RoundTripper, func(), error) {
+			conn := newConn()
+			return conn, closeFn(conn), nil
+		}, noCloseFn
+	}
+
+	// Re-use the same transport for all requests. For HTTP2, this should result
+	// in multiplexing all requests over the same connection.
+	conn := newConn()
+	return func() (http.RoundTripper, func(), error) {
+		return conn, noCloseFn, nil
+	}, closeFn(conn)
+}
+
+func newHTTPTransportGetter(cfg *Config) (httpTransportGetter, func()) {
+	newConn := func() *http.Transport {
+		dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return newDialer(cfg).DialContext(ctx, network, addr)
+		}
+		if len(cfg.UDS) > 0 {
+			dialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return newDialer(cfg).DialContext(ctx, "unix", cfg.UDS)
+			}
+		}
+		out := &http.Transport{
+			// No connection pooling.
+			DisableKeepAlives: true,
+			TLSClientConfig:   cfg.tlsConfig,
+			DialContext:       dialContext,
+			Proxy:             http.ProxyFromEnvironment,
+		}
+
+		// Set the proxy in the transport, if specified.
+		out.Proxy = cfg.proxyURL
+		return out
+	}
+	noCloseFn := func() {}
+
+	// Always create a new HTTP transport for each request, since HTTP can't multiplex over
+	// a single connection.
+	return func() (http.RoundTripper, func(), error) {
+		conn := newConn()
+		return conn, noCloseFn, nil
+	}, noCloseFn
+}
+
+type httpCall struct {
+	*httpProtocol
+	getTransport httpTransportGetter
+}
+
+func (c *httpCall) makeRequest(ctx context.Context, cfg *Config, requestID int) (string, error) {
+	start := time.Now()
+
+	r := cfg.Request
+	var outBuffer bytes.Buffer
+	echo.ForwarderURLField.WriteForRequest(&outBuffer, requestID, r.Url)
 
 	// Set the per-request timeout.
-	ctx, cancel := context.WithTimeout(ctx, req.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, cfg.timeout)
 	defer cancel()
-	httpReq = httpReq.WithContext(ctx)
 
-	var outBuffer bytes.Buffer
-	outBuffer.WriteString(fmt.Sprintf("[%d] Url=%s\n", req.RequestID, req.URL))
-	host := ""
-	writeHeaders(req.RequestID, req.Header, outBuffer, func(key string, value string) {
-		if key == hostHeader {
-			host = value
-		} else {
-			httpReq.Header.Add(key, value)
-		}
-	})
-
-	c.setHost(httpReq, host)
-
-	httpResp, err := c.do(c.client, httpReq)
+	httpReq, err := http.NewRequestWithContext(ctx, cfg.method, cfg.urlHost, nil)
 	if err != nil {
 		return outBuffer.String(), err
 	}
 
-	outBuffer.WriteString(fmt.Sprintf("[%d] %s=%d\n", req.RequestID, response.StatusCodeField, httpResp.StatusCode))
+	// Use raw path, we don't want golang normalizing anything since we use this for testing purposes
+	httpReq.URL.Opaque = cfg.urlPath
 
-	keys := []string{}
+	// Use the host header as the host.
+	httpReq.Host = cfg.hostHeader
+
+	// Copy the headers.
+	httpReq.Header = cfg.headers.Clone()
+	writeForwardedHeaders(&outBuffer, requestID, cfg.headers)
+
+	// Get the transport.
+	transport, closeTransport, err := c.getTransport()
+	if err != nil {
+		return outBuffer.String(), err
+	}
+	defer closeTransport()
+
+	// Create a new HTTP client.
+	client := &http.Client{
+		CheckRedirect: cfg.checkRedirect,
+		Timeout:       cfg.timeout,
+		Transport:     transport,
+	}
+
+	// Make the request.
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return outBuffer.String(), err
+	}
+
+	echo.LatencyField.WriteForRequest(&outBuffer, requestID, fmt.Sprintf("%v", time.Since(start)))
+	echo.ActiveRequestsField.WriteForRequest(&outBuffer, requestID, fmt.Sprintf("%d", c.e.ActiveRequests()))
+
+	// Process the response.
+	err = processHTTPResponse(requestID, httpResp, &outBuffer)
+
+	// Extract the output string.
+	return outBuffer.String(), err
+}
+
+func processHTTPResponse(requestID int, httpResp *http.Response, outBuffer *bytes.Buffer) error {
+	// Make sure we close the body before exiting.
+	defer func() {
+		if err := httpResp.Body.Close(); err != nil {
+			echo.WriteError(outBuffer, requestID, err)
+		}
+	}()
+
+	echo.StatusCodeField.WriteForRequest(outBuffer, requestID, strconv.Itoa(httpResp.StatusCode))
+
+	// Read the entire body.
+	data, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return err
+	}
+
+	// Write the response headers to the output buffer.
+	var keys []string
 	for k := range httpResp.Header {
 		keys = append(keys, k)
 	}
@@ -91,31 +263,19 @@ func (c *httpProtocol) makeRequest(ctx context.Context, req *request) (string, e
 	for _, key := range keys {
 		values := httpResp.Header[key]
 		for _, value := range values {
-			outBuffer.WriteString(fmt.Sprintf("[%d] ResponseHeader=%s:%s\n", req.RequestID, key, value))
+			echo.ResponseHeaderField.WriteKeyValueForRequest(outBuffer, requestID, key, value)
 		}
 	}
 
-	data, err := ioutil.ReadAll(httpResp.Body)
-	defer func() {
-		if err = httpResp.Body.Close(); err != nil {
-			outBuffer.WriteString(fmt.Sprintf("[%d error] %s\n", req.RequestID, err))
-		}
-	}()
-
-	if err != nil {
-		return outBuffer.String(), err
-	}
-
+	// Write the lines of the body to the output buffer.
 	for _, line := range strings.Split(string(data), "\n") {
 		if line != "" {
-			outBuffer.WriteString(fmt.Sprintf("[%d body] %s\n", req.RequestID, line))
+			echo.WriteBodyLine(outBuffer, requestID, line)
 		}
 	}
-
-	return outBuffer.String(), nil
+	return nil
 }
 
 func (c *httpProtocol) Close() error {
-	c.client.CloseIdleConnections()
 	return nil
 }

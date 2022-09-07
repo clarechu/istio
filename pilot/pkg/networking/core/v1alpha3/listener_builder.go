@@ -15,39 +15,35 @@
 package v1alpha3
 
 import (
-	"sort"
+	"time"
 
+	accesslog "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
-	wellknown "github.com/envoyproxy/go-control-plane/pkg/wellknown"
-	golangproto "github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/wrappers"
+	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
+	"google.golang.org/protobuf/types/known/durationpb"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
+	extensions "istio.io/api/extensions/v1alpha1"
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
-	"istio.io/pkg/log"
-
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/envoyfilter"
+	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/extension"
 	istio_route "istio.io/istio/pilot/pkg/networking/core/v1alpha3/route"
-	"istio.io/istio/pilot/pkg/networking/plugin"
+	"istio.io/istio/pilot/pkg/networking/plugin/authn"
+	"istio.io/istio/pilot/pkg/networking/plugin/authz"
 	"istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/istio/pilot/pkg/util/protoconv"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
+	"istio.io/istio/pilot/pkg/xds/requestidextension"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/proto"
-)
-
-var (
-	dummyServiceInstance = &model.ServiceInstance{
-		Service:     &model.Service{},
-		ServicePort: &model.Port{},
-		Endpoint: &model.IstioEndpoint{
-			EndpointPort: 15006,
-		},
-	}
+	"istio.io/pkg/log"
 )
 
 // A stateful listener builder
@@ -64,125 +60,21 @@ type ListenerBuilder struct {
 	httpProxyListener       *listener.Listener
 	virtualOutboundListener *listener.Listener
 	virtualInboundListener  *listener.Listener
-	// UDP listener for local dns resolution in Envoy
-	dnsListener *listener.Listener
+
+	envoyFilterWrapper *model.EnvoyFilterWrapper
+
+	// authnBuilder provides access to authn (mTLS) configuration for the given proxy.
+	authnBuilder *authn.Builder
+	// authzBuilder provides access to authz configuration for the given proxy.
+	authzBuilder *authz.Builder
+	// authzCustomBuilder provides access to CUSTOM authz configuration for the given proxy.
+	authzCustomBuilder *authz.Builder
 }
 
-// Setup the filter chain match so that the match should work under both
-// - bind_to_port == false listener
-// - virtual inbound listener
-func amendFilterChainMatchFromInboundListener(chain *listener.FilterChain, l *listener.Listener, needTLS bool) (*listener.FilterChain, bool) {
-	if chain.FilterChainMatch == nil {
-		chain.FilterChainMatch = &listener.FilterChainMatch{}
-	}
-	listenerAddress := l.Address
-	if sockAddr := listenerAddress.GetSocketAddress(); sockAddr != nil {
-		chain.FilterChainMatch.DestinationPort = &wrappers.UInt32Value{Value: sockAddr.GetPortValue()}
-		if cidr := util.ConvertAddressToCidr(sockAddr.GetAddress()); cidr != nil {
-			if chain.FilterChainMatch.PrefixRanges != nil && len(chain.FilterChainMatch.PrefixRanges) != 1 {
-				log.Debugf("Intercepted inbound listener %s have neither 0 or 1 prefix ranges. Actual:  %d",
-					l.Name, len(chain.FilterChainMatch.PrefixRanges))
-			}
-			if sockAddr.Address != WildcardAddress && sockAddr.Address != WildcardIPv6Address {
-				chain.FilterChainMatch.PrefixRanges = []*core.CidrRange{util.ConvertAddressToCidr(sockAddr.GetAddress())}
-			}
-		}
-		chain.Name = l.Name
-	}
-	for _, filter := range l.ListenerFilters {
-		if needTLS = needTLS || filter.Name == wellknown.TlsInspector; needTLS {
-			break
-		}
-	}
-	return chain, needTLS
-}
-
-func isBindtoPort(l *listener.Listener) bool {
-	v1 := l.GetDeprecatedV1()
-	if v1 == nil {
-		// Default is true
-		return true
-	}
-	bp := v1.BindToPort
-	if bp == nil {
-		// Default is true
-		return true
-	}
-	return bp.Value
-}
-
-// Accumulate the filter chains from per proxy service listeners
-func reduceInboundListenerToFilterChains(listeners []*listener.Listener) ([]*listener.FilterChain, bool) {
-	needTLS := false
-	chains := make([]*listener.FilterChain, 0)
-	for _, l := range listeners {
-		// default bindToPort is true and these listener should be skipped
-		if isBindtoPort(l) {
-			// A listener on real port should not be intercepted by virtual inbound listener
-			continue
-		}
-		for _, c := range l.FilterChains {
-			newChain, needTLSLocal := amendFilterChainMatchFromInboundListener(golangproto.Clone(c).(*listener.FilterChain), l, needTLS)
-			chains = append(chains, newChain)
-			needTLS = needTLS || needTLSLocal
-		}
-	}
-	return chains, needTLS
-}
-
-func (lb *ListenerBuilder) aggregateVirtualInboundListener(needTLSForPassThroughFilterChain bool) *ListenerBuilder {
-	// Deprecated by envoyproxy. Replaced
-	// 1. filter chains in this listener
-	// 2. explicit original_dst listener filter
-	// UseOriginalDst: proto.BoolTrue,
-	// nolint: staticcheck
-	lb.virtualInboundListener.HiddenEnvoyDeprecatedUseOriginalDst = nil
-	lb.virtualInboundListener.ListenerFilters = append(lb.virtualInboundListener.ListenerFilters,
-		xdsfilters.OriginalDestination,
-	)
-	// TODO: Trim the inboundListeners properly. Those that have been added to filter chains should
-	// be removed while those that haven't been added need to remain in the inboundListeners list.
-	filterChains, needTLS := reduceInboundListenerToFilterChains(lb.inboundListeners)
-	sort.SliceStable(filterChains, func(i, j int) bool {
-		return filterChains[i].Name < filterChains[j].Name
-	})
-
-	lb.virtualInboundListener.FilterChains =
-		append(lb.virtualInboundListener.FilterChains, filterChains...)
-
-	if needTLS || needTLSForPassThroughFilterChain {
-		lb.virtualInboundListener.ListenerFilters =
-			append(lb.virtualInboundListener.ListenerFilters, xdsfilters.TLSInspector)
-	}
-
-	if lb.node.GetInterceptionMode() == model.InterceptionTproxy {
-		lb.virtualInboundListener.ListenerFilters =
-			append(lb.virtualInboundListener.ListenerFilters, xdsfilters.OriginalSrc)
-	}
-
-	// Note: the HTTP inspector should be after TLS inspector.
-	// If TLS inspector sets transport protocol to tls, the http inspector
-	// won't inspect the packet.
-	if features.EnableProtocolSniffingForInbound {
-		lb.virtualInboundListener.ListenerFilters =
-			append(lb.virtualInboundListener.ListenerFilters, xdsfilters.HTTPInspector)
-	}
-
-	timeout := features.InboundProtocolDetectionTimeout
-	lb.virtualInboundListener.ListenerFiltersTimeout = ptypes.DurationProto(timeout)
-	lb.virtualInboundListener.ContinueOnListenerFiltersTimeout = true
-
-	// All listeners except bind_to_port=true listeners are now a part of virtual inbound and not needed
-	// we can filter these ones out.
-	bindToPortInbound := make([]*listener.Listener, 0, len(lb.inboundListeners))
-	for _, i := range lb.inboundListeners {
-		if isBindtoPort(i) {
-			bindToPortInbound = append(bindToPortInbound, i)
-		}
-	}
-	lb.inboundListeners = bindToPortInbound
-
-	return lb
+// enabledInspector captures if for a given listener, listener filter inspectors are added
+type enabledInspector struct {
+	HTTPInspector bool
+	TLSInspector  bool
 }
 
 func NewListenerBuilder(node *model.Proxy, push *model.PushContext) *ListenerBuilder {
@@ -190,84 +82,59 @@ func NewListenerBuilder(node *model.Proxy, push *model.PushContext) *ListenerBui
 		node: node,
 		push: push,
 	}
+	builder.authnBuilder = authn.NewBuilder(push, node)
+	builder.authzBuilder = authz.NewBuilder(authz.Local, push, node)
+	builder.authzCustomBuilder = authz.NewBuilder(authz.Custom, push, node)
 	return builder
 }
 
-func (lb *ListenerBuilder) buildSidecarInboundListeners(configgen *ConfigGeneratorImpl) *ListenerBuilder {
-	lb.inboundListeners = configgen.buildSidecarInboundListeners(lb.node, lb.push)
+func (lb *ListenerBuilder) appendSidecarInboundListeners() *ListenerBuilder {
+	lb.inboundListeners = lb.buildInboundListeners()
 	return lb
 }
 
-func (lb *ListenerBuilder) buildSidecarOutboundListeners(configgen *ConfigGeneratorImpl) *ListenerBuilder {
-	lb.outboundListeners = configgen.buildSidecarOutboundListeners(lb.node, lb.push)
+func (lb *ListenerBuilder) appendSidecarOutboundListeners() *ListenerBuilder {
+	lb.outboundListeners = lb.buildSidecarOutboundListeners(lb.node, lb.push)
 	return lb
 }
 
-func (lb *ListenerBuilder) buildSidecarDNSListener(configgen *ConfigGeneratorImpl) *ListenerBuilder {
-	lb.dnsListener = configgen.buildSidecarDNSListener(lb.node, lb.push)
-	return lb
-}
-
-func (lb *ListenerBuilder) buildHTTPProxyListener(configgen *ConfigGeneratorImpl) *ListenerBuilder {
-	httpProxy := configgen.buildHTTPProxy(lb.node, lb.push)
+func (lb *ListenerBuilder) buildHTTPProxyListener() *ListenerBuilder {
+	httpProxy := lb.buildHTTPProxy(lb.node, lb.push)
 	if httpProxy == nil {
 		return lb
 	}
 	removeListenerFilterTimeout([]*listener.Listener{httpProxy})
-	lb.patchOneListener(httpProxy, networking.EnvoyFilter_SIDECAR_OUTBOUND)
 	lb.httpProxyListener = httpProxy
 	return lb
 }
 
-func (lb *ListenerBuilder) buildVirtualOutboundListener(configgen *ConfigGeneratorImpl) *ListenerBuilder {
+func (lb *ListenerBuilder) buildVirtualOutboundListener() *ListenerBuilder {
+	if lb.node.GetInterceptionMode() == model.InterceptionNone {
+		// virtual listener is not necessary since workload is not using IPtables for traffic interception
+		return lb
+	}
 
 	var isTransparentProxy *wrappers.BoolValue
 	if lb.node.GetInterceptionMode() == model.InterceptionTproxy {
 		isTransparentProxy = proto.BoolTrue
 	}
 
-	filterChains := buildOutboundCatchAllNetworkFilterChains(configgen, lb.node, lb.push)
+	filterChains := buildOutboundCatchAllNetworkFilterChains(lb.node, lb.push)
 
 	actualWildcard, _ := getActualWildcardAndLocalHost(lb.node)
 
 	// add an extra listener that binds to the port that is the recipient of the iptables redirect
 	ipTablesListener := &listener.Listener{
-		Name:                                VirtualOutboundListenerName,
-		Address:                             util.BuildAddress(actualWildcard, uint32(lb.push.Mesh.ProxyListenPort)),
-		Transparent:                         isTransparentProxy,
-		HiddenEnvoyDeprecatedUseOriginalDst: proto.BoolTrue,
-		FilterChains:                        filterChains,
-		TrafficDirection:                    core.TrafficDirection_OUTBOUND,
+		Name:             model.VirtualOutboundListenerName,
+		Address:          util.BuildAddress(actualWildcard, uint32(lb.push.Mesh.ProxyListenPort)),
+		Transparent:      isTransparentProxy,
+		UseOriginalDst:   proto.BoolTrue,
+		FilterChains:     filterChains,
+		TrafficDirection: core.TrafficDirection_OUTBOUND,
 	}
-	configgen.onVirtualOutboundListener(lb.node, lb.push, ipTablesListener)
+	class := model.OutboundListenerClass(lb.node.Type)
+	accessLogBuilder.setListenerAccessLog(lb.push, lb.node, ipTablesListener, class)
 	lb.virtualOutboundListener = ipTablesListener
-	return lb
-}
-
-// TProxy uses only the virtual outbound listener on 15001 for both directions
-// but we still ship the no-op virtual inbound listener, so that the code flow is same across REDIRECT and TPROXY.
-func (lb *ListenerBuilder) buildVirtualInboundListener(configgen *ConfigGeneratorImpl) *ListenerBuilder {
-	var isTransparentProxy *wrappers.BoolValue
-	if lb.node.GetInterceptionMode() == model.InterceptionTproxy {
-		isTransparentProxy = proto.BoolTrue
-	}
-
-	actualWildcard, _ := getActualWildcardAndLocalHost(lb.node)
-	// add an extra listener that binds to the port that is the recipient of the iptables redirect
-	filterChains, needTLSForPassThroughFilterChain := buildInboundCatchAllNetworkFilterChains(configgen, lb.node, lb.push)
-	if features.EnableProtocolSniffingForInbound {
-		filterChains = append(filterChains, buildInboundCatchAllHTTPFilterChains(configgen, lb.node, lb.push)...)
-	}
-	lb.virtualInboundListener = &listener.Listener{
-		Name:                                VirtualInboundListenerName,
-		Address:                             util.BuildAddress(actualWildcard, ProxyInboundListenPort),
-		Transparent:                         isTransparentProxy,
-		HiddenEnvoyDeprecatedUseOriginalDst: proto.BoolTrue,
-		TrafficDirection:                    core.TrafficDirection_INBOUND,
-		FilterChains:                        filterChains,
-	}
-	lb.aggregateVirtualInboundListener(needTLSForPassThroughFilterChain)
-
 	return lb
 }
 
@@ -276,49 +143,47 @@ func (lb *ListenerBuilder) patchOneListener(l *listener.Listener, ctx networking
 		return nil
 	}
 	tempArray := []*listener.Listener{l}
-	tempArray = envoyfilter.ApplyListenerPatches(ctx, lb.node, lb.push, tempArray, true)
+	tempArray = envoyfilter.ApplyListenerPatches(ctx, lb.envoyFilterWrapper, tempArray, true)
 	// temp array will either be empty [if virtual listener was removed] or will have a modified listener
 	if len(tempArray) == 0 {
 		return nil
 	}
 	return tempArray[0]
 }
+
 func (lb *ListenerBuilder) patchListeners() {
+	lb.envoyFilterWrapper = lb.push.EnvoyFilters(lb.node)
+	if lb.envoyFilterWrapper == nil {
+		return
+	}
+
 	if lb.node.Type == model.Router {
-		lb.gatewayListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_GATEWAY, lb.node, lb.push, lb.gatewayListeners, false)
+		lb.gatewayListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_GATEWAY, lb.envoyFilterWrapper,
+			lb.gatewayListeners, false)
 		return
 	}
 
 	lb.virtualOutboundListener = lb.patchOneListener(lb.virtualOutboundListener, networking.EnvoyFilter_SIDECAR_OUTBOUND)
-	lb.dnsListener = lb.patchOneListener(lb.dnsListener, networking.EnvoyFilter_SIDECAR_OUTBOUND)
 	lb.virtualInboundListener = lb.patchOneListener(lb.virtualInboundListener, networking.EnvoyFilter_SIDECAR_INBOUND)
-	lb.inboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_INBOUND, lb.node,
-		lb.push, lb.inboundListeners, false)
-	lb.outboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_OUTBOUND, lb.node,
-		lb.push, lb.outboundListeners, false)
+	lb.httpProxyListener = lb.patchOneListener(lb.httpProxyListener, networking.EnvoyFilter_SIDECAR_OUTBOUND)
+	lb.inboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_INBOUND, lb.envoyFilterWrapper, lb.inboundListeners, false)
+	lb.outboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_OUTBOUND, lb.envoyFilterWrapper, lb.outboundListeners, false)
 }
 
 func (lb *ListenerBuilder) getListeners() []*listener.Listener {
 	if lb.node.Type == model.SidecarProxy {
 		nInbound, nOutbound := len(lb.inboundListeners), len(lb.outboundListeners)
-		nHTTPProxy, nVirtual, nVirtualInbound, nDNS := 0, 0, 0, 0
+		nHTTPProxy, nVirtual := 0, 0
 		if lb.httpProxyListener != nil {
 			nHTTPProxy = 1
 		}
 		if lb.virtualOutboundListener != nil {
 			nVirtual = 1
 		}
-		if lb.virtualInboundListener != nil {
-			nVirtualInbound = 1
-		}
-		if lb.dnsListener != nil {
-			nDNS = 1
-		}
 
-		nListener := nInbound + nOutbound + nHTTPProxy + nVirtual + nVirtualInbound + nDNS
+		nListener := nInbound + nOutbound + nHTTPProxy + nVirtual
 
 		listeners := make([]*listener.Listener, 0, nListener)
-		listeners = append(listeners, lb.inboundListeners...)
 		listeners = append(listeners, lb.outboundListeners...)
 		if lb.httpProxyListener != nil {
 			listeners = append(listeners, lb.httpProxyListener)
@@ -326,234 +191,23 @@ func (lb *ListenerBuilder) getListeners() []*listener.Listener {
 		if lb.virtualOutboundListener != nil {
 			listeners = append(listeners, lb.virtualOutboundListener)
 		}
-		if lb.virtualInboundListener != nil {
-			listeners = append(listeners, lb.virtualInboundListener)
-		}
-		if lb.dnsListener != nil {
-			listeners = append(listeners, lb.dnsListener)
-		}
+		listeners = append(listeners, lb.inboundListeners...)
 
 		log.Debugf("Build %d listeners for node %s including %d outbound, %d http proxy, "+
-			"%d virtual outbound and %d virtual inbound listeners, and %d DNS listener",
+			"%d virtual outbound",
 			nListener,
 			lb.node.ID,
 			nOutbound,
 			nHTTPProxy,
 			nVirtual,
-			nVirtualInbound,
-			nDNS)
+		)
 		return listeners
 	}
 
 	return lb.gatewayListeners
 }
 
-// Create pass through filter chains matching ipv4 address and ipv6 address independently.
-// This function also returns a boolean indicating whether or not the TLS inspector is needed
-// for the filter chain.
-func buildInboundCatchAllNetworkFilterChains(configgen *ConfigGeneratorImpl,
-	node *model.Proxy, push *model.PushContext) ([]*listener.FilterChain, bool) {
-	// ipv4 and ipv6 feature detect
-	ipVersions := make([]string, 0, 2)
-	if node.SupportsIPv4() {
-		ipVersions = append(ipVersions, util.InboundPassthroughClusterIpv4)
-	}
-	if node.SupportsIPv6() {
-		ipVersions = append(ipVersions, util.InboundPassthroughClusterIpv6)
-	}
-	filterChains := make([]*listener.FilterChain, 0, 2)
-
-	needTLS := false
-	for _, clusterName := range ipVersions {
-		tcpProxy := &tcp.TcpProxy{
-			StatPrefix:       clusterName,
-			ClusterSpecifier: &tcp.TcpProxy_Cluster{Cluster: clusterName},
-		}
-
-		matchingIP := ""
-		if clusterName == util.InboundPassthroughClusterIpv4 {
-			matchingIP = "0.0.0.0/0"
-		} else if clusterName == util.InboundPassthroughClusterIpv6 {
-			matchingIP = "::0/0"
-		}
-
-		setAccessLog(push, tcpProxy)
-		tcpProxyFilter := &listener.Filter{
-			Name:       wellknown.TCPProxy,
-			ConfigType: &listener.Filter_TypedConfig{TypedConfig: util.MessageToAny(tcpProxy)},
-		}
-
-		in := &plugin.InputParams{
-			Node:             node,
-			Push:             push,
-			ListenerProtocol: istionetworking.ListenerProtocolTCP,
-		}
-		var allChains []istionetworking.FilterChain
-		for _, p := range configgen.Plugins {
-			chains := p.OnInboundPassthroughFilterChains(in)
-			allChains = append(allChains, chains...)
-		}
-
-		if len(allChains) == 0 {
-			// Add one empty entry to the list if none of the plugins are interested in updating the filter chains.
-			allChains = []istionetworking.FilterChain{{}}
-		}
-		// Override the filter chain match to make sure the pass through filter chain captures the pass through traffic.
-		for i := range allChains {
-			chain := &allChains[i]
-			if chain.FilterChainMatch == nil {
-				chain.FilterChainMatch = &listener.FilterChainMatch{}
-			}
-			// Port : EMPTY to match all ports
-			chain.FilterChainMatch.DestinationPort = nil
-			chain.FilterChainMatch.PrefixRanges = []*core.CidrRange{
-				util.ConvertAddressToCidr(matchingIP),
-			}
-			chain.ListenerProtocol = istionetworking.ListenerProtocolTCP
-		}
-
-		mutable := &istionetworking.MutableObjects{
-			FilterChains: allChains,
-		}
-		for _, p := range configgen.Plugins {
-			if err := p.OnInboundPassthrough(in, mutable); err != nil {
-				log.Errorf("Build inbound passthrough filter chains error: %v", err)
-			}
-		}
-
-		// Construct the actual filter chains for each of the filter chain from the plugin.
-		for _, chain := range allChains {
-			filterChain := &listener.FilterChain{
-				FilterChainMatch: chain.FilterChainMatch,
-				Filters:          append(chain.TCP, tcpProxyFilter),
-			}
-			if chain.TLSContext != nil {
-				filterChain.FilterChainMatch.TransportProtocol = "tls"
-				// Update transport socket from the TLS context configured by the plugin.
-				filterChain.TransportSocket = &core.TransportSocket{
-					Name:       util.EnvoyTLSSocketName,
-					ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: util.MessageToAny(chain.TLSContext)},
-				}
-			}
-			for _, filter := range chain.ListenerFilters {
-				if filter.Name == wellknown.TlsInspector {
-					needTLS = true
-					break
-				}
-			}
-			filterChain.Name = VirtualInboundListenerName
-			filterChains = append(filterChains, filterChain)
-		}
-	}
-
-	return filterChains, needTLS
-}
-
-func buildInboundCatchAllHTTPFilterChains(configgen *ConfigGeneratorImpl,
-	node *model.Proxy, push *model.PushContext) []*listener.FilterChain {
-	// ipv4 and ipv6 feature detect
-	ipVersions := make([]string, 0, 2)
-	if node.SupportsIPv4() {
-		ipVersions = append(ipVersions, util.InboundPassthroughClusterIpv4)
-	}
-	if node.SupportsIPv6() {
-		ipVersions = append(ipVersions, util.InboundPassthroughClusterIpv6)
-	}
-	filterChains := make([]*listener.FilterChain, 0, 2)
-
-	for _, clusterName := range ipVersions {
-		matchingIP := ""
-		if clusterName == util.InboundPassthroughClusterIpv4 {
-			matchingIP = "0.0.0.0/0"
-		} else if clusterName == util.InboundPassthroughClusterIpv6 {
-			matchingIP = "::0/0"
-		}
-
-		port := &model.Port{
-			Name:     "virtualInbound",
-			Port:     15006,
-			Protocol: protocol.HTTP,
-		}
-
-		in := &plugin.InputParams{
-			ListenerProtocol:   istionetworking.ListenerProtocolHTTP,
-			Node:               node,
-			ServiceInstance:    dummyServiceInstance,
-			Port:               port,
-			Push:               push,
-			Bind:               matchingIP,
-			InboundClusterName: clusterName,
-		}
-		// Call plugins to install authn/authz policies.
-		var allChains []istionetworking.FilterChain
-		for _, p := range configgen.Plugins {
-			chains := p.OnInboundPassthroughFilterChains(in)
-			allChains = append(allChains, chains...)
-		}
-		if len(allChains) == 0 {
-			// Add one empty entry to the list if none of the plugins are interested in updating the filter chains.
-			allChains = []istionetworking.FilterChain{{}}
-		}
-
-		// Override the filter chain match to make sure the pass through filter chain captures the pass through traffic.
-		for i := range allChains {
-			chain := &allChains[i]
-			if chain.FilterChainMatch == nil {
-				chain.FilterChainMatch = &listener.FilterChainMatch{}
-			}
-			chain.FilterChainMatch.PrefixRanges = []*core.CidrRange{
-				util.ConvertAddressToCidr(matchingIP),
-			}
-			chain.FilterChainMatch.ApplicationProtocols = plaintextHTTPALPNs
-			chain.ListenerProtocol = istionetworking.ListenerProtocolHTTP
-		}
-
-		mutable := &istionetworking.MutableObjects{
-			FilterChains: allChains,
-		}
-		for _, p := range configgen.Plugins {
-			if err := p.OnInboundPassthrough(in, mutable); err != nil {
-				log.Errorf("Build inbound passthrough filter chains error: %v", err)
-			}
-		}
-
-		// Construct the actual filter chains for each of the filter chain from the plugin.
-		for _, chain := range allChains {
-			httpOpts := configgen.buildSidecarInboundHTTPListenerOptsForPortOrUDS(node, in)
-			httpOpts.statPrefix = clusterName
-			connectionManager := buildHTTPConnectionManager(in, httpOpts, chain.HTTP)
-
-			filter := &listener.Filter{
-				Name:       wellknown.HTTPConnectionManager,
-				ConfigType: &listener.Filter_TypedConfig{TypedConfig: util.MessageToAny(connectionManager)},
-			}
-
-			filterChain := &listener.FilterChain{
-				FilterChainMatch: chain.FilterChainMatch,
-				Filters:          []*listener.Filter{filter},
-			}
-			if chain.TLSContext != nil {
-				filterChain.FilterChainMatch.TransportProtocol = "tls"
-				filterChain.FilterChainMatch.ApplicationProtocols =
-					append(filterChain.FilterChainMatch.ApplicationProtocols, mtlsHTTPALPNs...)
-
-				// Update transport socket from the TLS context configured by the plugin.
-				filterChain.TransportSocket = &core.TransportSocket{
-					Name:       util.EnvoyTLSSocketName,
-					ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: util.MessageToAny(chain.TLSContext)},
-				}
-			}
-			filterChain.Name = virtualInboundCatchAllHTTPFilterChainName
-			filterChains = append(filterChains, filterChain)
-		}
-	}
-
-	return filterChains
-}
-
 func buildOutboundCatchAllNetworkFiltersOnly(push *model.PushContext, node *model.Proxy) []*listener.Filter {
-
-	filterStack := make([]*listener.Filter, 0)
 	var egressCluster string
 
 	if util.IsAllowAnyOutbound(node) {
@@ -570,15 +224,21 @@ func buildOutboundCatchAllNetworkFiltersOnly(push *model.PushContext, node *mode
 	} else {
 		egressCluster = util.BlackHoleCluster
 	}
+	idleTimeoutDuration, err := time.ParseDuration(node.Metadata.IdleTimeout)
+	if err != nil {
+		idleTimeoutDuration = 0
+	}
 
 	tcpProxy := &tcp.TcpProxy{
 		StatPrefix:       egressCluster,
 		ClusterSpecifier: &tcp.TcpProxy_Cluster{Cluster: egressCluster},
+		IdleTimeout:      durationpb.New(idleTimeoutDuration),
 	}
-	setAccessLog(push, tcpProxy)
+	filterStack := buildMetricsNetworkFilters(push, node, istionetworking.ListenerClassSidecarOutbound)
+	accessLogBuilder.setTCPAccessLog(push, node, tcpProxy, istionetworking.ListenerClassSidecarOutbound)
 	filterStack = append(filterStack, &listener.Filter{
 		Name:       wellknown.TCPProxy,
-		ConfigType: &listener.Filter_TypedConfig{TypedConfig: util.MessageToAny(tcpProxy)},
+		ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(tcpProxy)},
 	})
 
 	return filterStack
@@ -588,15 +248,161 @@ func buildOutboundCatchAllNetworkFiltersOnly(push *model.PushContext, node *mode
 // with TLS blocks and build the appropriate filter chain matches and routes here. And then finally
 // evaluate the left over unmatched TLS traffic using allow_any or registry_only.
 // See https://github.com/istio/istio/issues/21170
-func buildOutboundCatchAllNetworkFilterChains(_ *ConfigGeneratorImpl,
-	node *model.Proxy, push *model.PushContext) []*listener.FilterChain {
-
+func buildOutboundCatchAllNetworkFilterChains(node *model.Proxy, push *model.PushContext) []*listener.FilterChain {
 	filterStack := buildOutboundCatchAllNetworkFiltersOnly(push, node)
+	chains := make([]*listener.FilterChain, 0, 2)
+	chains = append(chains, blackholeFilterChain(push, node), &listener.FilterChain{
+		Name:    model.VirtualOutboundCatchAllTCPFilterChainName,
+		Filters: filterStack,
+	})
+	return chains
+}
 
-	return []*listener.FilterChain{
-		{
-			Name:    VirtualOutboundCatchAllTCPFilterChainName,
-			Filters: filterStack,
+func blackholeFilterChain(push *model.PushContext, node *model.Proxy) *listener.FilterChain {
+	return &listener.FilterChain{
+		Name: model.VirtualOutboundBlackholeFilterChainName,
+		FilterChainMatch: &listener.FilterChainMatch{
+			// We should not allow requests to the listen port directly. Requests must be
+			// sent to some other original port and iptables redirected to 15001. This
+			// ensures we do not passthrough back to the listen port.
+			DestinationPort: &wrappers.UInt32Value{Value: uint32(push.Mesh.ProxyListenPort)},
 		},
+		Filters: append(
+			buildMetricsNetworkFilters(push, node, istionetworking.ListenerClassSidecarOutbound),
+			&listener.Filter{
+				Name: wellknown.TCPProxy,
+				ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(&tcp.TcpProxy{
+					StatPrefix:       util.BlackHoleCluster,
+					ClusterSpecifier: &tcp.TcpProxy_Cluster{Cluster: util.BlackHoleCluster},
+				})},
+			},
+		),
 	}
+}
+
+func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts) *hcm.HttpConnectionManager {
+	if httpOpts.connectionManager == nil {
+		httpOpts.connectionManager = &hcm.HttpConnectionManager{}
+	}
+
+	connectionManager := httpOpts.connectionManager
+	if httpOpts.http3Only {
+		connectionManager.CodecType = hcm.HttpConnectionManager_HTTP3
+		connectionManager.Http3ProtocolOptions = &core.Http3ProtocolOptions{}
+	} else {
+		connectionManager.CodecType = hcm.HttpConnectionManager_AUTO
+	}
+	connectionManager.AccessLog = []*accesslog.AccessLog{}
+	connectionManager.StatPrefix = httpOpts.statPrefix
+
+	// Setup normalization
+	connectionManager.PathWithEscapedSlashesAction = hcm.HttpConnectionManager_KEEP_UNCHANGED
+	switch lb.push.Mesh.GetPathNormalization().GetNormalization() {
+	case meshconfig.MeshConfig_ProxyPathNormalization_NONE:
+		connectionManager.NormalizePath = proto.BoolFalse
+	case meshconfig.MeshConfig_ProxyPathNormalization_BASE, meshconfig.MeshConfig_ProxyPathNormalization_DEFAULT:
+		connectionManager.NormalizePath = proto.BoolTrue
+	case meshconfig.MeshConfig_ProxyPathNormalization_MERGE_SLASHES:
+		connectionManager.NormalizePath = proto.BoolTrue
+		connectionManager.MergeSlashes = true
+	case meshconfig.MeshConfig_ProxyPathNormalization_DECODE_AND_MERGE_SLASHES:
+		connectionManager.NormalizePath = proto.BoolTrue
+		connectionManager.MergeSlashes = true
+		connectionManager.PathWithEscapedSlashesAction = hcm.HttpConnectionManager_UNESCAPE_AND_FORWARD
+	}
+
+	if httpOpts.useRemoteAddress {
+		connectionManager.UseRemoteAddress = proto.BoolTrue
+	} else {
+		connectionManager.UseRemoteAddress = proto.BoolFalse
+	}
+
+	// Allow websocket upgrades
+	websocketUpgrade := &hcm.HttpConnectionManager_UpgradeConfig{UpgradeType: "websocket"}
+	connectionManager.UpgradeConfigs = []*hcm.HttpConnectionManager_UpgradeConfig{websocketUpgrade}
+
+	idleTimeout, err := time.ParseDuration(lb.node.Metadata.IdleTimeout)
+	if err == nil {
+		connectionManager.CommonHttpProtocolOptions = &core.HttpProtocolOptions{
+			IdleTimeout: durationpb.New(idleTimeout),
+		}
+	}
+
+	notimeout := durationpb.New(0 * time.Second)
+	connectionManager.StreamIdleTimeout = notimeout
+
+	if httpOpts.rds != "" {
+		rds := &hcm.HttpConnectionManager_Rds{
+			Rds: &hcm.Rds{
+				ConfigSource: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_Ads{
+						Ads: &core.AggregatedConfigSource{},
+					},
+					InitialFetchTimeout: durationpb.New(0),
+					ResourceApiVersion:  core.ApiVersion_V3,
+				},
+				RouteConfigName: httpOpts.rds,
+			},
+		}
+		connectionManager.RouteSpecifier = rds
+	} else {
+		connectionManager.RouteSpecifier = &hcm.HttpConnectionManager_RouteConfig{RouteConfig: httpOpts.routeConfig}
+	}
+
+	accessLogBuilder.setHTTPAccessLog(lb.push, lb.node, connectionManager, httpOpts.class)
+
+	routerFilterCtx, reqIDExtensionCtx := configureTracing(lb.push, lb.node, connectionManager, httpOpts.class)
+
+	filters := []*hcm.HttpFilter{}
+	wasm := lb.push.WasmPlugins(lb.node)
+	// TODO: how to deal with ext-authz? It will be in the ordering twice
+	filters = append(filters, lb.authzCustomBuilder.BuildHTTP(httpOpts.class)...)
+	filters = extension.PopAppend(filters, wasm, extensions.PluginPhase_AUTHN)
+	filters = append(filters, lb.authnBuilder.BuildHTTP(httpOpts.class)...)
+	filters = extension.PopAppend(filters, wasm, extensions.PluginPhase_AUTHZ)
+	filters = append(filters, lb.authzBuilder.BuildHTTP(httpOpts.class)...)
+
+	// TODO: these feel like the wrong place to insert, but this retains backwards compatibility with the original implementation
+	filters = extension.PopAppend(filters, wasm, extensions.PluginPhase_STATS)
+	filters = extension.PopAppend(filters, wasm, extensions.PluginPhase_UNSPECIFIED_PHASE)
+
+	if features.MetadataExchange {
+		filters = append(filters, xdsfilters.HTTPMx)
+	}
+
+	if httpOpts.protocol == protocol.GRPCWeb {
+		filters = append(filters, xdsfilters.GrpcWeb)
+	}
+
+	if httpOpts.protocol.IsGRPC() {
+		filters = append(filters, xdsfilters.GrpcStats)
+	}
+
+	// append ALPN HTTP filter in HTTP connection manager for outbound listener only.
+	if features.ALPNFilter {
+		if httpOpts.class != istionetworking.ListenerClassSidecarInbound {
+			filters = append(filters, xdsfilters.Alpn)
+		}
+	}
+
+	// TypedPerFilterConfig in route needs these filters.
+	filters = append(filters, xdsfilters.Fault, xdsfilters.Cors)
+	filters = append(filters, lb.push.Telemetry.HTTPFilters(lb.node, httpOpts.class)...)
+	filters = append(filters, xdsfilters.BuildRouterFilter(routerFilterCtx))
+
+	connectionManager.HttpFilters = filters
+	connectionManager.RequestIdExtension = requestidextension.BuildUUIDRequestIDExtension(reqIDExtensionCtx)
+
+	if features.EnableHCMInternalNetworks && lb.push.Networks != nil {
+		for _, internalnetwork := range lb.push.Networks.Networks {
+			iac := &hcm.HttpConnectionManager_InternalAddressConfig{}
+			for _, ne := range internalnetwork.Endpoints {
+				if cidr := util.ConvertAddressToCidr(ne.GetFromCidr()); cidr != nil {
+					iac.CidrRanges = append(iac.CidrRanges, cidr)
+				}
+			}
+			connectionManager.InternalAddressConfig = iac
+		}
+	}
+	return connectionManager
 }

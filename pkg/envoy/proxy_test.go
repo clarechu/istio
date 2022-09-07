@@ -18,25 +18,29 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/gogo/protobuf/types"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/mesh"
 )
 
 func TestEnvoyArgs(t *testing.T) {
-	proxyConfig := mesh.DefaultProxyConfig()
-	proxyConfig.ServiceCluster = "my-cluster"
-	proxyConfig.Concurrency = &types.Int32Value{Value: 8}
+	proxyConfig := (*model.NodeMetaProxyConfig)(mesh.DefaultProxyConfig())
+	proxyConfig.ClusterName = &meshconfig.ProxyConfig_ServiceCluster{ServiceCluster: "my-cluster"}
+	proxyConfig.Concurrency = &wrapperspb.Int32Value{Value: 8}
 
 	cfg := ProxyConfig{
-		Config:            proxyConfig,
-		Node:              "my-node",
-		LogLevel:          "trace",
-		ComponentLogLevel: "misc:error",
-		NodeIPs:           []string{"10.75.2.9", "192.168.11.18"},
-		PodName:           "",
-		PodNamespace:      "",
-		PodIP:             nil,
+		LogLevel:               "trace",
+		ComponentLogLevel:      "misc:error",
+		NodeIPs:                []string{"10.75.2.9", "192.168.11.18"},
+		BinaryPath:             proxyConfig.BinaryPath,
+		ConfigPath:             proxyConfig.ConfigPath,
+		ConfigCleanup:          true,
+		AdminPort:              proxyConfig.ProxyAdminPort,
+		DrainDuration:          proxyConfig.DrainDuration,
+		ParentShutdownDuration: proxyConfig.ParentShutdownDuration,
+		Concurrency:            8,
 	}
 
 	test := &envoy{
@@ -49,17 +53,15 @@ func TestEnvoyArgs(t *testing.T) {
 		t.Errorf("unexpected struct got\n%v\nwant\n%v", testProxy, test)
 	}
 
-	got := test.args("test.json", 5, "testdata/bootstrap.json")
+	got := test.args("test.json", "testdata/bootstrap.json")
 	want := []string{
 		"-c", "test.json",
-		"--restart-epoch", "5",
 		"--drain-time-s", "45",
+		"--drain-strategy", "immediate",
 		"--parent-shutdown-time-s", "60",
-		"--service-cluster", "my-cluster",
-		"--service-node", "my-node",
 		"--local-address-ip-version", "v4",
-		"--bootstrap-version", "3",
-		"--log-format-prefix-with-location", "0",
+		"--file-flush-interval-msec", "1000",
+		"--disable-hot-restart",
 		"--log-format", "%Y-%m-%dT%T.%fZ\t%l\tenvoy %n\t%v",
 		"-l", "trace",
 		"--component-log-level", "misc:error",
@@ -71,4 +73,28 @@ func TestEnvoyArgs(t *testing.T) {
 	}
 }
 
-// TestEnvoyRun is no longer used - we are now using v2 bootstrap API.
+func TestSplitComponentLog(t *testing.T) {
+	cases := []struct {
+		input      string
+		log        string
+		components []string
+	}{
+		{"info", "info", nil},
+		// A bit odd, but istio logging behaves this way so might as well be consistent
+		{"info,warn", "warn", nil},
+		{"info,misc:warn", "info", []string{"misc:warn"}},
+		{"misc:warn,info", "info", []string{"misc:warn"}},
+		{"misc:warn,info,upstream:debug", "info", []string{"misc:warn", "upstream:debug"}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.input, func(t *testing.T) {
+			l, c := splitComponentLog(tt.input)
+			if l != tt.log {
+				t.Errorf("expected log level %v, got %v", tt.log, l)
+			}
+			if !reflect.DeepEqual(c, tt.components) {
+				t.Errorf("expected component log level %v, got %v", tt.components, c)
+			}
+		})
+	}
+}

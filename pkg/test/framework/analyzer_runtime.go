@@ -17,13 +17,13 @@ package framework
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"sync"
 
 	"gopkg.in/yaml.v2"
 
+	"istio.io/istio/pkg/test/framework/config"
 	"istio.io/istio/pkg/test/framework/features"
 	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/scopes"
@@ -40,8 +40,8 @@ func init() {
 }
 
 func analyze() bool {
-	if !flag.Parsed() {
-		flag.Parse()
+	if !config.Parsed() {
+		config.Parse()
 	}
 	return analyzeMode
 }
@@ -80,7 +80,7 @@ func dumpAnalysis() {
 	scopes.Framework.Info("\n" + string(marshaled))
 
 	outPath := path.Join(s.RunDir(), fmt.Sprintf("%s_analysis.yaml", analysis.SuiteID))
-	if err := ioutil.WriteFile(outPath, marshaled, 0666); err != nil {
+	if err := os.WriteFile(outPath, marshaled, 0o666); err != nil {
 		scopes.Framework.Errorf("failed writing analysis to file for %s: %v", analysis.SuiteID, err)
 		return
 	}

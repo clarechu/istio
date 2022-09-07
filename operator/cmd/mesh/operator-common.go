@@ -19,9 +19,10 @@ import (
 
 	v12 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	_ "k8s.io/client-go/plugin/pkg/client/auth" // Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
+	_ "k8s.io/client-go/plugin/pkg/client/auth" //  Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 
 	"istio.io/istio/operator/pkg/helm"
+	"istio.io/istio/operator/pkg/manifest"
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/util"
 )
@@ -31,6 +32,8 @@ type operatorCommonArgs struct {
 	hub string
 	// tag is the tag for the operator image.
 	tag string
+	// imagePullSecrets is an array of imagePullSecret to pull operator image from the private registry
+	imagePullSecrets []string
 	// operatorNamespace is the namespace the operator controller is installed into.
 	operatorNamespace string
 	// watchedNamespaces is the namespaces the operator controller watches, could be namespace list separated by comma.
@@ -41,12 +44,13 @@ type operatorCommonArgs struct {
 	manifestsPath string
 	// revision is the Istio control plane revision the command targets.
 	revision string
+	// outputFormat controls the format of operator dumps
+	outputFormat string
 }
 
 const (
 	operatorResourceName     = "istio-operator"
 	operatorDefaultNamespace = "istio-operator"
-	istioDefaultNamespace    = "istio-system"
 )
 
 // isControllerInstalled reports whether an operator deployment exists in the given namespace.
@@ -59,39 +63,45 @@ func isControllerInstalled(cs kubernetes.Interface, operatorNamespace string, re
 }
 
 // renderOperatorManifest renders a manifest to install the operator with the given input arguments.
-func renderOperatorManifest(_ *rootArgs, ocArgs *operatorCommonArgs) (string, string, error) {
-	installPackagePath := ocArgs.manifestsPath
-	r, err := helm.NewHelmRenderer(installPackagePath, "istio-operator", string(name.IstioOperatorComponentName), ocArgs.operatorNamespace)
+func renderOperatorManifest(_ *RootArgs, ocArgs *operatorCommonArgs) (string, string, error) {
+	// If manifestsPath is a URL, fetch and extract it and continue with the local filesystem path instead.
+	installPackagePath, _, err := manifest.RewriteURLToLocalInstallPath(ocArgs.manifestsPath, "" /*profileOrPath*/, false /*skipValidation */)
 	if err != nil {
 		return "", "", err
 	}
+	r := helm.NewHelmRenderer(installPackagePath, "istio-operator", string(name.IstioOperatorComponentName), ocArgs.operatorNamespace, nil)
 
 	if err := r.Run(); err != nil {
 		return "", "", err
 	}
 
 	tmpl := `
-operatorNamespace: {{.OperatorNamespace}}
 istioNamespace: {{.IstioNamespace}}
 watchedNamespaces: {{.WatchedNamespaces}}
 hub: {{.Hub}}
 tag: {{.Tag}}
+{{- if .ImagePullSecrets }}
+imagePullSecrets:
+{{- range .ImagePullSecrets }}
+- {{ . }}
+{{- end }}
+{{- end }}
 revision: {{if .Revision }} {{.Revision}} {{else}} "" {{end}}
 `
 
 	tv := struct {
-		OperatorNamespace string
 		IstioNamespace    string
 		WatchedNamespaces string
 		Hub               string
 		Tag               string
+		ImagePullSecrets  []string
 		Revision          string
 	}{
-		OperatorNamespace: ocArgs.operatorNamespace,
 		IstioNamespace:    ocArgs.istioNamespace,
 		WatchedNamespaces: ocArgs.watchedNamespaces,
 		Hub:               ocArgs.hub,
 		Tag:               ocArgs.tag,
+		ImagePullSecrets:  ocArgs.imagePullSecrets,
 		Revision:          ocArgs.revision,
 	}
 	vals, err := util.RenderTemplate(tmpl, tv)

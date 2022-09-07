@@ -18,6 +18,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	matcherpb "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+
+	"istio.io/istio/pilot/pkg/security/authz/matcher"
+	authn "istio.io/istio/pilot/pkg/security/model"
 )
 
 // convertToPort converts a port string to a uint32.
@@ -34,4 +39,40 @@ func extractNameInBrackets(s string) (string, error) {
 		return "", fmt.Errorf("expecting format [<NAME>], but found %s", s)
 	}
 	return strings.TrimPrefix(strings.TrimSuffix(s, "]"), "["), nil
+}
+
+func extractNameInNestedBrackets(s string) ([]string, error) {
+	var claims []string
+	findEndBracket := func(begin int) int {
+		if begin >= len(s) || s[begin] != '[' {
+			return -1
+		}
+		for i := begin + 1; i < len(s); i++ {
+			if s[i] == '[' {
+				return -1
+			}
+			if s[i] == ']' {
+				return i
+			}
+		}
+		return -1
+	}
+	for begin := 0; begin < len(s); {
+		end := findEndBracket(begin)
+		if end == -1 {
+			ret, err := extractNameInBrackets(s)
+			if err != nil {
+				return nil, err
+			}
+			return []string{ret}, nil
+		}
+		claims = append(claims, s[begin+1:end])
+		begin = end + 1
+	}
+	return claims, nil
+}
+
+// MetadataMatcherForJWTClaims is a convenient method for generating metadata matcher for JWT claims.
+func MetadataMatcherForJWTClaims(claims []string, value *matcherpb.StringMatcher) *matcherpb.MetadataMatcher {
+	return matcher.MetadataListMatcher(authn.AuthnFilterName, append([]string{attrRequestClaims}, claims...), value)
 }

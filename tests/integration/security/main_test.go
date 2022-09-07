@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 //  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,36 +21,60 @@ import (
 	"testing"
 
 	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/authz"
+	"istio.io/istio/pkg/test/framework/components/echo/common/deployment"
 	"istio.io/istio/pkg/test/framework/components/istio"
+	"istio.io/istio/pkg/test/framework/components/jwt"
+	"istio.io/istio/pkg/test/framework/components/namespace"
+	"istio.io/istio/pkg/test/framework/resource"
 )
 
 var (
-	ist           istio.Instance
-	rootNamespace string
+	// Namespaces
+	echo1NS    namespace.Instance
+	echo2NS    namespace.Instance
+	externalNS namespace.Instance
+	serverNS   namespace.Instance
+
+	// Servers
+	apps             deployment.TwoNamespaceView
+	authzServer      authz.Server
+	localAuthzServer authz.Server
+	jwtServer        jwt.Server
 )
 
 func TestMain(m *testing.M) {
 	framework.
 		NewSuite(m).
-		RequireSingleCluster().
-		Setup(istio.Setup(&ist, setupConfig)).
-		Run()
-}
-
-func setupConfig(cfg *istio.Config) {
-	if cfg == nil {
-		return
-	}
-	rootNamespace = cfg.SystemNamespace
-
-	cfg.ControlPlaneValues = `
+		Setup(istio.Setup(nil, func(_ resource.Context, cfg *istio.Config) {
+			cfg.ControlPlaneValues = `
 values:
-  global:
-    meshExpansion:
-      enabled: true
-components:
-  egressGateways:
-  - enabled: true
-    name: istio-egressgateway
+  pilot: 
+    env: 
+      PILOT_JWT_ENABLE_REMOTE_JWKS: true
+meshConfig:
+  defaultConfig:
+    gatewayTopology:
+      numTrustedProxies: 1 # Needed for X-Forwarded-For (See https://istio.io/latest/docs/ops/configuration/traffic-management/network-topologies/)
 `
+		})).
+		// Create namespaces first. This way, echo can correctly configure egress to all namespaces.
+		SetupParallel(
+			namespace.Setup(&echo1NS, namespace.Config{Prefix: "echo1", Inject: true}),
+			namespace.Setup(&echo2NS, namespace.Config{Prefix: "echo2", Inject: true}),
+			namespace.Setup(&externalNS, namespace.Config{Prefix: "external", Inject: false}),
+			namespace.Setup(&serverNS, namespace.Config{Prefix: "servers", Inject: true})).
+		SetupParallel(
+			jwt.Setup(&jwtServer, namespace.Future(&serverNS)),
+			authz.Setup(&authzServer, namespace.Future(&serverNS)),
+			authz.SetupLocal(&localAuthzServer, namespace.Future(&echo1NS)),
+			deployment.SetupTwoNamespaces(&apps, deployment.Config{
+				IncludeExtAuthz: true,
+				Namespaces: []namespace.Getter{
+					namespace.Future(&echo1NS),
+					namespace.Future(&echo2NS),
+				},
+				ExternalNamespace: namespace.Future(&externalNS),
+			})).
+		Run()
 }

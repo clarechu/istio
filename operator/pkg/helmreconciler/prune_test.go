@@ -16,22 +16,23 @@ package helmreconciler
 
 import (
 	"context"
-	"io/ioutil"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/object"
-	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/util/clog"
 	"istio.io/istio/operator/pkg/util/progress"
+	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/test/env"
 )
 
@@ -41,21 +42,30 @@ const (
 
 func TestHelmReconciler_DeleteControlPlaneByManifest(t *testing.T) {
 	t.Run("deleteControlPlaneByManifest", func(t *testing.T) {
-		s := runtime.NewScheme()
-		cl := fake.NewFakeClientWithScheme(s)
+		cl := fake.NewClientBuilder().Build()
 		df := filepath.Join(env.IstioSrc, "manifests/profiles/default.yaml")
-		iopStr, err := ioutil.ReadFile(df)
+		iopStr, err := os.ReadFile(df)
 		if err != nil {
 			t.Fatal(err)
 		}
 		iop := &v1alpha1.IstioOperator{}
-		if err := util.UnmarshalWithJSONPB(string(iopStr), iop, false); err != nil {
+		if err := yaml.UnmarshalStrict(iopStr, iop); err != nil {
 			t.Fatal(err)
 		}
 		iop.Spec.Revision = testRevision
 		iop.Spec.InstallPackagePath = filepath.Join(env.IstioSrc, "manifests")
 
-		h := &HelmReconciler{client: cl, opts: &Options{ProgressLog: progress.NewLog(), Log: clog.NewDefaultLogger()}, iop: iop}
+		h := &HelmReconciler{
+			client:     cl,
+			kubeClient: kube.NewFakeClientWithVersion("24"),
+			opts: &Options{
+				ProgressLog: progress.NewLog(),
+				Log:         clog.NewDefaultLogger(),
+			},
+			iop:           iop,
+			countLock:     &sync.Mutex{},
+			prunedKindSet: map[schema.GroupKind]struct{}{},
+		}
 		manifestMap, err := h.RenderCharts()
 		if err != nil {
 			t.Fatalf("failed to render manifest: %v", err)
@@ -64,7 +74,7 @@ func TestHelmReconciler_DeleteControlPlaneByManifest(t *testing.T) {
 		if err := h.DeleteControlPlaneByManifests(manifestMap, testRevision, false); err != nil {
 			t.Fatalf("HelmReconciler.DeleteControlPlaneByManifests() error = %v", err)
 		}
-		for _, gvk := range append(NamespacedResources, ClusterCPResources...) {
+		for _, gvk := range append(h.NamespacedResources(), ClusterCPResources...) {
 			receiver := &unstructured.Unstructured{}
 			receiver.SetGroupVersionKind(schema.GroupVersionKind{Group: gvk.Group, Version: gvk.Version, Kind: gvk.Kind})
 			objKey := client.ObjectKey{Namespace: "istio-system", Name: "istiod-test"}
@@ -95,7 +105,7 @@ func applyResourcesIntoCluster(t *testing.T, h *HelmReconciler, manifestMap name
 			if err := h.applyLabelsAndAnnotations(obju, cn); err != nil {
 				t.Errorf("failed to apply label and annotations: %v", err)
 			}
-			if err := h.ApplyObject(obj.UnstructuredObject()); err != nil {
+			if err := h.ApplyObject(obj.UnstructuredObject(), false); err != nil {
 				t.Errorf("HelmReconciler.ApplyObject() error = %v", err)
 			}
 		}

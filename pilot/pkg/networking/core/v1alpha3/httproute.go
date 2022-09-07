@@ -16,122 +16,123 @@ package v1alpha3
 
 import (
 	"fmt"
+	"net"
+	"sort"
 	"strconv"
 	"strings"
 
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-	"github.com/golang/protobuf/ptypes"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	networking "istio.io/api/networking/v1alpha3"
-
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
-	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/envoyfilter"
 	istio_route "istio.io/istio/pilot/pkg/networking/core/v1alpha3/route"
-	"istio.io/istio/pilot/pkg/networking/plugin"
+	"istio.io/istio/pilot/pkg/networking/telemetry"
 	"istio.io/istio/pilot/pkg/networking/util"
-	"istio.io/istio/pilot/pkg/serviceregistry"
-	"istio.io/istio/pilot/pkg/util/sets"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/proto"
+	"istio.io/istio/pkg/util/sets"
 )
 
-const wildcardDomainPrefix = "*."
-const inboundVirtualHostPrefix = string(model.TrafficDirectionInbound) + "|http|"
+const (
+	wildcardDomainPrefix     = "*."
+	inboundVirtualHostPrefix = string(model.TrafficDirectionInbound) + "|http|"
+)
 
 // BuildHTTPRoutes produces a list of routes for the proxy
-func (configgen *ConfigGeneratorImpl) BuildHTTPRoutes(node *model.Proxy, push *model.PushContext,
-	routeNames []string) []*route.RouteConfiguration {
-	routeConfigurations := make([]*route.RouteConfiguration, 0)
+func (configgen *ConfigGeneratorImpl) BuildHTTPRoutes(
+	node *model.Proxy,
+	req *model.PushRequest,
+	routeNames []string,
+) ([]*discovery.Resource, model.XdsLogDetails) {
+	var routeConfigurations model.Resources
 
+	efw := req.Push.EnvoyFilters(node)
+	hit, miss := 0, 0
 	switch node.Type {
 	case model.SidecarProxy:
 		vHostCache := make(map[int][]*route.VirtualHost)
+		// dependent envoyfilters' key, calculate in front once to prevent calc for each route.
+		envoyfilterKeys := efw.Keys()
 		for _, routeName := range routeNames {
-			rc := configgen.buildSidecarOutboundHTTPRouteConfig(node, push, routeName, vHostCache)
-			if rc != nil {
-				rc = envoyfilter.ApplyRouteConfigurationPatches(networking.EnvoyFilter_SIDECAR_OUTBOUND, node, push, rc)
+			rc, cached := configgen.buildSidecarOutboundHTTPRouteConfig(node, req, routeName, vHostCache, efw, envoyfilterKeys)
+			if cached && !features.EnableUnsafeAssertions {
+				hit++
 			} else {
-				rc = &route.RouteConfiguration{
+				miss++
+			}
+			if rc == nil {
+				emptyRoute := &route.RouteConfiguration{
 					Name:             routeName,
 					VirtualHosts:     []*route.VirtualHost{},
 					ValidateClusters: proto.BoolFalse,
+				}
+				rc = &discovery.Resource{
+					Name:     routeName,
+					Resource: protoconv.MessageToAny(emptyRoute),
 				}
 			}
 			routeConfigurations = append(routeConfigurations, rc)
 		}
 	case model.Router:
 		for _, routeName := range routeNames {
-			rc := configgen.buildGatewayHTTPRouteConfig(node, push, routeName)
+			rc := configgen.buildGatewayHTTPRouteConfig(node, req.Push, routeName)
 			if rc != nil {
-				rc = envoyfilter.ApplyRouteConfigurationPatches(networking.EnvoyFilter_GATEWAY, node, push, rc)
-			} else {
-				rc = &route.RouteConfiguration{
-					Name:             routeName,
-					VirtualHosts:     []*route.VirtualHost{},
-					ValidateClusters: proto.BoolFalse,
+				rc = envoyfilter.ApplyRouteConfigurationPatches(networking.EnvoyFilter_GATEWAY, node, efw, rc)
+				resource := &discovery.Resource{
+					Name:     routeName,
+					Resource: protoconv.MessageToAny(rc),
 				}
+				routeConfigurations = append(routeConfigurations, resource)
 			}
-			routeConfigurations = append(routeConfigurations, rc)
 		}
 	}
-	return routeConfigurations
+	if !features.EnableRDSCaching {
+		return routeConfigurations, model.DefaultXdsLogDetails
+	}
+	return routeConfigurations, model.XdsLogDetails{AdditionalInfo: fmt.Sprintf("cached:%v/%v", hit, hit+miss)}
 }
 
 // buildSidecarInboundHTTPRouteConfig builds the route config with a single wildcard virtual host on the inbound path
 // TODO: trace decorators, inbound timeouts
-func (configgen *ConfigGeneratorImpl) buildSidecarInboundHTTPRouteConfig(
-	node *model.Proxy, push *model.PushContext, instance *model.ServiceInstance, clusterName string) *route.RouteConfiguration {
-	traceOperation := traceOperation(string(instance.Service.Hostname), instance.ServicePort.Port)
-	defaultRoute := istio_route.BuildDefaultHTTPInboundRoute(node, clusterName, traceOperation)
+func buildSidecarInboundHTTPRouteConfig(lb *ListenerBuilder, cc inboundChainConfig) *route.RouteConfiguration {
+	traceOperation := telemetry.TraceOperation(string(cc.telemetryMetadata.InstanceHostname), int(cc.port.Port))
+	defaultRoute := istio_route.BuildDefaultHTTPInboundRoute(cc.clusterName, traceOperation)
 
 	inboundVHost := &route.VirtualHost{
-		Name:    inboundVirtualHostPrefix + strconv.Itoa(instance.ServicePort.Port), // Format: "inbound|http|%d"
+		Name:    inboundVirtualHostPrefix + strconv.Itoa(int(cc.port.Port)), // Format: "inbound|http|%d"
 		Domains: []string{"*"},
 		Routes:  []*route.Route{defaultRoute},
 	}
 
 	r := &route.RouteConfiguration{
-		Name:             clusterName,
+		Name:             cc.clusterName,
 		VirtualHosts:     []*route.VirtualHost{inboundVHost},
 		ValidateClusters: proto.BoolFalse,
 	}
-
-	in := &plugin.InputParams{
-		ListenerProtocol: istionetworking.ListenerProtocolHTTP,
-		Node:             node,
-		ServiceInstance:  instance,
-		Service:          instance.Service,
-		Port:             instance.ServicePort,
-		Push:             push,
-	}
-
-	for _, p := range configgen.Plugins {
-		p.OnInboundRouteConfiguration(in, r)
-	}
-
-	r = envoyfilter.ApplyRouteConfigurationPatches(networking.EnvoyFilter_SIDECAR_INBOUND, in.Node, in.Push, r)
+	efw := lb.push.EnvoyFilters(lb.node)
+	r = envoyfilter.ApplyRouteConfigurationPatches(networking.EnvoyFilter_SIDECAR_INBOUND, lb.node, efw, r)
 	return r
-}
-
-// domainName builds the domain name for a given host and port
-func domainName(host string, port int) string {
-	return host + ":" + strconv.Itoa(port)
-}
-
-func traceOperation(host string, port int) string {
-	// Format : "%s:%d/*"
-	return host + ":" + strconv.Itoa(port) + "/*"
 }
 
 // buildSidecarOutboundHTTPRouteConfig builds an outbound HTTP Route for sidecar.
 // Based on port, will determine all virtual hosts that listen on the port.
-func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(node *model.Proxy, push *model.PushContext,
-	routeName string, vHostCache map[int][]*route.VirtualHost) *route.RouteConfiguration {
-
+func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(
+	node *model.Proxy,
+	req *model.PushRequest,
+	routeName string,
+	vHostCache map[int][]*route.VirtualHost,
+	efw *model.EnvoyFilterWrapper,
+	efKeys []string,
+) (*discovery.Resource, bool) {
 	var virtualHosts []*route.VirtualHost
 	listenerPort := 0
 	useSniffing := false
@@ -150,14 +151,17 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(node *
 	if err != nil {
 		// we have a port whose name is http_proxy or unix:///foo/bar
 		// check for both.
-		if routeName != RDSHttpProxy && !strings.HasPrefix(routeName, model.UnixAddressPrefix) {
+		if routeName != model.RDSHttpProxy && !strings.HasPrefix(routeName, model.UnixAddressPrefix) {
 			// TODO: This is potentially one place where envoyFilter ADD operation can be helpful if the
 			// user wants to ship a custom RDS. But at this point, the match semantics are murky. We have no
 			// object to match upon. This needs more thought. For now, we will continue to return nil for
 			// unknown routes
-			return nil
+			return nil, false
 		}
 	}
+
+	var routeCache *istio_route.Cache
+	var resource *discovery.Resource
 
 	cacheHit := false
 	if useSniffing && listenerPort != 0 {
@@ -170,7 +174,10 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(node *
 		}
 	}
 	if !cacheHit {
-		virtualHosts = configgen.buildSidecarOutboundVirtualHosts(node, push, routeName, listenerPort)
+		virtualHosts, resource, routeCache = BuildSidecarOutboundVirtualHosts(node, req.Push, routeName, listenerPort, efKeys, configgen.Cache)
+		if resource != nil {
+			return resource, true
+		}
 		if listenerPort > 0 {
 			// only cache for tcp ports and not for uds
 			vHostCache[listenerPort] = virtualHosts
@@ -178,7 +185,7 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(node *
 
 		// FIXME: This will ignore virtual services with hostnames that do not match any service in the registry
 		// per api spec, these hostnames + routes should appear in the virtual hosts (think bookinfo.com and
-		// productpage.ns1.svc.cluster.local). See the TODO in buildSidecarOutboundVirtualHosts for the right solution
+		// productpage.ns1.svc.cluster.local). See the TODO in BuildSidecarOutboundVirtualHosts for the right solution
 		if useSniffing {
 			virtualHosts = getVirtualHostsForSniffedServicePort(virtualHosts, routeName)
 		}
@@ -195,31 +202,96 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(node *
 		VirtualHosts:     virtualHosts,
 		ValidateClusters: proto.BoolFalse,
 	}
-
-	pluginParams := &plugin.InputParams{
-		ListenerProtocol: istionetworking.ListenerProtocolHTTP,
-		ListenerCategory: networking.EnvoyFilter_SIDECAR_OUTBOUND,
-		Node:             node,
-		Push:             push,
-		Port: &model.Port{
-			Name:     "",
-			Port:     listenerPort,
-			Protocol: protocol.HTTP,
-		},
+	if SidecarIgnorePort(node) {
+		out.IgnorePortInHostMatching = true
 	}
 
-	// call plugins
-	for _, p := range configgen.Plugins {
-		p.OnOutboundRouteConfiguration(pluginParams, out)
+	// apply envoy filter patches
+	out = envoyfilter.ApplyRouteConfigurationPatches(networking.EnvoyFilter_SIDECAR_OUTBOUND, node, efw, out)
+
+	resource = &discovery.Resource{
+		Name:     out.Name,
+		Resource: protoconv.MessageToAny(out),
+	}
+
+	if features.EnableRDSCaching && routeCache != nil {
+		configgen.Cache.Add(routeCache, req, resource)
+	}
+
+	return resource, false
+}
+
+// TODO: merge with IstioEgressListenerWrapper.selectVirtualServices
+// selectVirtualServices selects the virtual services by matching given services' host names.
+func selectVirtualServices(virtualServices []config.Config, servicesByName map[host.Name]*model.Service) []config.Config {
+	out := make([]config.Config, 0)
+	// As a performance optimization, find out wildcard service hosts first, so that
+	// if non wildcard vs hosts can't be looked up directly in the service map, only need to
+	// loop through wildcard service hosts instead of all.
+	wcSvcHosts := []host.Name{}
+	for svcHost := range servicesByName {
+		if svcHost.IsWildCarded() {
+			wcSvcHosts = append(wcSvcHosts, svcHost)
+		}
+	}
+
+	for i := range virtualServices {
+		rule := virtualServices[i].Spec.(*networking.VirtualService)
+		var match bool
+
+		// Selection algorithm:
+		// virtualservices have a list of hosts in the API spec
+		// if any host in the list matches one service hostname, select the virtual service
+		// and break out of the loop.
+		for _, h := range rule.Hosts {
+			// TODO: This is a bug. VirtualServices can have many hosts
+			// while the user might be importing only a single host
+			// We need to generate a new VirtualService with just the matched host
+			if servicesByName[host.Name(h)] != nil {
+				match = true
+				break
+			}
+
+			if host.Name(h).IsWildCarded() {
+				// Process wildcard vs host as it need to follow the slow path of
+				// looping through all services in the map.
+				for svcHost := range servicesByName {
+					if host.Name(h).Matches(svcHost) {
+						match = true
+						break
+					}
+				}
+			} else {
+				// If non wildcard vs host isn't be found in service map, only loop through
+				// wildcard service hosts to avoid repeated matching.
+				for _, svcHost := range wcSvcHosts {
+					if host.Name(h).Matches(svcHost) {
+						match = true
+						break
+					}
+				}
+			}
+
+			if match {
+				break
+			}
+		}
+
+		if match {
+			out = append(out, virtualServices[i])
+		}
 	}
 
 	return out
 }
 
-func (configgen *ConfigGeneratorImpl) buildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext,
-	routeName string, listenerPort int) []*route.VirtualHost {
-
-	var virtualServices []model.Config
+func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext,
+	routeName string,
+	listenerPort int,
+	efKeys []string,
+	xdsCache model.XdsCache,
+) ([]*route.VirtualHost, *discovery.Resource, *istio_route.Cache) {
+	var virtualServices []config.Config
 	var services []*model.Service
 
 	// Get the services from the egress listener.  When sniffing is enabled, we send
@@ -231,7 +303,7 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundVirtualHosts(node *mod
 	// We should never be getting a nil egress listener because the code that setup this RDS
 	// call obviously saw an egress listener
 	if egressListener == nil {
-		return nil
+		return nil, nil, nil
 	}
 
 	services = egressListener.Services()
@@ -246,33 +318,131 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundVirtualHosts(node *mod
 		listenerPort = 0
 	}
 
-	nameToServiceMap := make(map[host.Name]*model.Service)
+	servicesByName := make(map[host.Name]*model.Service)
 	for _, svc := range services {
 		if listenerPort == 0 {
 			// Take all ports when listen port is 0 (http_proxy or uds)
 			// Expect virtualServices to resolve to right port
-			nameToServiceMap[svc.Hostname] = svc
+			servicesByName[svc.Hostname] = svc
 		} else if svcPort, exists := svc.Ports.GetByPort(listenerPort); exists {
-			nameToServiceMap[svc.Hostname] = &model.Service{
-				Hostname:     svc.Hostname,
-				Address:      svc.GetServiceAddressForProxy(node),
-				MeshExternal: svc.MeshExternal,
-				Resolution:   svc.Resolution,
-				Ports:        []*model.Port{svcPort},
+			servicesByName[svc.Hostname] = &model.Service{
+				Hostname:       svc.Hostname,
+				DefaultAddress: svc.GetAddressForProxy(node),
+				MeshExternal:   svc.MeshExternal,
+				Resolution:     svc.Resolution,
+				Ports:          []*model.Port{svcPort},
 				Attributes: model.ServiceAttributes{
+					Namespace:       svc.Attributes.Namespace,
 					ServiceRegistry: svc.Attributes.ServiceRegistry,
 				},
 			}
 		}
 	}
 
-	// Get list of virtual services bound to the mesh gateway
-	virtualHostWrappers := istio_route.BuildSidecarVirtualHostsFromConfigAndRegistry(node, push, nameToServiceMap,
-		virtualServices, listenerPort)
-	vHostPortMap := make(map[int][]*route.VirtualHost)
+	var routeCache *istio_route.Cache
 
+	if listenerPort > 0 {
+		services = make([]*model.Service, 0, len(servicesByName))
+		// sort services
+		for _, svc := range servicesByName {
+			services = append(services, svc)
+		}
+		sort.SliceStable(services, func(i, j int) bool {
+			return services[i].Hostname <= services[j].Hostname
+		})
+
+		if features.EnableRDSCaching {
+			routeCache = &istio_route.Cache{
+				RouteName:               routeName,
+				ProxyVersion:            node.Metadata.IstioVersion,
+				ClusterID:               string(node.Metadata.ClusterID),
+				DNSDomain:               node.DNSDomain,
+				DNSCapture:              bool(node.Metadata.DNSCapture),
+				DNSAutoAllocate:         bool(node.Metadata.DNSAutoAllocate),
+				AllowAny:                util.IsAllowAnyOutbound(node),
+				ListenerPort:            listenerPort,
+				Services:                services,
+				VirtualServices:         virtualServices,
+				DelegateVirtualServices: push.DelegateVirtualServices(virtualServices),
+				EnvoyFilterKeys:         efKeys,
+			}
+		}
+	}
+
+	// This is hack to keep consistent with previous behavior.
+	if listenerPort != 80 {
+		// only select virtualServices that matches a service
+		virtualServices = selectVirtualServices(virtualServices, servicesByName)
+	}
+	// Get list of virtual services bound to the mesh gateway
+	virtualHostWrappers := istio_route.BuildSidecarVirtualHostWrapper(routeCache, node, push, servicesByName, virtualServices, listenerPort)
+
+	if features.EnableRDSCaching {
+		resource, exist := xdsCache.Get(routeCache)
+		if exist && !features.EnableUnsafeAssertions {
+			return nil, resource, routeCache
+		}
+	}
+
+	vHostPortMap := make(map[int][]*route.VirtualHost)
 	vhosts := sets.Set{}
 	vhdomains := sets.Set{}
+	knownFQDN := sets.Set{}
+
+	buildVirtualHost := func(hostname string, vhwrapper istio_route.VirtualHostWrapper, svc *model.Service) *route.VirtualHost {
+		name := util.DomainName(hostname, vhwrapper.Port)
+		if duplicateVirtualHost(name, vhosts) {
+			// This means this virtual host has caused duplicate virtual host name.
+			var msg string
+			if svc == nil {
+				msg = fmt.Sprintf("duplicate domain from virtual service: %s", name)
+			} else {
+				msg = fmt.Sprintf("duplicate domain from service: %s", name)
+			}
+			push.AddMetric(model.DuplicatedDomains, name, node.ID, msg)
+			return nil
+		}
+		var domains []string
+		var altHosts []string
+		if svc == nil {
+			if SidecarIgnorePort(node) {
+				domains = []string{util.IPv6Compliant(hostname)}
+			} else {
+				domains = []string{util.IPv6Compliant(hostname), name}
+			}
+		} else {
+			domains, altHosts = generateVirtualHostDomains(svc, listenerPort, vhwrapper.Port, node)
+		}
+		dl := len(domains)
+		domains = dedupeDomains(domains, vhdomains, altHosts, knownFQDN)
+		if dl != len(domains) {
+			var msg string
+			if svc == nil {
+				msg = fmt.Sprintf("duplicate domain from virtual service: %s", name)
+			} else {
+				msg = fmt.Sprintf("duplicate domain from service: %s", name)
+			}
+			// This means this virtual host has caused duplicate virtual host domain.
+			push.AddMetric(model.DuplicatedDomains, name, node.ID, msg)
+		}
+		if len(domains) > 0 {
+			return &route.VirtualHost{
+				Name:                       name,
+				Domains:                    domains,
+				Routes:                     vhwrapper.Routes,
+				IncludeRequestAttemptCount: true,
+			}
+		}
+
+		return nil
+	}
+
+	for _, virtualHostWrapper := range virtualHostWrappers {
+		for _, svc := range virtualHostWrapper.Services {
+			name := util.DomainName(string(svc.Hostname), virtualHostWrapper.Port)
+			knownFQDN.InsertAll(name, string(svc.Hostname))
+		}
+	}
 
 	for _, virtualHostWrapper := range virtualHostWrappers {
 		// If none of the routes matched by source, skip this virtual host
@@ -282,64 +452,27 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundVirtualHosts(node *mod
 		virtualHosts := make([]*route.VirtualHost, 0, len(virtualHostWrapper.VirtualServiceHosts)+len(virtualHostWrapper.Services))
 
 		for _, hostname := range virtualHostWrapper.VirtualServiceHosts {
-			name := domainName(hostname, virtualHostWrapper.Port)
-			duplicate := duplicateVirtualHost(name, vhosts)
-			if !duplicate {
-				domains := []string{hostname, name}
-				dl := len(domains)
-				domains = dedupeDomains(domains, vhdomains)
-				if dl != len(domains) {
-					duplicate = true
-				}
-				virtualHosts = append(virtualHosts, &route.VirtualHost{
-					Name:                       name,
-					Domains:                    domains,
-					Routes:                     virtualHostWrapper.Routes,
-					IncludeRequestAttemptCount: true,
-				})
-			}
-
-			if duplicate {
-				// This means this virtual host has caused duplicate virtual host name/domain.
-				push.AddMetric(model.DuplicatedDomains, name, node, fmt.Sprintf("duplicate domain from virtual service: %s", name))
+			if vhost := buildVirtualHost(hostname, virtualHostWrapper, nil); vhost != nil {
+				virtualHosts = append(virtualHosts, vhost)
 			}
 		}
 
 		for _, svc := range virtualHostWrapper.Services {
-			name := domainName(string(svc.Hostname), virtualHostWrapper.Port)
-			duplicate := duplicateVirtualHost(name, vhosts)
-			if !duplicate {
-				domains := generateVirtualHostDomains(svc, virtualHostWrapper.Port, node)
-				dl := len(domains)
-				domains = dedupeDomains(domains, vhdomains)
-				if dl != len(domains) {
-					duplicate = true
-				}
-				virtualHosts = append(virtualHosts, &route.VirtualHost{
-					Name:                       name,
-					Domains:                    domains,
-					Routes:                     virtualHostWrapper.Routes,
-					IncludeRequestAttemptCount: true,
-				})
-			}
-
-			if duplicate {
-				// This means we have hit a duplicate virtual host name/ domain name.
-				push.AddMetric(model.DuplicatedDomains, name, node, fmt.Sprintf("duplicate domain from  service: %s", name))
+			if vhost := buildVirtualHost(string(svc.Hostname), virtualHostWrapper, svc); vhost != nil {
+				virtualHosts = append(virtualHosts, vhost)
 			}
 		}
-
 		vHostPortMap[virtualHostWrapper.Port] = append(vHostPortMap[virtualHostWrapper.Port], virtualHosts...)
 	}
 
-	var tmpVirtualHosts []*route.VirtualHost
+	var out []*route.VirtualHost
 	if listenerPort == 0 {
-		tmpVirtualHosts = mergeAllVirtualHosts(vHostPortMap)
+		out = mergeAllVirtualHosts(vHostPortMap)
 	} else {
-		tmpVirtualHosts = vHostPortMap[listenerPort]
+		out = vHostPortMap[listenerPort]
 	}
 
-	return tmpVirtualHosts
+	return out, nil, routeCache
 }
 
 // duplicateVirtualHost checks whether the virtual host with the same name exists in the route.
@@ -352,13 +485,22 @@ func duplicateVirtualHost(vhost string, vhosts sets.Set) bool {
 }
 
 // dedupeDomains removes the duplicate domains from the passed in domains.
-func dedupeDomains(domains []string, vhdomains sets.Set) []string {
+func dedupeDomains(domains []string, vhdomains sets.Set, expandedHosts []string, knownFQDNs sets.Set) []string {
 	temp := domains[:0]
 	for _, d := range domains {
-		if !vhdomains.Contains(d) {
-			temp = append(temp, d)
-			vhdomains.Insert(d)
+		if vhdomains.Contains(d) {
+			continue
 		}
+		// Check if the domain is an "expanded" host, and its also a known FQDN
+		// This prevents a case where a domain like "foo.com.cluster.local" gets expanded to "foo.com", overwriting
+		// the real "foo.com"
+		// This works by providing a list of domains that were added as expanding the DNS domain as part of expandedHosts,
+		// and a list of known unexpanded FQDNs to compare against
+		if util.ListContains(expandedHosts, d) && knownFQDNs.Contains(d) { // O(n) search, but n is at most 10
+			continue
+		}
+		temp = append(temp, d)
+		vhdomains.Insert(d)
 	}
 	return temp
 }
@@ -367,10 +509,11 @@ func dedupeDomains(domains []string, vhdomains sets.Set) []string {
 // setup. This listener should only get the virtual hosts that correspond to this service+port and not
 // all virtual hosts that are usually supplied for 0.0.0.0:PORT.
 func getVirtualHostsForSniffedServicePort(vhosts []*route.VirtualHost, routeName string) []*route.VirtualHost {
+	nameWithoutPort, _, _ := net.SplitHostPort(routeName)
 	var virtualHosts []*route.VirtualHost
 	for _, vh := range vhosts {
 		for _, domain := range vh.Domains {
-			if domain == routeName {
+			if domain == routeName || domain == nameWithoutPort {
 				virtualHosts = append(virtualHosts, vh)
 				break
 			}
@@ -378,36 +521,65 @@ func getVirtualHostsForSniffedServicePort(vhosts []*route.VirtualHost, routeName
 	}
 
 	if len(virtualHosts) == 0 {
-		virtualHosts = vhosts
+		return virtualHosts
+	}
+	if len(virtualHosts) == 1 {
+		virtualHosts[0].Domains = []string{"*"}
+		return virtualHosts
+	}
+	if features.EnableUnsafeAssertions {
+		panic(fmt.Sprintf("unexpectedly matched multiple virtual hosts for %v: %v", routeName, virtualHosts))
 	}
 	return virtualHosts
 }
 
+// GatewayIgnorePort determines if we can exclude ports from domain matches
+func GatewayIgnorePort(node *model.Proxy) bool {
+	return util.IsIstioVersionGE115(node.IstioVersion) && !node.IsProxylessGrpc()
+}
+
+// SidecarIgnorePort determines if we can exclude ports from domain matches for sidecars specifically.
+// This differs from GatewayIgnorePort as it is flag protected to avoid breaking change risks
+func SidecarIgnorePort(node *model.Proxy) bool {
+	return util.IsIstioVersionGE115(node.IstioVersion) && !node.IsProxylessGrpc() && features.SidecarIgnorePort
+}
+
 // generateVirtualHostDomains generates the set of domain matches for a service being accessed from
 // a proxy node
-func generateVirtualHostDomains(service *model.Service, port int, node *model.Proxy) []string {
-	domains := []string{string(service.Hostname), domainName(string(service.Hostname), port)}
-	domains = append(domains, generateAltVirtualHosts(string(service.Hostname), port, node.DNSDomain)...)
+func generateVirtualHostDomains(service *model.Service, listenerPort int, port int, node *model.Proxy) ([]string, []string) {
+	if SidecarIgnorePort(node) && listenerPort != 0 {
+		// Indicate we do not need port, as we will set IgnorePortInHostMatching
+		port = portNoAppendPortSuffix
+	}
+	altHosts := GenerateAltVirtualHosts(string(service.Hostname), port, node.DNSDomain)
+	domains := make([]string, 0, 4+len(altHosts))
+	domains = appendDomainPort(domains, string(service.Hostname), port)
+	domains = append(domains, altHosts...)
 
 	if service.Resolution == model.Passthrough &&
-		service.Attributes.ServiceRegistry == string(serviceregistry.Kubernetes) {
+		service.Attributes.ServiceRegistry == provider.Kubernetes {
 		for _, domain := range domains {
 			domains = append(domains, wildcardDomainPrefix+domain)
 		}
 	}
 
-	svcAddr := service.GetServiceAddressForProxy(node)
+	svcAddr := service.GetAddressForProxy(node)
 	if len(svcAddr) > 0 && svcAddr != constants.UnspecifiedIP {
-		// add a vhost match for the IP (if its non CIDR)
-		cidr := util.ConvertAddressToCidr(svcAddr)
-		if cidr.PrefixLen.Value == 32 {
-			domains = append(domains, svcAddr, domainName(svcAddr, port))
-		}
+		domains = appendDomainPort(domains, svcAddr, port)
 	}
-	return domains
+	return domains, altHosts
 }
 
-// Given a service, and a port, this function generates all possible HTTP Host headers.
+// appendDomainPort appends `domain` and `domain:port` to `domains`. The `domain:port` variant is skipped
+// if port is unset.
+func appendDomainPort(domains []string, domain string, port int) []string {
+	if port == portNoAppendPortSuffix {
+		return append(domains, util.IPv6Compliant(domain))
+	}
+	return append(domains, util.IPv6Compliant(domain), util.DomainName(domain, port))
+}
+
+// GenerateAltVirtualHosts given a service and a port, generates all possible HTTP Host headers.
 // For example, a service of the form foo.local.campus.net on port 80, with local domain "local.campus.net"
 // could be accessed as http://foo:80 within the .local network, as http://foo.local:80 (by other clients
 // in the campus.net domain), as http://foo.local.campus:80, etc.
@@ -423,28 +595,88 @@ func generateVirtualHostDomains(service *model.Service, port int, node *model.Pr
 //
 // - Given foo.local.campus.net on proxy domain "" or proxy domain example.com, this
 // function returns nil
-func generateAltVirtualHosts(hostname string, port int, proxyDomain string) []string {
-	var vhosts []string
-	uniqHostname, sharedDNSDomain := getUniqueAndSharedDNSDomain(hostname, proxyDomain)
+func GenerateAltVirtualHosts(hostname string, port int, proxyDomain string) []string {
+	// If the dns/proxy domain contains `.svc`, only services following the <ns>.svc.<suffix>
+	// naming convention and that share a suffix with the domain should be expanded.
+	if strings.Contains(proxyDomain, ".svc.") {
 
-	// If there is no shared DNS name (e.g., foobar.com service on local.net proxy domain)
-	// do not generate any alternate virtual host representations
-	if len(sharedDNSDomain) == 0 {
+		if strings.HasSuffix(hostname, removeSvcNamespace(proxyDomain)) {
+			return generateAltVirtualHostsForKubernetesService(hostname, port, proxyDomain)
+		}
+
+		// Hostname is not a kube service.  It is not safe to expand the
+		// hostname as non-fully-qualified names could conflict with expansion of other kube service
+		// hostnames
 		return nil
 	}
 
-	// adds the uniq piece foo, foo:80
-	vhosts = append(vhosts, uniqHostname, domainName(uniqHostname, port))
+	var vhosts []string
+	uniqueHostnameParts, sharedDNSDomainParts := getUniqueAndSharedDNSDomain(hostname, proxyDomain)
 
-	// adds all the other variants (foo.local, foo.local:80)
-	for i := len(sharedDNSDomain) - 1; i > 0; i-- {
-		if sharedDNSDomain[i] == '.' {
-			variant := uniqHostname + "." + sharedDNSDomain[:i]
-			variantWithPort := domainName(variant, port)
-			vhosts = append(vhosts, variant, variantWithPort)
-		}
+	// If there is no shared DNS name (e.g., foobar.com service on local.net proxy domain)
+	// do not generate any alternate virtual host representations
+	if len(sharedDNSDomainParts) == 0 {
+		return nil
+	}
+
+	uniqueHostname := strings.Join(uniqueHostnameParts, ".")
+
+	// Add the uniqueHost.
+	vhosts = appendDomainPort(vhosts, uniqueHostname, port)
+	if len(uniqueHostnameParts) == 2 {
+		// This is the case of uniqHostname having namespace already.
+		dnsHostName := uniqueHostname + "." + sharedDNSDomainParts[0]
+		vhosts = appendDomainPort(vhosts, dnsHostName, port)
 	}
 	return vhosts
+}
+
+// portNoAppendPortSuffix is a signal to not append port to vhost
+const portNoAppendPortSuffix = 0
+
+func generateAltVirtualHostsForKubernetesService(hostname string, port int, proxyDomain string) []string {
+	id := strings.Index(proxyDomain, ".svc.")
+	ih := strings.Index(hostname, ".svc.")
+	if ih > 0 { // Proxy and service hostname are in kube
+		ns := strings.Index(hostname, ".")
+		if ns+1 >= len(hostname) || ns+1 > ih {
+			// Invalid domain
+			return nil
+		}
+		if hostname[ns+1:ih] == proxyDomain[:id] {
+			// Same namespace
+			if port == portNoAppendPortSuffix {
+				return []string{
+					hostname[:ns],
+					hostname[:ih] + ".svc",
+					hostname[:ih],
+				}
+			}
+			return []string{
+				hostname[:ns],
+				util.DomainName(hostname[:ns], port),
+				hostname[:ih] + ".svc",
+				util.DomainName(hostname[:ih]+".svc", port),
+				hostname[:ih],
+				util.DomainName(hostname[:ih], port),
+			}
+		}
+		// Different namespace
+		if port == portNoAppendPortSuffix {
+			return []string{
+				hostname[:ih],
+				hostname[:ih] + ".svc",
+			}
+		}
+		return []string{
+			hostname[:ih],
+			util.DomainName(hostname[:ih], port),
+			hostname[:ih] + ".svc",
+			util.DomainName(hostname[:ih]+".svc", port),
+		}
+	}
+	// Proxy is in k8s, but service isn't. No alt hosts
+	return nil
 }
 
 // mergeAllVirtualHosts across all ports. On routes for ports other than port 80,
@@ -479,6 +711,7 @@ func reverseArray(r []string) []string {
 	}
 	return r
 }
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -497,37 +730,39 @@ func min(a, b int) int {
 // foo.ns1, and svc.cluster.local.
 // When given foo.ns2.svc.cluster.local and ns2.svc.cluster.local, this function will return
 // foo, ns2.svc.cluster.local.
-func getUniqueAndSharedDNSDomain(fqdnHostname, proxyDomain string) (string, string) {
+func getUniqueAndSharedDNSDomain(fqdnHostname, proxyDomain string) (partsUnique []string, partsShared []string) {
 	// split them by the dot and reverse the arrays, so that we can
 	// start collecting the shared bits of DNS suffix.
 	// E.g., foo.ns1.svc.cluster.local -> local,cluster,svc,ns1,foo
 	//       ns2.svc.cluster.local -> local,cluster,svc,ns2
-	partsFQDN := reverseArray(strings.Split(fqdnHostname, "."))
-	partsProxyDomain := reverseArray(strings.Split(proxyDomain, "."))
+	partsFQDN := strings.Split(fqdnHostname, ".")
+	partsProxyDomain := strings.Split(proxyDomain, ".")
+	partsFQDNInReverse := reverseArray(partsFQDN)
+	partsProxyDomainInReverse := reverseArray(partsProxyDomain)
 	var sharedSuffixesInReverse []string // pieces shared between proxy and svc. e.g., local,cluster,svc
 
-	for i := 0; i < min(len(partsFQDN), len(partsProxyDomain)); i++ {
-		if partsFQDN[i] == partsProxyDomain[i] {
-			sharedSuffixesInReverse = append(sharedSuffixesInReverse, partsFQDN[i])
+	for i := 0; i < min(len(partsFQDNInReverse), len(partsProxyDomainInReverse)); i++ {
+		if partsFQDNInReverse[i] == partsProxyDomainInReverse[i] {
+			sharedSuffixesInReverse = append(sharedSuffixesInReverse, partsFQDNInReverse[i])
 		} else {
 			break
 		}
 	}
 
 	if len(sharedSuffixesInReverse) == 0 {
-		return fqdnHostname, ""
+		partsUnique = partsFQDN
+	} else {
+		// get the non shared pieces (ns1, foo) and reverse Array
+		partsUnique = reverseArray(partsFQDNInReverse[len(sharedSuffixesInReverse):])
+		partsShared = reverseArray(sharedSuffixesInReverse)
 	}
-
-	// get the non shared pieces (ns1, foo) and reverse Array
-	uniqHostame := strings.Join(reverseArray(partsFQDN[len(sharedSuffixesInReverse):]), ".")
-	sharedSuffixes := strings.Join(reverseArray(sharedSuffixesInReverse), ".")
-	return uniqHostame, sharedSuffixes
+	return
 }
 
 func buildCatchAllVirtualHost(node *model.Proxy) *route.VirtualHost {
 	if util.IsAllowAnyOutbound(node) {
 		egressCluster := util.PassthroughCluster
-		notimeout := ptypes.DurationProto(0)
+		notimeout := durationpb.New(0)
 
 		// no need to check for nil value as the previous if check has checked
 		if node.SidecarScope.OutboundTrafficPolicy.EgressProxy != nil {
@@ -535,6 +770,15 @@ func buildCatchAllVirtualHost(node *model.Proxy) *route.VirtualHost {
 			// build a cluster out of this destination
 			egressCluster = istio_route.GetDestinationCluster(node.SidecarScope.OutboundTrafficPolicy.EgressProxy,
 				nil, 0)
+		}
+
+		routeAction := &route.RouteAction{
+			ClusterSpecifier: &route.RouteAction_Cluster{Cluster: egressCluster},
+			// Disable timeout instead of assuming some defaults.
+			Timeout: notimeout,
+			// Use deprecated value for now as the replacement MaxStreamDuration has some regressions.
+			// nolint: staticcheck
+			MaxGrpcTimeout: notimeout,
 		}
 
 		return &route.VirtualHost{
@@ -547,14 +791,7 @@ func buildCatchAllVirtualHost(node *model.Proxy) *route.VirtualHost {
 						PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"},
 					},
 					Action: &route.Route_Route{
-						Route: &route.RouteAction{
-							ClusterSpecifier: &route.RouteAction_Cluster{Cluster: egressCluster},
-							// Disable timeout instead of assuming some defaults.
-							Timeout: notimeout,
-							// If not configured at all, the grpc-timeout header is not used and
-							// gRPC requests time out like any other requests using timeout or its default.
-							MaxGrpcTimeout: notimeout,
-						},
+						Route: routeAction,
 					},
 				},
 			},
@@ -580,4 +817,13 @@ func buildCatchAllVirtualHost(node *model.Proxy) *route.VirtualHost {
 		},
 		IncludeRequestAttemptCount: true,
 	}
+}
+
+// Simply removes everything before .svc, if present
+func removeSvcNamespace(domain string) string {
+	if idx := strings.Index(domain, ".svc."); idx > 0 {
+		return domain[idx:]
+	}
+
+	return domain
 }

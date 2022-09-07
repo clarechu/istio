@@ -17,7 +17,6 @@ package envoy
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"os"
@@ -26,8 +25,8 @@ import (
 	"time"
 
 	envoyBootstrap "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
-	"github.com/ghodss/yaml"
 	"github.com/hashicorp/go-multierror"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/pkg/log"
 )
@@ -506,40 +505,6 @@ var logFormatValidator = registerFlagValidator(&flagValidator{
 	flagName: "--log-format",
 })
 
-// Epoch sets the --restart-epoch flag, which specifies the epoch used for hot restart.
-type Epoch uint32
-
-func (e Epoch) FlagName() FlagName {
-	return epochValidator.flagName
-}
-
-func (e Epoch) FlagValue() string {
-	return strconv.FormatUint(uint64(e), 10)
-}
-
-func (e Epoch) apply(ctx *configContext) {
-	epochValidator.apply(ctx, e.FlagValue())
-}
-
-func (e Epoch) validate(ctx *configContext) error {
-	return epochValidator.validate(ctx, e.FlagValue())
-}
-
-var epochValidator = registerFlagValidator(&flagValidator{
-	flagName: "--restart-epoch",
-	apply: func(ctx *configContext, flagValue string) {
-		if e, err := strconv.ParseUint(flagValue, 10, 32); err == nil {
-			ctx.epoch = Epoch(e)
-		}
-	},
-	validate: func(ctx *configContext, flagValue string) error {
-		if _, err := strconv.ParseUint(flagValue, 10, 32); err != nil {
-			return err
-		}
-		return nil
-	},
-})
-
 // ServiceCluster sets the --service-cluster flag, which defines the local service cluster
 // name where Envoy is running
 func ServiceCluster(c string) Option {
@@ -648,7 +613,6 @@ type configContext struct {
 	configPath string
 	configYaml string
 	baseID     BaseID
-	epoch      Epoch
 }
 
 func newConfigContext() *configContext {
@@ -675,7 +639,7 @@ func (c *configContext) getAdminPort() (uint32, error) {
 		return 0, multierror.Append(err, errors.New("unable to process envoy bootstrap"))
 	}
 
-	content, e := ioutil.ReadFile(c.configPath)
+	content, e := os.ReadFile(c.configPath)
 	if e != nil {
 		return 0, multierror.Append(err, fmt.Errorf("failed reading config-path file %s: %v", c.configPath, e))
 	}

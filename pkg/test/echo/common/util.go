@@ -15,16 +15,24 @@
 package common
 
 import (
+	"flag"
 	"net/http"
+	"strings"
 	"time"
 
 	"istio.io/istio/pkg/test/echo/proto"
 )
 
+func init() {
+	flag.DurationVar(&DefaultRequestTimeout, "istio.test.echo.requestTimeout", DefaultRequestTimeout,
+		"Specifies the timeout for individual ForwardEcho calls.")
+}
+
+var DefaultRequestTimeout = 5 * time.Second
+
 const (
-	ConnectionTimeout     = time.Second * 2
-	DefaultRequestTimeout = 15 * time.Second
-	DefaultCount          = 1
+	ConnectionTimeout = 2 * time.Second
+	DefaultCount      = 1
 )
 
 // FillInDefaults fills in the timeout and count if not specified in the given message.
@@ -50,13 +58,26 @@ func GetCount(request *proto.ForwardEchoRequest) int {
 	return DefaultCount
 }
 
+func HTTPToProtoHeaders(headers http.Header) []*proto.Header {
+	out := make([]*proto.Header, 0, len(headers))
+	for k, v := range headers {
+		out = append(out, &proto.Header{Key: k, Value: strings.Join(v, ",")})
+	}
+	return out
+}
+
+func ProtoToHTTPHeaders(headers []*proto.Header) http.Header {
+	out := make(http.Header)
+	for _, h := range headers {
+		// Avoid using .Add() to allow users to pass non-canonical forms
+		out[h.Key] = append(out[h.Key], h.Value)
+	}
+	return out
+}
+
 // GetHeaders returns the headers for the message.
 func GetHeaders(request *proto.ForwardEchoRequest) http.Header {
-	headers := make(http.Header)
-	for _, h := range request.Headers {
-		headers.Add(h.Key, h.Value)
-	}
-	return headers
+	return ProtoToHTTPHeaders(request.Headers)
 }
 
 // MicrosToDuration converts the given microseconds to a time.Duration.

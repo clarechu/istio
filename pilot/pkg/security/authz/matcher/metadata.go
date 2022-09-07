@@ -39,18 +39,18 @@ func MetadataStringMatcher(filter, key string, m *matcherpb.StringMatcher) *matc
 }
 
 // MetadataListMatcher creates a metadata list matcher for the given path keys and value.
-func MetadataListMatcher(filter string, keys []string, value string) *matcherpb.MetadataMatcher {
+func MetadataListMatcher(filter string, keys []string, value *matcherpb.StringMatcher) *matcherpb.MetadataMatcher {
 	listMatcher := &matcherpb.ListMatcher{
 		MatchPattern: &matcherpb.ListMatcher_OneOf{
 			OneOf: &matcherpb.ValueMatcher{
 				MatchPattern: &matcherpb.ValueMatcher_StringMatch{
-					StringMatch: StringMatcher(value),
+					StringMatch: value,
 				},
 			},
 		},
 	}
 
-	paths := make([]*matcherpb.MetadataMatcher_PathSegment, 0)
+	paths := make([]*matcherpb.MetadataMatcher_PathSegment, 0, len(keys))
 	for _, k := range keys {
 		paths = append(paths, &matcherpb.MetadataMatcher_PathSegment{
 			Segment: &matcherpb.MetadataMatcher_PathSegment_Key{

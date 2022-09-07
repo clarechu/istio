@@ -22,7 +22,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
+	"time"
 
+	"istio.io/istio/pkg/security"
 	"istio.io/istio/security/pkg/stsservice"
 	"istio.io/pkg/log"
 )
@@ -59,7 +62,7 @@ const (
 type Server struct {
 	// tokenManager takes STS request parameters and generates tokens, and returns
 	// generated token to the STS server.
-	tokenManager stsservice.TokenManager
+	tokenManager security.TokenManager
 	stsServer    *http.Server
 	// Port number that server listens on.
 	Port int
@@ -72,18 +75,21 @@ type Config struct {
 }
 
 // NewServer creates a new STS server.
-func NewServer(config Config, tokenManager stsservice.TokenManager) (*Server, error) {
+func NewServer(config Config, tokenManager security.TokenManager) (*Server, error) {
 	s := &Server{
 		tokenManager: tokenManager,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(TokenPath, s.ServeStsRequests)
 	mux.HandleFunc(StsStatusPath, s.DumpStsStatus)
+	hostPort := net.JoinHostPort(config.LocalHostAddr, strconv.Itoa(config.LocalPort))
 	s.stsServer = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", config.LocalHostAddr, config.LocalPort),
-		Handler: mux,
+		Addr:        hostPort,
+		Handler:     mux,
+		IdleTimeout: 90 * time.Second, // matches http.DefaultTransport keep-alive timeout
+		ReadTimeout: 30 * time.Second,
 	}
-	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", config.LocalHostAddr, config.LocalPort))
+	ln, err := net.Listen("tcp", hostPort)
 	if err != nil {
 		log.Errorf("Server failed to listen %v", err)
 		return nil, err
@@ -94,7 +100,7 @@ func NewServer(config Config, tokenManager stsservice.TokenManager) (*Server, er
 		stsServerLog.Infof("Start listening on %s:%d", config.LocalHostAddr, s.Port)
 		err := s.stsServer.Serve(ln)
 		// ListenAndServe always returns a non-nil error.
-		stsServerLog.Errora(err)
+		stsServerLog.Error(err)
 	}()
 	return s, nil
 }
@@ -122,14 +128,16 @@ func (s *Server) ServeStsRequests(w http.ResponseWriter, req *http.Request) {
 }
 
 // validateStsRequest validates a STS request, and extracts STS parameters from the request.
-func (s *Server) validateStsRequest(req *http.Request) (stsservice.StsRequestParameters, error) {
-	reqParam := stsservice.StsRequestParameters{}
+func (s *Server) validateStsRequest(req *http.Request) (security.StsRequestParameters, error) {
+	reqParam := security.StsRequestParameters{}
 	if req == nil {
 		return reqParam, errors.New("request is nil")
 	}
 
-	reqDump, _ := httputil.DumpRequest(req, true)
-	stsServerLog.Debugf("Received STS request: %s", string(reqDump))
+	if stsServerLog.DebugEnabled() {
+		reqDump, _ := httputil.DumpRequest(req, true)
+		stsServerLog.Debugf("Received STS request: %s", string(reqDump))
+	}
 	if req.Method != "POST" {
 		return reqParam, fmt.Errorf("request method is invalid, should be POST but get %s", req.Method)
 	}
@@ -193,6 +201,7 @@ func (s *Server) sendSuccessfulResponse(w http.ResponseWriter, tokenData []byte)
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(tokenData); err != nil {
 		stsServerLog.Errorf("failure in sending STS success response: %v", err)
+		return
 	}
 	stsServerLog.Debug("sent out STS success response")
 }
@@ -200,8 +209,10 @@ func (s *Server) sendSuccessfulResponse(w http.ResponseWriter, tokenData []byte)
 // DumpStsStatus handles requests for dumping STS status, including STS requests being served,
 // tokens being fetched.
 func (s *Server) DumpStsStatus(w http.ResponseWriter, req *http.Request) {
-	reqDump, _ := httputil.DumpRequest(req, true)
-	stsServerLog.Debugf("Received STS request: %s", string(reqDump))
+	if stsServerLog.DebugEnabled() {
+		reqDump, _ := httputil.DumpRequest(req, true)
+		stsServerLog.Debugf("Received STS request: %s", string(reqDump))
+	}
 
 	stsStatusJSON, err := s.tokenManager.DumpTokenStatus()
 	if err != nil {

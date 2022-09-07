@@ -1,52 +1,44 @@
 # BASE_DISTRIBUTION is used to switch between the old base distribution and distroless base images
-ARG BASE_DISTRIBUTION=default
+ARG BASE_DISTRIBUTION=debug
 
 # Version is the base image version from the TLD Makefile
 ARG BASE_VERSION=latest
 
-# The following section is used as base image if BASE_DISTRIBUTION=default
-FROM docker.io/istio/base:${BASE_VERSION} as default
-
-# Copy Envoy bootstrap templates used by pilot-agent
-COPY envoy_bootstrap.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
-COPY gcp_envoy_bootstrap.json /var/lib/istio/envoy/gcp_envoy_bootstrap_tmpl.json
-
-RUN chown -R istio-proxy /var/lib/istio
+# The following section is used as base image if BASE_DISTRIBUTION=debug
+FROM gcr.io/istio-release/base:${BASE_VERSION} as debug
 
 # The following section is used as base image if BASE_DISTRIBUTION=distroless
-FROM gcr.io/distroless/cc@sha256:f81e5db8287d66b012d874a6f7fea8da5b96d9cc509aa5a9b5d095a604d4bca1 as distroless
+# This image is a custom built debian11 distroless image with multiarchitecture support.
+# It is built on the base distroless image, with iptables binary and libraries added
+# The source can be found at https://github.com/istio/distroless/tree/iptables
+# This version is from commit 6faf2f9348d382c6a95bbc3171b89406103cb0ad.
+FROM gcr.io/istio-release/iptables@sha256:64ba191166d2c3f87815148cc1a9f530b770e0dfe81acb164ab79cbb31da582c as distroless
 
-# TODO(https://github.com/istio/istio/issues/17656) clean up this hack
-COPY --from=default /sbin/xtables-multi /sbin/iptables* /sbin/ip6tables* /sbin/ip /sbin/
-COPY --from=default /usr/lib/x86_64-linux-gnu/xtables/ /usr/lib/x86_64-linux-gnu/xtables
-COPY --from=default /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu
-COPY --from=default /etc/iproute2 /etc/iproute2
-
-# Copy Envoy bootstrap templates used by pilot-agent
-COPY --chown=nonroot:nonroot envoy_bootstrap.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
-COPY --chown=nonroot:nonroot gcp_envoy_bootstrap.json /var/lib/istio/envoy/gcp_envoy_bootstrap_tmpl.json
+# This will build the final image based on either debug or distroless from above
+# hadolint ignore=DL3006
+FROM ${BASE_DISTRIBUTION:-debug}
 
 WORKDIR /
-
-# This will build the final image based on either default or distroless from above
-# hadolint ignore=DL3006
-FROM ${BASE_DISTRIBUTION}
 
 ARG proxy_version
 ARG istio_version
 ARG SIDECAR=envoy
 
-# Install Envoy.
-COPY $SIDECAR /usr/local/bin/$SIDECAR
+# Copy Envoy bootstrap templates used by pilot-agent
+COPY envoy_bootstrap.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
+COPY gcp_envoy_bootstrap.json /var/lib/istio/envoy/gcp_envoy_bootstrap_tmpl.json
 
-# Environment variable indicating the exact proxy sha - for debugging or version-specific configs 
+# Install Envoy.
+ARG TARGETARCH
+COPY ${TARGETARCH:-amd64}/${SIDECAR} /usr/local/bin/${SIDECAR}
+
+# Environment variable indicating the exact proxy sha - for debugging or version-specific configs
 ENV ISTIO_META_ISTIO_PROXY_SHA $proxy_version
 # Environment variable indicating the exact build, for debugging
 ENV ISTIO_META_ISTIO_VERSION $istio_version
 
-COPY pilot-agent /usr/local/bin/pilot-agent
-
-COPY envoy_policy.yaml.tmpl /var/lib/istio/envoy/envoy_policy.yaml.tmpl
+ARG TARGETARCH
+COPY ${TARGETARCH:-amd64}/pilot-agent /usr/local/bin/pilot-agent
 
 COPY stats-filter.wasm /etc/istio/extensions/stats-filter.wasm
 COPY stats-filter.compiled.wasm /etc/istio/extensions/stats-filter.compiled.wasm

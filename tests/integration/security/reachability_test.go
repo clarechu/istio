@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,221 +20,539 @@ package security
 import (
 	"testing"
 
+	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/test/echo/common/scheme"
 	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/components/namespace"
-	"istio.io/istio/tests/integration/security/util/reachability"
+	"istio.io/istio/pkg/test/framework/components/echo/check"
+	"istio.io/istio/pkg/test/framework/components/echo/common/ports"
+	"istio.io/istio/pkg/test/framework/components/echo/config"
+	"istio.io/istio/pkg/test/framework/components/echo/config/param"
+	"istio.io/istio/pkg/test/framework/components/echo/deployment"
+	"istio.io/istio/pkg/test/framework/components/echo/echotest"
+	"istio.io/istio/pkg/test/framework/components/echo/match"
+	"istio.io/istio/pkg/test/framework/components/istio"
 )
 
-// This test verifies reachability under different authN scenario:
-// - app A to app B using mTLS.
-// - app A to app B using mTLS-permissive.
-// - app A to app B without using mTLS.
-// In each test, the steps are:
-// - Configure authn policy.
-// - Wait for config propagation.
-// - Send HTTP/gRPC requests between apps.
+const (
+	migrationServiceName     = "migration"
+	migrationVersionIstio    = "vistio"
+	migrationVersionNonIstio = "vlegacy"
+	migrationPathIstio       = "/" + migrationVersionIstio
+	migrationPathNonIstio    = "/" + migrationVersionNonIstio
+	mtlsModeParam            = "MTLSMode"
+	mtlsModeOverrideParam    = "MTLSModeOverride"
+	tlsModeParam             = "TLSMode"
+)
+
 func TestReachability(t *testing.T) {
 	framework.NewTest(t).
-		Run(func(ctx framework.TestContext) {
+		Features("security.reachability").
+		Run(func(t framework.TestContext) {
+			systemNS := istio.ClaimSystemNamespaceOrFail(t, t)
 
-			rctx := reachability.CreateContext(ctx, true)
-			systemNM := namespace.ClaimSystemNamespaceOrFail(ctx, ctx)
+			// Create a custom echo deployment in NS1 with subsets that allows us to test the
+			// migration of a workload to istio (from no sidecar to sidecar).
+			migrationApp := deployment.New(t).
+				WithClusters(t.Clusters()...).
+				WithConfig(echo.Config{
+					Namespace:      echo1NS,
+					Service:        migrationServiceName,
+					ServiceAccount: true,
+					Ports:          ports.All(),
+					Subsets: []echo.SubsetConfig{
+						{
+							// Istio deployment, with sidecar.
+							Version:     migrationVersionIstio,
+							Annotations: echo.NewAnnotations().SetBool(echo.SidecarInject, true),
+						},
+						{
+							// Legacy (non-Istio) deployment subset, does not have sidecar injected.
+							Version:     migrationVersionNonIstio,
+							Annotations: echo.NewAnnotations().SetBool(echo.SidecarInject, false),
+						},
+					},
+				}).
+				BuildOrFail(t)
 
-			testCases := []reachability.TestCase{
-				{
-					ConfigFile: "beta-mtls-on.yaml",
-					Namespace:  systemNM,
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						return true
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						if rctx.IsNaked(src) && rctx.IsNaked(opts.Target) {
-							// naked->naked should always succeed.
-							return true
-						}
+			// Add the migration app to the full list of services.
+			allServices := apps.Ns1.All.Append(migrationApp.Services())
 
-						// If one of the two endpoints is naked, expect failure.
-						return !rctx.IsNaked(src) && !rctx.IsNaked(opts.Target)
-					},
-				},
-				{
-					ConfigFile: "beta-mtls-permissive.yaml",
-					Namespace:  systemNM,
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						// Exclude calls from naked->VM since naked has no Envoy
-						// so k8s is responsible for DNS resolution
-						// However, no endpoint exists for VM in k8s, so calls from naked->VM will fail
-						return !rctx.IsNaked(opts.Target) && !(rctx.IsNaked(src) && opts.Target == rctx.VM)
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						return true
-					},
-				},
-				{
-					ConfigFile: "beta-mtls-off.yaml",
-					Namespace:  systemNM,
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						// Exclude calls from naked->VM.
-						return !(rctx.IsNaked(src) && opts.Target == rctx.VM)
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						return true
-					},
-				},
-				{
-					ConfigFile: "beta-per-port-mtls.yaml",
-					Namespace:  rctx.Namespace,
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						// Include all tests that target app B, which has the single-port config.
-						return opts.Target == rctx.B
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						return opts.PortName != "http"
-					},
-				},
-				{
-					ConfigFile: "beta-mtls-automtls.yaml",
-					Namespace:  rctx.Namespace,
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						return true
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						// autoMtls doesn't work for client that doesn't have proxy, unless target doesn't
-						// have proxy neither.
-						if rctx.IsNaked(src) {
-							return rctx.IsNaked(opts.Target)
-						}
-						// headless service with sidecar injected, global mTLS enabled,
-						// no client side transport socket or transport_socket_matches since it's headless service.
-						if src != rctx.Headless && opts.Target == rctx.Headless {
-							return false
-						}
-						return true
-					},
-				},
-				{
-					ConfigFile: "beta-mtls-partial-automtls.yaml",
-					Namespace:  rctx.Namespace,
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						return true
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						// autoMtls doesn't work for client that doesn't have proxy, unless target doesn't
-						// have proxy or have mTLS disabled
-						if rctx.IsNaked(src) {
-							return rctx.IsNaked(opts.Target) || (opts.Target == rctx.B && opts.PortName != "http")
+			// Create matchers for the migration app.
+			migration := match.ServiceName(migrationApp.NamespacedName())
+			notMigration := match.Not(migration)
 
-						}
-						// headless with sidecar injected, global mTLS enabled, no client side transport socket or transport_socket_matches since it's headless service.
-						if src != rctx.Headless && opts.Target == rctx.Headless {
-							return false
-						}
-						// PeerAuthentication disable mTLS for workload app:b, except http port. Thus, autoMTLS
-						// will fail on all ports on b, except http port.
-						return opts.Target != rctx.B || opts.PortName == "http"
+			// Call options to be used for tests using the migration app.
+			migrationOpts := []echo.CallOptions{
+				{
+					Port: echo.Port{
+						Name: ports.HTTP,
+					},
+					HTTP: echo.HTTP{
+						Path: migrationPathIstio,
 					},
 				},
 				{
-					ConfigFile: "global-plaintext.yaml",
-					Namespace:  systemNM,
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						// Exclude calls to the headless TCP port.
-						if rctx.IsHeadless(opts.Target) && opts.PortName == "tcp" {
-							return false
-						}
-
-						// Exclude calls from naked->VM since naked has no Envoy
-						// so k8s is responsible for DNS resolution
-						// However, no endpoint exists for VM in k8s, so calls from naked->VM will fail
-						if rctx.IsNaked(src) && opts.Target == rctx.VM {
-							return false
-						}
-
-						return true
+					Port: echo.Port{
+						Name: ports.HTTP,
 					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						// When mTLS is disabled, all traffic should work.
-						return true
+					HTTP: echo.HTTP{
+						Path: migrationPathNonIstio,
 					},
 				},
+			}
+
+			cases := []struct {
+				name               string
+				configs            config.Sources
+				fromMatch          match.Matcher
+				toMatch            match.Matcher
+				callOpts           []echo.CallOptions
+				expectMTLS         condition
+				expectCrossCluster condition
+				expectCrossNetwork condition
+				expectSuccess      condition
+			}{
+				{
+					name: "global mtls strict",
+					configs: config.Sources{
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/global-dr.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSStrict.String(),
+						tlsModeParam:             "ISTIO_MUTUAL",
+						param.Namespace.String(): systemNS,
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         notNaked,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: notNaked,
+					expectSuccess:      notNaked,
+				},
+				{
+					name: "global mtls permissive",
+					configs: config.Sources{
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/global-dr.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSPermissive.String(),
+						tlsModeParam:             "ISTIO_MUTUAL",
+						param.Namespace.String(): systemNS,
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         notNaked,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: notNaked,
+					expectSuccess:      notToNaked,
+				},
+				{
+					name: "global mtls disabled",
+					configs: config.Sources{
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/global-dr.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSDisable.String(),
+						tlsModeParam:             "DISABLE",
+						param.Namespace.String(): systemNS,
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         never,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: never,
+					expectSuccess:      always,
+				},
+				{
+					name: "global plaintext to mtls permissive",
+					configs: config.Sources{
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/global-dr.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSPermissive.String(),
+						tlsModeParam:             "DISABLE",
+						param.Namespace.String(): systemNS,
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         never,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: never,
+					expectSuccess:      always,
+				},
+				{
+					name: "global automtls strict",
+					configs: config.Sources{
+						// No DR is added for this test. enableAutoMtls is expected on by default.
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSStrict.String(),
+						param.Namespace.String(): systemNS,
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         notNaked,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: notNaked,
+					expectSuccess:      notFromNaked,
+				},
+				{
+					name: "global automtls disable",
+					configs: config.Sources{
+						// No DR is added for this test. enableAutoMtls is expected on by default.
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSDisable.String(),
+						param.Namespace.String(): systemNS,
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         never,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: never,
+					expectSuccess:      always,
+				},
+				{
+					name: "global automtls passthrough",
+					configs: config.Sources{
+						config.File("testdata/reachability/automtls-passthrough.yaml.tmpl"),
+					}.WithNamespace(systemNS),
+					fromMatch: notMigration,
+					// VM passthrough doesn't work. We will send traffic to the ClusterIP of
+					// the VM service, which will have 0 Endpoints. If we generated
+					// EndpointSlice's for VMs this might work.
+					toMatch:    match.And(match.NotVM, notMigration),
+					expectMTLS: notNaked,
+					// Since we are doing pass-through, all requests will stay in the same cluster,
+					// as we are bypassing Istio load balancing.
+					// TODO(https://github.com/istio/istio/issues/39700): Why does headless behave differently?
+					expectCrossCluster: and(notFromNaked, or(toHeadless, toStatefulSet)),
+					expectCrossNetwork: never,
+					expectSuccess:      always,
+				},
+				{
+					name: "global no peer authn",
+					configs: config.Sources{
+						config.File("testdata/reachability/global-dr.yaml.tmpl"),
+					}.WithParams(param.Params{
+						tlsModeParam:             "ISTIO_MUTUAL",
+						param.Namespace.String(): systemNS,
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         notNaked,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: notNaked,
+					expectSuccess:      notToNaked,
+				},
+				{
+					name: "mtls strict",
+					configs: config.Sources{
+						config.File("testdata/reachability/workload-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/workload-dr.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam: model.MTLSStrict.String(),
+						tlsModeParam:  "ISTIO_MUTUAL",
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         notNaked,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: notNaked,
+					expectSuccess:      notNaked,
+				},
+				{
+					name: "mtls permissive",
+					configs: config.Sources{
+						config.File("testdata/reachability/workload-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/workload-dr.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam: model.MTLSPermissive.String(),
+						tlsModeParam:  "ISTIO_MUTUAL",
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         notNaked,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: notNaked,
+					expectSuccess:      notToNaked,
+				},
+				{
+					name: "mtls disabled",
+					configs: config.Sources{
+						config.File("testdata/reachability/workload-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/workload-dr.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam: model.MTLSDisable.String(),
+						tlsModeParam:  "DISABLE",
+					}),
+					fromMatch:          notMigration,
+					toMatch:            notMigration,
+					expectMTLS:         never,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: never,
+					expectSuccess:      always,
+				},
+				{
+					name: "mtls port override",
+					configs: config.Sources{
+						config.File("testdata/reachability/workload-peer-authn-port-override.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:         model.MTLSStrict.String(),
+						mtlsModeOverrideParam: model.MTLSDisable.String(),
+					}),
+					fromMatch: notMigration,
+					// TODO(https://github.com/istio/istio/issues/39439):
+					toMatch:            match.And(match.NotHeadless, notMigration),
+					expectMTLS:         never,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: never,
+					expectSuccess:      always,
+				},
+
 				// --------start of auto mtls partial test cases ---------------
 				// The follow three consecutive test together ensures the auto mtls works as intended
 				// for sidecar migration scenario.
 				{
-					ConfigFile: "automtls-partial-sidecar-dr-no-tls.yaml",
-					Namespace:  rctx.Namespace,
-					CallOpts: []echo.CallOptions{
-						{
-							PortName: "http",
-							Scheme:   scheme.HTTP,
-							Path:     "/vistio",
-						},
-						{
-							PortName: "http",
-							Scheme:   scheme.HTTP,
-							Path:     "/vlegacy",
-						},
-					},
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						// We only need one pair.
-						return src == rctx.A && opts.Target == rctx.Multiversion
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						return true
-					},
+					name: "migration no tls",
+					configs: config.Sources{
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/migration.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSStrict.String(),
+						tlsModeParam:             "", // No TLS settings will be included.
+						param.Namespace.String(): apps.Ns1.Namespace,
+					}),
+					fromMatch:          match.And(match.NotNaked, notMigration),
+					toMatch:            migration,
+					callOpts:           migrationOpts,
+					expectMTLS:         toMigrationIstioSubset,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: toMigrationIstioSubset,
+					expectSuccess:      always,
 				},
 				{
-					ConfigFile: "automtls-partial-sidecar-dr-disable.yaml",
-					Namespace:  rctx.Namespace,
-					CallOpts: []echo.CallOptions{
-						{
-							PortName: "http",
-							Scheme:   scheme.HTTP,
-							Path:     "/vistio",
-						},
-						{
-							PortName: "http",
-							Scheme:   scheme.HTTP,
-							Path:     "/vlegacy",
-						},
-					},
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						// We only need one pair.
-						return src == rctx.A && opts.Target == rctx.Multiversion
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						// Only the request to legacy one succeeds as we disable mtls explicitly.
-						return opts.Path == "/vlegacy"
-					},
+					name: "migration tls disabled",
+					configs: config.Sources{
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/migration.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSStrict.String(),
+						tlsModeParam:             "DISABLE",
+						param.Namespace.String(): apps.Ns1.Namespace,
+					}),
+					fromMatch:          match.And(match.NotNaked, notMigration),
+					toMatch:            migration,
+					callOpts:           migrationOpts,
+					expectMTLS:         never,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: never,
+					// Only the request to legacy one succeeds as we disable mtls explicitly.
+					expectSuccess: toMigrationNonIstioSubset,
 				},
 				{
-					ConfigFile: "automtls-partial-sidecar-dr-mutual.yaml",
-					Namespace:  rctx.Namespace,
-					CallOpts: []echo.CallOptions{
-						{
-							PortName: "http",
-							Scheme:   scheme.HTTP,
-							Path:     "/vistio",
-						},
-						{
-							PortName: "http",
-							Scheme:   scheme.HTTP,
-							Path:     "/vlegacy",
-						},
-					},
-					Include: func(src echo.Instance, opts echo.CallOptions) bool {
-						// We only need one pair.
-						return src == rctx.A && opts.Target == rctx.Multiversion
-					},
-					ExpectSuccess: func(src echo.Instance, opts echo.CallOptions) bool {
-						// Only the request to vistio one succeeds as we enable mtls explicitly.
-						return opts.Path == "/vistio"
-					},
+					name: "migration tls mutual",
+					configs: config.Sources{
+						config.File("testdata/reachability/global-peer-authn.yaml.tmpl"),
+						config.File("testdata/reachability/migration.yaml.tmpl"),
+					}.WithParams(param.Params{
+						mtlsModeParam:            model.MTLSStrict.String(),
+						tlsModeParam:             "ISTIO_MUTUAL",
+						param.Namespace.String(): apps.Ns1.Namespace,
+					}),
+					fromMatch:          match.And(match.NotNaked, notMigration),
+					toMatch:            migration,
+					callOpts:           migrationOpts,
+					expectMTLS:         toMigrationIstioSubset,
+					expectCrossCluster: notFromNaked,
+					expectCrossNetwork: toMigrationIstioSubset,
+					// Only the request to vistio one succeeds as we enable mtls explicitly.
+					expectSuccess: toMigrationIstioSubset,
 				},
-				// ----- end of automtls partial test suites -----
 			}
-			rctx.Run(testCases)
+
+			for _, c := range cases {
+				c := c
+
+				t.NewSubTest(c.name).Run(func(t framework.TestContext) {
+					// Apply the configs.
+					config.New(t).
+						Source(c.configs...).
+						BuildAll(nil, allServices).
+						Apply()
+					// Run the test against a number of ports.
+					allOpts := append([]echo.CallOptions{}, c.callOpts...)
+					if len(allOpts) == 0 {
+						allOpts = []echo.CallOptions{
+							{
+								Port: echo.Port{
+									Name: ports.HTTP,
+								},
+							},
+							{
+								Port: echo.Port{
+									Name: ports.HTTP,
+								},
+								Scheme: scheme.WebSocket,
+							},
+							{
+								Port: echo.Port{
+									Name: ports.HTTP2,
+								},
+							},
+							{
+								Port: echo.Port{
+									Name: ports.HTTPS,
+								},
+							},
+							{
+								Port: echo.Port{
+									Name: ports.TCP,
+								},
+							},
+							{
+								Port: echo.Port{
+									Name: ports.GRPC,
+								},
+							},
+						}
+					}
+
+					// Iterate over all protocols outside, rather than inside, the destination match
+					// This is to workaround a known bug (https://github.com/istio/istio/issues/38982) causing
+					// connection resets when sending traffic to multiple ports at once
+					for _, opts := range allOpts {
+						opts := opts
+
+						schemeStr := string(opts.Scheme)
+						if len(schemeStr) == 0 {
+							schemeStr = opts.Port.Name
+						}
+						t.NewSubTestf("%s%s", schemeStr, opts.HTTP.Path).Run(func(t framework.TestContext) {
+							// Run the test cases.
+							echotest.New(t, allServices.Instances()).
+								FromMatch(match.And(c.fromMatch, match.NotProxylessGRPC)).
+								ToMatch(match.And(c.toMatch, match.NotProxylessGRPC)).
+								WithDefaultFilters(1, 1).
+								ConditionallyTo(echotest.NoSelfCalls).
+								Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
+									opts := opts.DeepCopy()
+									opts.To = to
+
+									if c.expectSuccess(from, opts) {
+										opts.Check = check.OK()
+
+										// Check HTTP headers to confirm expected use of mTLS in the request.
+										if c.expectMTLS(from, opts) {
+											opts.Check = check.And(opts.Check, check.MTLSForHTTP())
+										} else {
+											opts.Check = check.And(opts.Check, check.PlaintextForHTTP())
+										}
+
+										// Check that the correct clusters/networks were reached.
+										if c.expectCrossNetwork(from, opts) {
+											if !check.IsDNSCaptureEnabled(t) && opts.To.Config().Headless {
+												opts.Check = check.And(opts.Check, check.ReachedSourceCluster(t.Clusters()))
+											} else {
+												opts.Check = check.And(opts.Check, check.ReachedTargetClusters(t))
+											}
+										} else if c.expectCrossCluster(from, opts) {
+											// Expect to stay in the same network as the source pod.
+											expectedClusters := to.Clusters().ForNetworks(from.Config().Cluster.NetworkName())
+											if !check.IsDNSCaptureEnabled(t) && opts.To.Config().Headless {
+												opts.Check = check.And(opts.Check, check.ReachedSourceCluster(t.Clusters()))
+											} else {
+												opts.Check = check.And(opts.Check, check.ReachedClusters(t.Clusters(), expectedClusters))
+											}
+										} else {
+											// Expect to stay in the same cluster as the source pod.
+											expectedClusters := cluster.Clusters{from.Config().Cluster}
+											if !check.IsDNSCaptureEnabled(t) && opts.To.Config().Headless {
+												opts.Check = check.And(opts.Check, check.ReachedSourceCluster(t.Clusters()))
+											} else {
+												opts.Check = check.And(opts.Check, check.ReachedClusters(t.Clusters(), expectedClusters))
+											}
+										}
+									} else {
+										opts.Check = check.NotOK()
+									}
+									from.CallOrFail(t, opts)
+								})
+						})
+					}
+				})
+			}
 		})
+}
+
+type condition func(from echo.Instance, opts echo.CallOptions) bool
+
+func not(c condition) condition {
+	return func(from echo.Instance, opts echo.CallOptions) bool {
+		return !c(from, opts)
+	}
+}
+
+func and(conds ...condition) condition {
+	return func(from echo.Instance, opts echo.CallOptions) bool {
+		for _, c := range conds {
+			if !c(from, opts) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func or(conds ...condition) condition {
+	return func(from echo.Instance, opts echo.CallOptions) bool {
+		for _, c := range conds {
+			if c(from, opts) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+var fromNaked condition = func(from echo.Instance, _ echo.CallOptions) bool {
+	return from.Config().IsNaked()
+}
+
+var toNaked condition = func(_ echo.Instance, opts echo.CallOptions) bool {
+	return opts.To.Config().IsNaked()
+}
+
+var toHeadless condition = func(_ echo.Instance, opts echo.CallOptions) bool {
+	return opts.To.Config().IsHeadless()
+}
+
+var toStatefulSet condition = func(_ echo.Instance, opts echo.CallOptions) bool {
+	return opts.To.Config().IsStatefulSet()
+}
+
+var toMigrationIstioSubset condition = func(_ echo.Instance, opts echo.CallOptions) bool {
+	return opts.HTTP.Path == migrationPathIstio
+}
+
+var toMigrationNonIstioSubset condition = func(_ echo.Instance, opts echo.CallOptions) bool {
+	return opts.HTTP.Path == migrationPathNonIstio
+}
+
+var anyNaked = or(fromNaked, toNaked)
+
+var notNaked = not(anyNaked)
+
+var notFromNaked = not(fromNaked)
+
+var notToNaked = not(toNaked)
+
+var always condition = func(echo.Instance, echo.CallOptions) bool {
+	return true
+}
+
+var never condition = func(echo.Instance, echo.CallOptions) bool {
+	return false
 }

@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,15 +24,14 @@ import (
 	"strings"
 	"testing"
 	"text/template"
-	"time"
 
-	"github.com/Masterminds/sprig"
+	"github.com/Masterminds/sprig/v3"
 
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/scopes"
-	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/istio/tests/integration/pilot/common"
 )
 
 const localityTemplate = `
@@ -72,7 +74,7 @@ spec:
 {{.LocalitySetting | indent 8 }}
     outlierDetection:
       interval: 1s
-      baseEjectionTime: 3m
+      baseEjectionTime: 10m
       maxEjectionPercent: 100`
 
 type LocalityInput struct {
@@ -88,6 +90,13 @@ const localityFailover = `
 failover:
 - from: region
   to: nearregion`
+
+const failoverPriority = `
+failoverPriority:
+- "topology.kubernetes.io/region"
+- "topology.kubernetes.io/zone"
+- "topology.istio.io/subzone"`
+
 const localityDistribute = `
 distribute:
 - from: region
@@ -96,94 +105,117 @@ distribute:
     region: 20`
 
 func TestLocality(t *testing.T) {
-	cases := []struct {
-		name     string
-		input    LocalityInput
-		expected map[string]int
-	}{
-		{
-			"Prioritized/CDS",
-			LocalityInput{
-				LocalitySetting: localityFailover,
-				Resolution:      "DNS",
-				Local:           apps.podB.Config().Service,
-				Remote:          apps.podC.Config().Service,
-			},
-			expectAllTrafficTo(apps.podB.Config().Service),
-		},
-		{
-			"Prioritized/EDS",
-			LocalityInput{
-				LocalitySetting: localityFailover,
-				Resolution:      "STATIC",
-				Local:           apps.podC.Address(),
-				Remote:          apps.podB.Address(),
-			},
-			expectAllTrafficTo(apps.podC.Config().Service),
-		},
-		{
-			"Failover/CDS",
-			LocalityInput{
-				LocalitySetting: localityFailover,
-				Resolution:      "DNS",
-				Local:           "fake-should-fail.example.com",
-				NearLocal:       apps.podB.Config().Service,
-				Remote:          apps.podC.Config().Service,
-			},
-			expectAllTrafficTo(apps.podB.Config().Service),
-		},
-		{
-			"Failover/EDS",
-			LocalityInput{
-				LocalitySetting: localityFailover,
-				Resolution:      "STATIC",
-				Local:           "10.10.10.10",
-				NearLocal:       apps.podC.Address(),
-				Remote:          apps.podB.Address(),
-			},
-			expectAllTrafficTo(apps.podC.Config().Service),
-		},
-		{
-			"Distribute/CDS",
-			LocalityInput{
-				LocalitySetting: localityDistribute,
-				Resolution:      "DNS",
-				Local:           apps.podC.Config().Service,
-				NearLocal:       apps.podB.Config().Service,
-				Remote:          "fake-should-fail.example.com",
-			},
-			map[string]int{
-				apps.podB.Config().Service: sendCount * .8,
-				apps.podC.Config().Service: sendCount * .2,
-			},
-		},
-		{
-			"Distribute/EDS",
-			LocalityInput{
-				LocalitySetting: localityDistribute,
-				Resolution:      "STATIC",
-				Local:           apps.podB.Address(),
-				NearLocal:       apps.podC.Address(),
-				Remote:          "10.10.10.10",
-			},
-			map[string]int{
-				apps.podC.Config().Service: sendCount * .8,
-				apps.podB.Config().Service: sendCount * .2,
-			},
-		},
-	}
-	framework.NewTest(t).RequiresSingleCluster().Run(func(ctx framework.TestContext) {
-		for _, tt := range cases {
-			ctx.NewSubTest(tt.name).Run(func(ctx framework.TestContext) {
-				hostname := fmt.Sprintf("%s-fake-locality.example.com", strings.ToLower(strings.ReplaceAll(tt.name, "/", "-")))
-				tt.input.Host = hostname
-				applyAndCleanup(ctx, apps.namespace.Name(), runTemplate(ctx, localityTemplate, tt.input))
-				retry.UntilSuccessOrFail(ctx, func() error {
-					return sendTraffic(apps.podA, hostname, tt.expected)
-				}, retry.Delay(250*time.Millisecond))
-			})
-		}
-	})
+	// nolint: staticcheck
+	framework.
+		NewTest(t).
+		Features("traffic.locality").
+		RequiresSingleCluster().
+		Run(func(t framework.TestContext) {
+			destA := apps.B[0]
+			destB := apps.C[0]
+			destC := apps.Naked[0]
+			if !t.Settings().Skip(echo.VM) {
+				// TODO do we even need this to be a VM
+				destC = apps.VM[0]
+			}
+
+			cases := []struct {
+				name     string
+				input    LocalityInput
+				expected map[string]int
+			}{
+				{
+					"Prioritized/CDS",
+					LocalityInput{
+						LocalitySetting: localityFailover,
+						Resolution:      "DNS",
+						Local:           destA.Config().Service,
+						Remote:          destB.Config().Service,
+					},
+					expectAllTrafficTo(destA.Config().Service),
+				},
+				{
+					"Prioritized/EDS",
+					LocalityInput{
+						LocalitySetting: localityFailover,
+						Resolution:      "STATIC",
+						Local:           destB.Address(),
+						Remote:          destA.Address(),
+					},
+					expectAllTrafficTo(destB.Config().Service),
+				},
+				{
+					"Failover/CDS",
+					LocalityInput{
+						LocalitySetting: localityFailover,
+						Resolution:      "DNS",
+						Local:           "fake-should-fail.example.com",
+						NearLocal:       destA.Config().Service,
+						Remote:          destB.Config().Service,
+					},
+					expectAllTrafficTo(destA.Config().Service),
+				},
+				{
+					"Failover/EDS",
+					LocalityInput{
+						LocalitySetting: localityFailover,
+						Resolution:      "STATIC",
+						Local:           "10.10.10.10",
+						NearLocal:       destB.Address(),
+						Remote:          destA.Address(),
+					},
+					expectAllTrafficTo(destB.Config().Service),
+				},
+				{
+					"FailoverPriority/EDS",
+					LocalityInput{
+						LocalitySetting: failoverPriority,
+						Resolution:      "STATIC",
+						Local:           destA.Address(),
+						NearLocal:       destB.Address(),
+						Remote:          destC.Address(),
+					},
+					expectAllTrafficTo(destA.Config().Service),
+				},
+				{
+					"Distribute/CDS",
+					LocalityInput{
+						LocalitySetting: localityDistribute,
+						Resolution:      "DNS",
+						Local:           destB.Config().Service,
+						NearLocal:       destA.Config().Service,
+						Remote:          "fake-should-fail.example.com",
+					},
+					map[string]int{
+						destA.Config().Service: sendCount * .8,
+						destB.Config().Service: sendCount * .2,
+					},
+				},
+				{
+					"Distribute/EDS",
+					LocalityInput{
+						LocalitySetting: localityDistribute,
+						Resolution:      "STATIC",
+						Local:           destA.Address(),
+						NearLocal:       destB.Address(),
+						Remote:          "10.10.10.10",
+					},
+					map[string]int{
+						destB.Config().Service: sendCount * .8,
+						destA.Config().Service: sendCount * .2,
+					},
+				},
+			}
+			for _, tt := range cases {
+				t.NewSubTest(tt.name).Run(func(t framework.TestContext) {
+					hostname := fmt.Sprintf("%s-fake-locality.example.com", strings.ToLower(strings.ReplaceAll(tt.name, "/", "-")))
+					tt.input.Host = hostname
+					t.ConfigIstio().YAML(apps.Namespace.Name(), runTemplate(t, localityTemplate, tt.input)).
+						ApplyOrFail(t)
+					sendTrafficOrFail(t, apps.A[0], hostname, tt.expected)
+				})
+			}
+		})
 }
 
 const sendCount = 50
@@ -192,51 +224,49 @@ func expectAllTrafficTo(dest string) map[string]int {
 	return map[string]int{dest: sendCount}
 }
 
-func applyAndCleanup(ctx framework.TestContext, ns string, yaml ...string) {
-	ctx.Config().ApplyYAMLOrFail(ctx, ns, yaml...)
-	ctx.WhenDone(func() error {
-		return ctx.Config().DeleteYAML(ns, yaml...)
-	})
-}
-
-func sendTraffic(from echo.Instance, host string, expected map[string]int) error {
+func sendTrafficOrFail(t framework.TestContext, from echo.Instance, host string, expected map[string]int) {
+	t.Helper()
 	headers := http.Header{}
 	headers.Add("Host", host)
+	checker := func(result echo.CallResult, inErr error) error {
+		if inErr != nil {
+			return inErr
+		}
+		got := map[string]int{}
+		for _, r := range result.Responses {
+			// Hostname will take form of svc-v1-random. We want to extract just 'svc'
+			parts := strings.SplitN(r.Hostname, "-", 2)
+			if len(parts) < 2 {
+				return fmt.Errorf("unexpected hostname: %v", r)
+			}
+			gotHost := parts[0]
+			got[gotHost]++
+		}
+		scopes.Framework.Infof("Got responses: %+v", got)
+		for svc, reqs := range got {
+			expect := expected[svc]
+			if !common.AlmostEquals(reqs, expect, 3) {
+				return fmt.Errorf("unexpected request distribution. Expected: %+v, got: %+v", expected, got)
+			}
+		}
+		return nil
+	}
 	// This is a hack to remain infrastructure agnostic when running these tests
 	// We actually call the host set above not the endpoint we pass
-	resp, err := from.Call(echo.CallOptions{
-		Target:   from,
-		PortName: "http",
-		Headers:  headers,
-		Count:    sendCount,
+	_ = from.CallOrFail(t, echo.CallOptions{
+		To: from,
+		Port: echo.Port{
+			Name: "http",
+		},
+		HTTP: echo.HTTP{
+			Headers: headers,
+		},
+		Count: sendCount,
+		Check: checker,
 	})
-	if err != nil {
-		return fmt.Errorf("%s->%s failed sending: %v", from.Config().Service, host, err)
-	}
-	if len(resp) != sendCount {
-		return fmt.Errorf("%s->%s expected %d responses, received %d", from.Config().Service, host, sendCount, len(resp))
-	}
-	got := map[string]int{}
-	for _, r := range resp {
-		// Hostname will take form of svc-v1-random. We want to extract just 'svc'
-		parts := strings.SplitN(r.Hostname, "-", 2)
-		if len(parts) < 2 {
-			return fmt.Errorf("unexpected hostname: %v", r)
-		}
-		gotHost := parts[0]
-		got[gotHost]++
-	}
-	scopes.Framework.Infof("Got responses: %+v", got)
-	for svc, reqs := range got {
-		expect := expected[svc]
-		if !almostEquals(reqs, expect, 3) {
-			return fmt.Errorf("unexpected request distribution. Expected: %+v, got: %+v", expected, got)
-		}
-	}
-	return nil
 }
 
-func runTemplate(t test.Failer, tmpl string, input interface{}) string {
+func runTemplate(t test.Failer, tmpl string, input any) string {
 	tt, err := template.New("").Funcs(sprig.TxtFuncMap()).Parse(tmpl)
 	if err != nil {
 		t.Fatal(err)

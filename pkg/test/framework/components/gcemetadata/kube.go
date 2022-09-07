@@ -17,10 +17,12 @@ package gcemetadata
 import (
 	"fmt"
 	"io"
+	"net"
 
 	kubeApiCore "k8s.io/api/core/v1"
 
 	environ "istio.io/istio/pkg/test/env"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/resource"
 	testKube "istio.io/istio/pkg/test/kube"
@@ -39,7 +41,7 @@ var (
 type kubeComponent struct {
 	id      resource.ID
 	ns      namespace.Instance
-	cluster resource.Cluster
+	cluster cluster.Cluster
 	address string
 }
 
@@ -52,7 +54,7 @@ func newKube(ctx resource.Context, cfg Config) (Instance, error) {
 	scopes.Framework.Info("=== BEGIN: Deploy GCE Metadata Server ===")
 	defer func() {
 		if err != nil {
-			err = fmt.Errorf("gcemetadata deployment failed: %v", err) // nolint:golint
+			err = fmt.Errorf("gcemetadata deployment failed: %v", err)
 			scopes.Framework.Infof("=== FAILED: Deploy GCE Metadata Server ===")
 			_ = c.Close()
 		} else {
@@ -73,12 +75,12 @@ func newKube(ctx resource.Context, cfg Config) (Instance, error) {
 	}
 
 	var svc *kubeApiCore.Service
-	if svc, _, err = testKube.WaitUntilServiceEndpointsAreReady(c.cluster, c.ns.Name(), "gce-metadata-server"); err != nil {
+	if svc, _, err = testKube.WaitUntilServiceEndpointsAreReady(c.cluster.Kube(), c.ns.Name(), "gce-metadata-server"); err != nil {
 		scopes.Framework.Infof("Error waiting for GCE Metadata service to be available: %v", err)
 		return nil, err
 	}
 
-	c.address = fmt.Sprintf("%s:%d", svc.Spec.ClusterIP, svc.Spec.Ports[0].TargetPort.IntVal)
+	c.address = net.JoinHostPort(svc.Spec.ClusterIP, fmt.Sprint(svc.Spec.Ports[0].TargetPort.IntVal))
 	scopes.Framework.Infof("GCE Metadata Server in-cluster address: %s", c.address)
 
 	return c, nil

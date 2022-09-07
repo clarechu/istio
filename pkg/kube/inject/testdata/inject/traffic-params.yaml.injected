@@ -12,17 +12,18 @@ spec:
   template:
     metadata:
       annotations:
-        sidecar.istio.io/interceptionMode: REDIRECT
-        sidecar.istio.io/status: '{"version":"","initContainers":["istio-init"],"containers":["istio-proxy"],"volumes":["istio-envoy","istio-data","istio-podinfo","istio-token","istiod-ca-cert"],"imagePullSecrets":null}'
-        traffic.sidecar.istio.io/excludeInboundPorts: 4,5,6
-        traffic.sidecar.istio.io/excludeOutboundIPRanges: 10.96.0.2/24,10.96.0.3/24
-        traffic.sidecar.istio.io/includeInboundPorts: "80"
-        traffic.sidecar.istio.io/includeOutboundIPRanges: 127.0.0.1/24,10.96.0.1/24
+        kubectl.kubernetes.io/default-container: traffic
+        kubectl.kubernetes.io/default-logs-container: traffic
+        prometheus.io/path: /stats/prometheus
+        prometheus.io/port: "15020"
+        prometheus.io/scrape: "true"
+        sidecar.istio.io/status: '{"initContainers":["istio-init"],"containers":["istio-proxy"],"volumes":["workload-socket","credential-socket","workload-certs","istio-envoy","istio-data","istio-podinfo","istio-token","istiod-ca-cert"],"imagePullSecrets":null,"revision":"default"}'
       creationTimestamp: null
       labels:
         app: traffic
-        istio.io/rev: ""
         security.istio.io/tlsMode: istio
+        service.istio.io/canonical-name: traffic
+        service.istio.io/canonical-revision: latest
     spec:
       containers:
       - image: fake.docker.io/google-samples/traffic-go-gke:1.0
@@ -36,11 +37,9 @@ spec:
         - sidecar
         - --domain
         - $(POD_NAMESPACE).svc.cluster.local
-        - --serviceCluster
-        - traffic.$(POD_NAMESPACE)
         - --proxyLogLevel=warning
         - --proxyComponentLogLevel=misc:error
-        - --trust-domain=cluster.local
+        - --log_output_level=default:info
         - --concurrency
         - "2"
         env:
@@ -48,6 +47,8 @@ spec:
           value: third-party-jwt
         - name: PILOT_CERT_PROVIDER
           value: istiod
+        - name: CA_ADDR
+          value: istiod.istio-system.svc:15012
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -68,17 +69,9 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: CANONICAL_SERVICE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.labels['service.istio.io/canonical-name']
-        - name: CANONICAL_REVISION
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.labels['service.istio.io/canonical-revision']
         - name: PROXY_CONFIG
           value: |
-            {"proxyMetadata":{"DNS_AGENT":""}}
+            {}
         - name: ISTIO_META_POD_PORTS
           value: |-
             [
@@ -96,11 +89,9 @@ spec:
           value: kubernetes://apis/apps/v1/namespaces/default/deployments/traffic
         - name: ISTIO_META_MESH_ID
           value: cluster.local
-        - name: DNS_AGENT
-        - name: ISTIO_KUBE_APP_PROBERS
-          value: '{}'
+        - name: TRUST_DOMAIN
+          value: cluster.local
         image: gcr.io/istio-testing/proxyv2:latest
-        imagePullPolicy: Always
         name: istio-proxy
         ports:
         - containerPort: 15090
@@ -124,6 +115,12 @@ spec:
           runAsNonRoot: true
           runAsUser: 1337
         volumeMounts:
+        - mountPath: /var/run/secrets/workload-spiffe-uds
+          name: workload-socket
+        - mountPath: /var/run/secrets/credential-uds
+          name: credential-socket
+        - mountPath: /var/run/secrets/workload-spiffe-credentials
+          name: workload-certs
         - mountPath: /var/run/secrets/istio
           name: istiod-ca-cert
         - mountPath: /var/lib/istio/data
@@ -153,18 +150,16 @@ spec:
         - '*'
         - -d
         - 15090,15021,4,5,6
-        env:
-        - name: DNS_AGENT
+        - --log_output_level=default:info
         image: gcr.io/istio-testing/proxyv2:latest
-        imagePullPolicy: Always
         name: istio-init
         resources:
           limits:
             cpu: "2"
             memory: 1Gi
           requests:
-            cpu: 10m
-            memory: 10Mi
+            cpu: 100m
+            memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -178,9 +173,10 @@ spec:
           runAsGroup: 0
           runAsNonRoot: false
           runAsUser: 0
-      securityContext:
-        fsGroup: 1337
       volumes:
+      - name: workload-socket
+      - name: credential-socket
+      - name: workload-certs
       - emptyDir:
           medium: Memory
         name: istio-envoy

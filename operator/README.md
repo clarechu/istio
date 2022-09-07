@@ -1,12 +1,11 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/istio/operator)](https://goreportcard.com/report/github.com/istio/operator)
-[![GolangCI](https://golangci.com/badges/github.com/istio/operator.svg)](https://golangci.com/r/github.com/istio/operator)
 
 # Istio Operator
 
 The istio/operator repo is part of istio/istio from 1.5 onwards.
-You can [contribute](CONTRIBUTING.md) by picking an
+You can [contribute](../CONTRIBUTING.md) by picking an
 [unassigned open issue](https://github.com/istio/istio/issues?q=is%3Aissue+is%3Aopen+label%3Aarea%2Fenvironments%2Foperator+no%3Aassignee),
-creating a [bug or feature request](BUGS-AND-FEATURE-REQUESTS.md),
+creating a [bug or feature request](../BUGS-AND-FEATURE-REQUESTS.md),
 or just coming to the weekly [Environments Working Group](https://github.com/istio/community/blob/master/WORKING-GROUPS.md)
 meeting to share your ideas.
 
@@ -20,12 +19,12 @@ three main components:
 
 - [MeshConfig](https://github.com/istio/api/blob/master/mesh/v1alpha1/config.proto) for runtime config consumed directly by Istio
 control plane components.
-- [Component configuration API](https://github.com/istio/api/blob/master/operator/v1alpha1/component.proto), for managing
+- [Component configuration API](https://github.com/istio/api/blob/00671adacbea20f941cb20cce021bc63cbad1840/operator/v1alpha1/operator.proto#L42-L93), for managing
 K8s settings like resources, auto scaling, pod disruption budgets and others defined in the
-[KubernetesResourceSpec](https://github.com/istio/api/blob/master/operator/v1alpha1/component.proto)
+[KubernetesResourceSpec](https://github.com/istio/api/blob/00671adacbea20f941cb20cce021bc63cbad1840/operator/v1alpha1/operator.proto#L217-L271)
 for Istio core and addon components.
 - The legacy
-[Helm installation API](https://istio.io/docs/reference/config/installation-options/) for backwards
+[Helm installation API](https://github.com/istio/istio/blob/master/operator/pkg/apis/istio/v1alpha1/values_types.proto) for backwards
 compatibility.
 
 Some parameters will temporarily exist both the component configuration and legacy Helm APIs - for example, K8s
@@ -55,16 +54,7 @@ for details.
 
 The quick start describes how to install and use the operator `mesh` CLI command and/or controller.
 
-### Building
-
-If you're trying to do a local build that bypasses the build container, you'll need to
-to execute the following step one time.
-
-```bash
-GO111MODULE=on go get github.com/jteeuwen/go-bindata/go-bindata@6025e8de665b
-```
-
-#### CLI
+### CLI
 
 To build the operator CLI, simply:
 
@@ -74,7 +64,7 @@ make build
 
 Ensure the created binary is in your PATH to run the examples below.
 
-#### Controller (in cluster)
+### Controller (in cluster)
 
 Building a custom controller requires a Dockerhub (or similar) account. To build using the container based build:
 
@@ -83,32 +73,20 @@ HUB=docker.io/<your-account> TAG=latest make docker.operator
 ```
 
 This builds the controller binary and docker file, and pushes the image to the specified hub with the `latest` tag.
-Once the images are pushed, configure kubectl to point to your cluster and install the controller. You should edit
-the file deploy/operator.yaml to point to your docker hub:
+Once the images are pushed, configure kubectl to point to your cluster and install the controller.
 
-```yaml
-          image: docker.io/<your-account>/operator
-```
-
-Install the controller manifest and example IstioOperator CR:
+Install the controller manifest:
 
 ```bash
 istioctl operator init --hub docker.io/<your-account> --tag latest
 kubectl create ns istio-system
-kubectl apply -f operator/deploy/crds/istio_v1alpha1_istiooperator_cr.yaml
-```
-
-or
-
-```bash
-kubectl apply -k operator/deploy/
-kubectl apply -f operator/deploy/crds/istio_v1alpha1_istiooperator_cr.yaml
+kubectl apply -f operator/samples/default-install.yaml
 ```
 
 This installs the controller into the cluster in the istio-operator namespace. The controller in turns installs
 the Istio control plane into the istio-system namespace by default.
 
-#### Controller (running locally)
+### Controller (running locally)
 
 1. Set env $WATCH_NAMESPACE (default value is "istio-system") and $LEADER_ELECTION_NAMESPACE (default value is "istio-operator")
 
@@ -282,26 +260,6 @@ spec:
 You can mix and match these approaches. For example, you can use a compiled-in configuration profile with charts in your
 local file system.
 
-#### Migration from values.yaml
-
-The following command takes helm values.yaml files and output the new IstioOperatorSpec:
-
-```bash
-istioctl manifest migrate /usr/home/bob/go/src/istio.io/installer/istio-control/istio-discovery/values.yaml
-```
-
-If a directory is specified, all files called "values.yaml" under the directory will be converted into a single combined IstioOperatorSpec:
-
-```bash
-istioctl manifest migrate /usr/home/bob/go/src/istio.io/installer/istio-control
-```
-
-If no file is specified, the IstioOperator CR in the kube config cluster is used as an input:
-
-```bash
-istioctl manifest migrate
-```
-
 #### Check diffs of manifests
 
 The following command takes two manifests and output the differences in a readable way. It can be used to compare between the manifests generated by operator API and helm directly:
@@ -342,17 +300,17 @@ spec:
           requests:
             cpu: 1000m # override from default 500m
             memory: 4096Mi # ... default 2048Mi
-          hpaSpec:
-            maxReplicas: 10 # ... default 5
-            minReplicas: 2  # ... default 1
-          nodeSelector: # ... default empty
-            master: "true"
-          tolerations: # ... default empty
-          - key: dedicated
-            operator: Exists
-            effect: NoSchedule
-          - key: CriticalAddonsOnly
-            operator: Exists
+        hpaSpec:
+          maxReplicas: 10 # ... default 5
+          minReplicas: 2  # ... default 1
+        nodeSelector: # ... default empty
+          master: "true"
+        tolerations: # ... default empty
+        - key: dedicated
+          operator: Exists
+          effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists
 ```
 
 The K8s settings are defined in detail in the
@@ -368,13 +326,14 @@ way as galley settings. Supported K8s settings currently include:
 - [pod annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
 - [container environment variables](https://kubernetes.io/docs/tasks/inject-data-application/define-environment-variable-container/)
 - [ImagePullPolicy](https://kubernetes.io/docs/concepts/containers/images/)
-- [priority calss name](https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/#priorityclass)
+- [priority class name](https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/#priorityclass)
 - [node selector](https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector)
 - [toleration](https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/)
 - [affinity and anti-affinity](https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#affinity-and-anti-affinity)
 - [deployment strategy](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
 - [service annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
 - [service spec](https://kubernetes.io/docs/concepts/services-networking/service/)
+- [pod securityContext](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod)
 
 All of these K8s settings use the K8s API definitions, so [K8s documentation](https://kubernetes.io/docs/concepts/) can
 be used for reference. All K8s overlay values are also validated in the operator.
@@ -433,6 +392,15 @@ spec:
             value: "60m" # OVERRIDDEN
           - path: spec.template.spec.containers.[name:discovery].ports.[containerPort:8080].containerPort
             value: 8090 # OVERRIDDEN
+          - path: 'spec.template.spec.volumes[100]' #push to the list
+            value:
+              configMap:
+                name: my-config-map
+              name: my-volume-name
+          - path: 'spec.template.spec.containers[0].volumeMounts[100]'
+            value:
+              mountPath: /mnt/path1
+              name: my-volume-name
         - kind: Service
           name: istio-pilot
           patches:

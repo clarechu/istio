@@ -10,6 +10,7 @@ testFramework:
 # For istioctl dashboard, we will look for this label
 podLabels:
   app: grafana
+  sidecar.istio.io/inject: "false"
 
 # Demo only, so we will have no authentication
 admin:
@@ -26,9 +27,6 @@ env:
 # Expose on port 3000 to match the Istio docs
 service:
   port: 3000
-
-image:
-  tag: 7.0.5
 
 # Set up out dashboards
 dashboardProviders:

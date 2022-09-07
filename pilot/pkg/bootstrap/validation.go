@@ -15,25 +15,11 @@
 package bootstrap
 
 import (
-	"strings"
-
-	"istio.io/pkg/env"
-	"istio.io/pkg/log"
-
-	"istio.io/istio/pilot/pkg/leaderelection"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/webhooks/validation/controller"
 	"istio.io/istio/pkg/webhooks/validation/server"
-)
-
-var (
-	validationWebhookConfigNameTemplateVar = "${namespace}"
-	// These should be an invalid DNS-1123 label to ensure the user
-	// doesn't specific a valid name that matches out template.
-	validationWebhookConfigNameTemplate = "istiod-" + validationWebhookConfigNameTemplateVar
-
-	validationWebhookConfigName = env.RegisterStringVar("VALIDATION_WEBHOOK_CONFIG_NAME", validationWebhookConfigNameTemplate,
-		"Name of validatingwegbhookconfiguration to patch, if istioctl is not used.")
+	"istio.io/pkg/log"
 )
 
 func (s *Server) initConfigValidation(args *PilotArgs) error {
@@ -48,43 +34,16 @@ func (s *Server) initConfigValidation(args *PilotArgs) error {
 		DomainSuffix: args.RegistryOptions.KubeOptions.DomainSuffix,
 		Mux:          s.httpsMux,
 	}
-	whServer, err := server.New(params)
+	_, err := server.New(params)
 	if err != nil {
 		return err
 	}
 
-	s.addStartFunc(func(stop <-chan struct{}) error {
-		whServer.Run(stop)
-		return nil
-	})
-
-	if webhookConfigName := validationWebhookConfigName.Get(); webhookConfigName != "" && s.kubeClient != nil {
-		if webhookConfigName == validationWebhookConfigNameTemplate {
-			webhookConfigName = strings.ReplaceAll(validationWebhookConfigNameTemplate, validationWebhookConfigNameTemplateVar, args.Namespace)
-		}
-
-		caBundlePath := s.caBundlePath
-		if hasCustomTLSCerts(args.ServerOptions.TLSOptions) {
-			caBundlePath = args.ServerOptions.TLSOptions.CaCertFile
-		}
-		o := controller.Options{
-			WatchedNamespace:  args.Namespace,
-			CAPath:            caBundlePath,
-			WebhookConfigName: webhookConfigName,
-			ServiceName:       "istiod",
-		}
-		whController, err := controller.New(o, s.kubeClient)
-		if err != nil {
-			log.Errorf("failed to start validation controller: %v", err)
-			return err
-		}
-		s.addTerminatingStartFunc(func(stop <-chan struct{}) error {
-			le := leaderelection.NewLeaderElection(args.Namespace, args.PodName, leaderelection.ValidationController, s.kubeClient)
-			le.AddRunFunction(func(leaderStop <-chan struct{}) {
-				log.Infof("Starting validation controller")
-				whController.Start(leaderStop)
-			})
-			le.Run(stop)
+	if features.ValidationWebhookConfigName != "" && s.kubeClient != nil {
+		s.addStartFunc(func(stop <-chan struct{}) error {
+			log.Infof("Starting validation controller")
+			go controller.NewValidatingWebhookController(
+				s.kubeClient, args.Revision, args.Namespace, s.istiodCertBundleWatcher).Run(stop)
 			return nil
 		})
 	}

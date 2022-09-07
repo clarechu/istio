@@ -23,33 +23,30 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/pkg/env"
 )
 
-var (
-	// settableFlags are the flags used to istioctl
-	settableFlags = map[string]interface{}{
-		"istioNamespace":      env.RegisterStringVar("ISTIOCTL_ISTIONAMESPACE", controller.IstioNamespace, "istioctl --istioNamespace override"),
-		"xds-address":         env.RegisterStringVar("ISTIOCTL_XDS_ADDRESS", "", "istioctl --xds-address override"),
-		"xds-port":            env.RegisterIntVar("ISTIOCTL_XDS_PORT", 15012, "istioctl --xds-port override"),
-		"authority":           env.RegisterStringVar("ISTIOCTL_AUTHORITY", "", "istioctl --authority override"),
-		"cert-dir":            env.RegisterStringVar("ISTIOCTL_CERT_DIR", "", "istioctl --cert-dir override"),
-		"insecure":            env.RegisterBoolVar("ISTIOCTL_INSECURE", false, "istioctl --insecure override"),
-		"prefer-experimental": env.RegisterBoolVar("ISTIOCTL_PREFER_EXPERIMENTAL", false, "istioctl should use experimental subcommand variants"),
-	}
-)
+// settableFlags are the flags used to istioctl
+var settableFlags = map[string]env.VariableInfo{
+	"istioNamespace":      env.Register("ISTIOCTL_ISTIONAMESPACE", constants.IstioSystemNamespace, "The istioctl --istioNamespace override"),
+	"xds-address":         env.Register("ISTIOCTL_XDS_ADDRESS", "", "The istioctl --xds-address override"),
+	"xds-port":            env.Register("ISTIOCTL_XDS_PORT", 15012, "The istioctl --xds-port override"),
+	"authority":           env.Register("ISTIOCTL_AUTHORITY", "", "The istioctl --authority override"),
+	"cert-dir":            env.Register("ISTIOCTL_CERT_DIR", "", "The istioctl --cert-dir override"),
+	"insecure":            env.Register("ISTIOCTL_INSECURE", false, "The istioctl --insecure override"),
+	"prefer-experimental": env.Register("ISTIOCTL_PREFER_EXPERIMENTAL", false, "The istioctl should use experimental subcommand variants"),
+	"plaintext":           env.Register("ISTIOCTL_PLAINTEXT", false, "The istioctl --plaintext override"),
+}
 
 // configCmd represents the config subcommand command
 func configCmd() *cobra.Command {
 	configCmd := &cobra.Command{
 		Use:   "config SUBCOMMAND",
-		Short: "Gonfigure istioctl defaults",
+		Short: "Configure istioctl defaults",
 		Args:  cobra.NoArgs,
-		Example: `
-# list configuration parameters
-istioctl config list
-`,
+		Example: `  # list configuration parameters
+  istioctl config list`,
 	}
 	configCmd.AddCommand(listCommand())
 	return configCmd
@@ -87,10 +84,10 @@ func runList(writer io.Writer) error {
 	return w.Flush()
 }
 
-func configSource(flag string, v interface{}) string {
+func configSource(flag string, v env.VariableInfo) string {
 	// Environment variables have high precedence in Viper
-	if isVarSet(v) {
-		return "$" + getVarVar(v).Name
+	if v.IsSet() {
+		return "$" + v.GetName()
 	}
 
 	if viper.InConfig(flag) {
@@ -98,43 +95,4 @@ func configSource(flag string, v interface{}) string {
 	}
 
 	return "default"
-}
-
-func getVarVar(v interface{}) env.Var {
-	switch ev := v.(type) {
-	case env.StringVar:
-		return ev.Var
-	case env.BoolVar:
-		return ev.Var
-	case env.IntVar:
-		return ev.Var
-	case env.DurationVar:
-		return ev.Var
-	case env.FloatVar:
-		return ev.Var
-	default:
-		panic(fmt.Sprintf("Unexpected environment var type %v", v))
-	}
-}
-
-func isVarSet(v interface{}) bool {
-	switch ev := v.(type) {
-	case env.StringVar:
-		_, ok := ev.Lookup()
-		return ok
-	case env.BoolVar:
-		_, ok := ev.Lookup()
-		return ok
-	case env.IntVar:
-		_, ok := ev.Lookup()
-		return ok
-	case env.DurationVar:
-		_, ok := ev.Lookup()
-		return ok
-	case env.FloatVar:
-		_, ok := ev.Lookup()
-		return ok
-	default:
-		panic(fmt.Sprintf("Unexpected environment var type %v", v))
-	}
 }

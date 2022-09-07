@@ -18,23 +18,11 @@ import (
 	"context"
 	"time"
 
-	"istio.io/pkg/log"
-
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-)
 
-const (
-	// The Istio secret annotation type
-	IstioSecretType = "istio.io/key-and-cert"
-
-	// The ID/name for the certificate chain file.
-	CertChainID = "cert-chain.pem"
-	// The ID/name for the private key file.
-	PrivateKeyID = "key.pem"
-	// The ID/name for the CA root certificate file.
-	RootCertID = "root-cert.pem"
+	"istio.io/pkg/log"
 )
 
 var k8sControllerLog = log.RegisterScope("secretcontroller", "Citadel kubernetes controller log", 0)
@@ -54,14 +42,15 @@ func NewCaSecretController(core corev1.CoreV1Interface) *CaSecretController {
 
 // LoadCASecretWithRetry reads CA secret with retries until timeout.
 func (csc *CaSecretController) LoadCASecretWithRetry(secretName, namespace string,
-	retryInterval, timeout time.Duration) (*v1.Secret, error) {
+	retryInterval, timeout time.Duration,
+) (*v1.Secret, error) {
 	start := time.Now()
 	var caSecret *v1.Secret
 	var scrtErr error
 	for {
 		caSecret, scrtErr = csc.client.Secrets(namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
 		if scrtErr == nil {
-			return caSecret, scrtErr
+			return caSecret, nil
 		}
 		k8sControllerLog.Errorf("Failed on loading CA secret %s:%s.",
 			namespace, secretName)
@@ -77,7 +66,8 @@ func (csc *CaSecretController) LoadCASecretWithRetry(secretName, namespace strin
 
 // UpdateCASecretWithRetry updates CA secret with retries until timeout.
 func (csc *CaSecretController) UpdateCASecretWithRetry(caSecret *v1.Secret,
-	retryInterval, timeout time.Duration) error {
+	retryInterval, timeout time.Duration,
+) error {
 	start := time.Now()
 	for {
 		_, scrtErr := csc.client.Secrets(caSecret.Namespace).Update(context.TODO(), caSecret, metav1.UpdateOptions{})

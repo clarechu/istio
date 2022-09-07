@@ -15,40 +15,43 @@
 package mesh_test
 
 import (
-	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	. "github.com/onsi/gomega"
+	"google.golang.org/protobuf/proto"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
-	"istio.io/pkg/filewatcher"
-
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/protomarshal"
+	"istio.io/pkg/filewatcher"
 )
 
 func TestNewWatcherWithBadInputShouldFail(t *testing.T) {
 	g := NewWithT(t)
-	_, err := mesh.NewWatcher(filewatcher.NewWatcher(), "")
+	_, err := mesh.NewFileWatcher(filewatcher.NewWatcher(), "", false)
 	g.Expect(err).ToNot(BeNil())
 }
 
 func TestWatcherShouldNotifyHandlers(t *testing.T) {
-	g := NewWithT(t)
+	watcherShouldNotifyHandlers(t, false)
+}
 
+func TestMultiWatcherShouldNotifyHandlers(t *testing.T) {
+	watcherShouldNotifyHandlers(t, true)
+}
+
+func watcherShouldNotifyHandlers(t *testing.T, multi bool) {
 	path := newTempFile(t)
-	defer removeSilent(path)
 
 	m := mesh.DefaultMeshConfig()
-	writeMessage(t, path, &m)
+	writeMessage(t, path, m)
 
-	w := newWatcher(t, path)
-	g.Expect(w.Mesh()).To(Equal(&m))
+	w := newWatcher(t, path, multi)
+	assert.Equal(t, w.Mesh(), m)
 
 	doneCh := make(chan struct{}, 1)
 
@@ -60,21 +63,21 @@ func TestWatcherShouldNotifyHandlers(t *testing.T) {
 
 	// Change the file to trigger the update.
 	m.IngressClass = "foo"
-	writeMessage(t, path, &m)
+	writeMessage(t, path, m)
 
 	select {
 	case <-doneCh:
-		g.Expect(newM).To(Equal(&m))
-		g.Expect(w.Mesh()).To(Equal(newM))
+		assert.Equal(t, newM, m)
+		assert.Equal(t, w.Mesh(), newM)
 		break
 	case <-time.After(time.Second * 5):
 		t.Fatal("timed out waiting for update")
 	}
 }
 
-func newWatcher(t testing.TB, filename string) mesh.Watcher {
+func newWatcher(t testing.TB, filename string, multi bool) mesh.Watcher {
 	t.Helper()
-	w, err := mesh.NewWatcher(filewatcher.NewWatcher(), filename)
+	w, err := mesh.NewFileWatcher(filewatcher.NewWatcher(), filename, multi)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,11 +86,12 @@ func newWatcher(t testing.TB, filename string) mesh.Watcher {
 
 func newTempFile(t testing.TB) string {
 	t.Helper()
-	f, err := ioutil.TempFile("", t.Name())
+
+	f, err := os.CreateTemp(t.TempDir(), t.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer closeSilent(f)
+	t.Cleanup(func() { _ = f.Close() })
 
 	path, err := filepath.Abs(f.Name())
 	if err != nil {
@@ -107,13 +111,9 @@ func writeMessage(t testing.TB, path string, msg proto.Message) {
 
 func writeFile(t testing.TB, path, content string) {
 	t.Helper()
-	if err := ioutil.WriteFile(path, []byte(content), 0666); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o666); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func closeSilent(c io.Closer) {
-	_ = c.Close()
 }
 
 func removeSilent(path string) {
@@ -127,9 +127,9 @@ func BenchmarkGetMesh(b *testing.B) {
 	defer removeSilent(path)
 
 	m := mesh.DefaultMeshConfig()
-	writeMessage(b, path, &m)
+	writeMessage(b, path, m)
 
-	w := newWatcher(b, path)
+	w := newWatcher(b, path, false)
 
 	b.StartTimer()
 

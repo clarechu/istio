@@ -15,154 +15,29 @@
 package kube
 
 import (
-	"fmt"
-	"sync"
-	"time"
-
 	"github.com/hashicorp/go-multierror"
 
-	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/resource"
-	"istio.io/istio/pkg/test/kube"
-	"istio.io/istio/pkg/test/scopes"
-	"istio.io/istio/pkg/test/util/retry"
 )
 
-var _ echo.Builder = &builder{}
-
-type builder struct {
-	ctx        resource.Context
-	references []*echo.Instance
-	configs    []echo.Config
+func init() {
+	echo.RegisterFactory(cluster.Kubernetes, build)
 }
 
-func NewBuilder(ctx resource.Context) echo.Builder {
-	return &builder{
-		ctx: ctx,
-	}
-}
+func build(ctx resource.Context, configs []echo.Config) (echo.Instances, error) {
+	instances := make([]echo.Instance, len(configs))
 
-func (b *builder) With(i *echo.Instance, cfg echo.Config) echo.Builder {
-	b.references = append(b.references, i)
-	b.configs = append(b.configs, cfg)
-	return b
-}
-
-func (b *builder) Build() (echo.Instances, error) {
-	t0 := time.Now()
-	instances, err := b.newInstances()
-	if err != nil {
-		return nil, fmt.Errorf("build instance: %v", err)
+	g := multierror.Group{}
+	for i, cfg := range configs {
+		i, cfg := i, cfg
+		g.Go(func() (err error) {
+			instances[i], err = newInstance(ctx, cfg)
+			return
+		})
 	}
 
-	if err := b.initializeInstances(instances); err != nil {
-		return nil, fmt.Errorf("initialize instances: %v", err)
-	}
-	scopes.Framework.Debugf("initialized echo deployments in %v", time.Since(t0))
-
-	if err := b.waitUntilAllCallable(instances); err != nil {
-		return nil, fmt.Errorf("wait until callable: %v", err)
-	}
-	scopes.Framework.Debugf("echo deployments ready in %v", time.Since(t0))
-
-	// Success... update the caller's references.
-	for i, inst := range instances {
-		if b.references[i] != nil {
-			*b.references[i] = inst
-		}
-	}
-	return instances, nil
-}
-
-func (b *builder) BuildOrFail(t test.Failer) echo.Instances {
-	t.Helper()
-	res, err := b.Build()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return res
-}
-
-func (b *builder) newInstances() ([]echo.Instance, error) {
-	instances := make([]echo.Instance, 0, len(b.configs))
-	for _, cfg := range b.configs {
-		inst, err := newInstance(b.ctx, cfg)
-		if err != nil {
-			return nil, err
-		}
-		instances = append(instances, inst)
-	}
-	return instances, nil
-}
-
-func (b *builder) initializeInstances(instances []echo.Instance) error {
-	// Wait to receive the k8s Endpoints for each Echo Instance.
-	wg := sync.WaitGroup{}
-	aggregateErrMux := &sync.Mutex{}
-	var aggregateErr error
-	for _, inst := range instances {
-		wg.Add(1)
-
-		inst := inst
-		serviceName := inst.Config().Service
-		serviceNamespace := inst.Config().Namespace.Name()
-		timeout := inst.Config().ReadinessTimeout
-		cluster := inst.(*instance).cluster
-
-		// Run the waits in parallel.
-		go func() {
-			defer wg.Done()
-			selector := "app"
-			if inst.Config().DeployAsVM {
-				selector = "istio.io/test-vm"
-			}
-			// Wait until all the pods are ready for this service
-			fetch := kube.NewPodMustFetch(cluster, serviceNamespace, fmt.Sprintf("%s=%s", selector, serviceName))
-			pods, err := kube.WaitUntilPodsAreReady(fetch, retry.Timeout(timeout))
-			if err != nil {
-				aggregateErrMux.Lock()
-				aggregateErr = multierror.Append(aggregateErr, err)
-				aggregateErrMux.Unlock()
-				return
-			}
-			if err := inst.(*instance).initialize(pods); err != nil {
-				aggregateErrMux.Lock()
-				aggregateErr = multierror.Append(aggregateErr, fmt.Errorf("initialize %v: %v", inst.ID(), err))
-				aggregateErrMux.Unlock()
-			}
-		}()
-	}
-
-	wg.Wait()
-
-	if aggregateErr != nil {
-		return aggregateErr
-	}
-
-	return nil
-}
-
-func (b *builder) waitUntilAllCallable(instances []echo.Instance) error {
-	// Now wait for each endpoint to be callable from all others.
-	wg := sync.WaitGroup{}
-	aggregateErrMux := &sync.Mutex{}
-	var aggregateErr error
-	for _, inst := range instances {
-		wg.Add(1)
-
-		source := inst
-		go func() {
-			defer wg.Done()
-
-			if err := source.WaitUntilCallable(instances...); err != nil {
-				aggregateErrMux.Lock()
-				aggregateErr = multierror.Append(aggregateErr, err)
-				aggregateErrMux.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-
-	return aggregateErr
+	err := g.Wait().ErrorOrNil()
+	return instances, err
 }

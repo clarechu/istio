@@ -22,17 +22,17 @@ import (
 	"github.com/onsi/gomega"
 
 	networking "istio.io/api/networking/v1alpha3"
-
 	"istio.io/istio/pilot/pkg/config/memory"
-	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
-var createConfigSet = []*model.Config{
+var createConfigSet = []*config.Config{
 	{
-		ConfigMeta: model.ConfigMeta{
+		Meta: config.Meta{
 			Name:             "magic",
 			GroupVersionKind: gvk.Gateway,
 		},
@@ -51,9 +51,9 @@ var createConfigSet = []*model.Config{
 	},
 }
 
-var updateConfigSet = []*model.Config{
+var updateConfigSet = []*config.Config{
 	{
-		ConfigMeta: model.ConfigMeta{
+		Meta: config.Meta{
 			Name:             "magic",
 			GroupVersionKind: gvk.Gateway,
 		},
@@ -79,11 +79,11 @@ func TestMonitorForChange(t *testing.T) {
 
 	var (
 		callCount int
-		configs   []*model.Config
+		configs   []*config.Config
 		err       error
 	)
 
-	someConfigFunc := func() ([]*model.Config, error) {
+	someConfigFunc := func() ([]*config.Config, error) {
 		switch callCount {
 		case 0:
 			configs = createConfigSet
@@ -91,7 +91,7 @@ func TestMonitorForChange(t *testing.T) {
 		case 3:
 			configs = updateConfigSet
 		case 6:
-			configs = []*model.Config{}
+			configs = []*config.Config{}
 		}
 
 		callCount++
@@ -99,12 +99,16 @@ func TestMonitorForChange(t *testing.T) {
 	}
 	mon := NewMonitor("", store, someConfigFunc, "")
 	stop := make(chan struct{})
-	defer func() { stop <- struct{}{} }() // shut it down
+	defer func() { close(stop) }()
 	mon.Start(stop)
 
 	go func() {
 		for i := 0; i < 10; i++ {
-			mon.updateCh <- struct{}{}
+			select {
+			case <-stop:
+				return
+			case mon.updateCh <- struct{}{}:
+			}
 			time.Sleep(time.Millisecond * 100)
 		}
 	}()
@@ -116,7 +120,7 @@ func TestMonitorForChange(t *testing.T) {
 			return errors.New("no configs")
 		}
 
-		if c[0].ConfigMeta.Name != "magic" {
+		if c[0].Meta.Name != "magic" {
 			return errors.New("wrong config")
 		}
 
@@ -138,10 +142,26 @@ func TestMonitorForChange(t *testing.T) {
 		return nil
 	}).Should(gomega.Succeed())
 
-	g.Eventually(func() ([]model.Config, error) {
+	g.Eventually(func() ([]config.Config, error) {
 		return store.List(gvk.Gateway, "")
 	}).Should(gomega.HaveLen(0))
+}
 
+func TestMonitorFileSnapshot(t *testing.T) {
+	ts := &testState{
+		ConfigFiles: map[string][]byte{"gateway.yml": []byte(statusRegressionYAML)},
+	}
+
+	ts.testSetup(t)
+
+	store := memory.Make(collection.SchemasFor(collections.IstioNetworkingV1Alpha3Gateways))
+	fileWatcher := NewFileSnapshot(ts.rootPath, collection.SchemasFor(), "foo")
+
+	mon := NewMonitor("", store, fileWatcher.ReadConfigFiles, "")
+	stop := make(chan struct{})
+	defer func() { close(stop) }()
+	mon.Start(stop)
+	retry.UntilOrFail(t, func() bool { return store.Get(gvk.Gateway, "test", "test-1") != nil })
 }
 
 func TestMonitorForError(t *testing.T) {
@@ -151,13 +171,13 @@ func TestMonitorForError(t *testing.T) {
 
 	var (
 		callCount int
-		configs   []*model.Config
+		configs   []*config.Config
 		err       error
 	)
 
 	delay := make(chan struct{}, 1)
 
-	someConfigFunc := func() ([]*model.Config, error) {
+	someConfigFunc := func() ([]*config.Config, error) {
 		switch callCount {
 		case 0:
 			configs = createConfigSet
@@ -173,17 +193,29 @@ func TestMonitorForError(t *testing.T) {
 	}
 	mon := NewMonitor("", store, someConfigFunc, "")
 	stop := make(chan struct{})
-	defer func() { stop <- struct{}{} }() // shut it down
+	defer func() { close(stop) }()
 	mon.Start(stop)
 
 	go func() {
-		for i := 0; i < 10; i++ {
-			mon.updateCh <- struct{}{}
-			time.Sleep(time.Millisecond * 10)
+		updateTicker := time.NewTicker(100 * time.Millisecond)
+		numUpdates := 10
+		for {
+			select {
+			case <-stop:
+				updateTicker.Stop()
+				return
+			case <-updateTicker.C:
+				mon.updateCh <- struct{}{}
+				numUpdates--
+				if numUpdates == 0 {
+					updateTicker.Stop()
+					return
+				}
+			}
 		}
 	}()
-	//Test ensures that after a coplilot connection error the data remains
-	//nil data return and error return keeps the existing data aka createConfigSet
+	// Test ensures that after a coplilot connection error the data remains
+	// nil data return and error return keeps the existing data aka createConfigSet
 	<-delay
 	g.Eventually(func() error {
 		c, err := store.List(gvk.Gateway, "")

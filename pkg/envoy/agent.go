@@ -17,258 +17,200 @@ package envoy
 import (
 	"context"
 	"errors"
-	"reflect"
-	"sync"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
+	"istio.io/istio/pkg/http"
+	"istio.io/istio/pkg/util/sets"
 	"istio.io/pkg/log"
 )
 
-// Agent manages the restarts and the life cycle of a proxy binary.  Agent
-// keeps track of all running proxy epochs and their configurations.  Hot
-// restarts are performed by launching a new proxy process with a strictly
-// incremented restart epoch. It is up to the proxy to ensure that older epochs
-// gracefully shutdown and carry over all the necessary state to the latest
-// epoch.  The agent does not terminate older epochs. The initial epoch is 0.
-//
-// The restart protocol matches Envoy semantics for restart epochs: to
-// successfully launch a new Envoy process that will replace the running Envoy
-// processes, the restart epoch of the new process must be exactly 1 greater
-// than the highest restart epoch of the currently running Envoy processes.
-// See https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/hot_restart.html
-// for more information about the Envoy hot restart protocol.
-//
-// Agent requires two functions "run" and "cleanup". Run function is a call to
-// start the proxy and must block until the proxy exits. Cleanup function is
-// executed immediately after the proxy exits and must be non-blocking since it
-// is executed synchronously in the main agent control loop. Both functions
-// take the proxy epoch as an argument. A typical scenario would involve epoch
-// 0 followed by a failed epoch 1 start. The agent then attempts to start epoch
-// 1 again.
-//
-// Whenever the run function returns an error, the agent assumes that the proxy
-// failed to start and attempts to restart the proxy several times with an
-// exponential back-off. The subsequent restart attempts may reuse the epoch
-// from the failed attempt. Retry budgets are allocated whenever the desired
-// configuration changes.
-//
-// Agent executes a single control loop that receives notifications about
-// scheduled configuration updates, exits from older proxy epochs, and retry
-// attempt timers. The call to schedule a configuration update will block until
-// the control loop is ready to accept and process the configuration update.
-type Agent interface {
-	// Run starts the agent control loop and awaits for a signal on the input
-	// channel to exit the loop.
-	Run(ctx context.Context) error
-
-	// Restart triggers a hot restart of envoy, applying the given config to the new process
-	Restart(config interface{})
-}
-
-var errAbort = errors.New("epoch aborted")
+var errAbort = errors.New("proxy aborted")
 
 const errOutOfMemory = "signal: killed"
 
+var activeConnectionCheckDelay = 1 * time.Second
+
 // NewAgent creates a new proxy agent for the proxy start-up and clean-up functions.
-func NewAgent(proxy Proxy, terminationDrainDuration time.Duration) Agent {
-	return &agent{
-		proxy:                    proxy,
-		statusCh:                 make(chan exitStatus),
-		activeEpochs:             map[int]chan error{},
-		terminationDrainDuration: terminationDrainDuration,
-		currentEpoch:             -1,
+func NewAgent(proxy Proxy, terminationDrainDuration, minDrainDuration time.Duration, localhost string,
+	adminPort, statusPort, prometheusPort int, exitOnZeroActiveConnections bool,
+) *Agent {
+	knownIstioListeners := sets.New(
+		fmt.Sprintf("listener.0.0.0.0_%d.downstream_cx_active", statusPort),
+		fmt.Sprintf("listener.0.0.0.0_%d.downstream_cx_active", prometheusPort),
+		"listener.admin.downstream_cx_active",
+		"listener.admin.main_thread.downstream_cx_active",
+	)
+	return &Agent{
+		proxy:                       proxy,
+		statusCh:                    make(chan exitStatus, 1), // context might stop drainage
+		abortCh:                     make(chan error, 1),
+		terminationDrainDuration:    terminationDrainDuration,
+		minDrainDuration:            minDrainDuration,
+		exitOnZeroActiveConnections: exitOnZeroActiveConnections,
+		adminPort:                   adminPort,
+		localhost:                   localhost,
+		knownIstioListeners:         knownIstioListeners,
 	}
 }
 
 // Proxy defines command interface for a proxy
 type Proxy interface {
-	// IsLive returns true if the server is up and running (i.e. past initialization).
-	IsLive() bool
+	// Run command with an abort channel
+	Run(<-chan error) error
 
-	// Run command for a config, epoch, and abort channel
-	Run(interface{}, int, <-chan error) error
-
-	// Drains the current epoch.
+	// Drains the envoy process.
 	Drain() error
 
-	// Cleanup command for an epoch
-	Cleanup(int)
+	// Cleanup command for cleans up the proxy.
+	Cleanup()
+
+	// UpdateConfig writes a new config file
+	UpdateConfig(config []byte) error
 }
 
-type agent struct {
+type Agent struct {
 	// proxy commands
 	proxy Proxy
-
-	restartMutex sync.Mutex
-	mutex        sync.Mutex
-	activeEpochs map[int]chan error
-
-	// currentEpoch represents the epoch of the most recent proxy. When a new proxy is created this should be incremented
-	currentEpoch int
-
-	// current configuration is the highest epoch configuration
-	currentConfig interface{}
 
 	// channel for proxy exit notifications
 	statusCh chan exitStatus
 
+	abortCh chan error
+
 	// time to allow for the proxy to drain before terminating all remaining proxy processes
 	terminationDrainDuration time.Duration
+	minDrainDuration         time.Duration
+
+	adminPort int
+	localhost string
+
+	knownIstioListeners sets.Set
+
+	exitOnZeroActiveConnections bool
 }
 
 type exitStatus struct {
-	epoch int
-	err   error
+	err error
 }
 
-func (a *agent) Restart(config interface{}) {
-	// Only allow one restart to execute at a time.
-	a.restartMutex.Lock()
-	defer a.restartMutex.Unlock()
-
-	// Protect access to internal state.
-	a.mutex.Lock()
-
-	if reflect.DeepEqual(a.currentConfig, config) {
-		// Same configuration - nothing to do.
-		a.mutex.Unlock()
-		return
-	}
-
-	hasActiveEpoch := len(a.activeEpochs) > 0
-	activeEpoch := a.currentEpoch
-
-	// Increment the latest running epoch
-	epoch := a.currentEpoch + 1
-	log.Infof("Received new config, creating new Envoy epoch %d", epoch)
-
-	a.currentEpoch = epoch
-	a.currentConfig = config
-
-	// Add the new epoch to the map.
-	abortCh := make(chan error, 1)
-	a.activeEpochs[a.currentEpoch] = abortCh
-
-	// Unlock before the wait to avoid delaying envoy exit logic.
-	a.mutex.Unlock()
-
-	// Wait for previous epoch to go live (if one exists) before performing a hot restart.
-	if hasActiveEpoch {
-		a.waitUntilLive(activeEpoch)
-	}
-
-	go a.runWait(config, epoch, abortCh)
-}
-
-// waitUntilLive waits for the current epoch (if there is one) to go live.
-func (a *agent) waitUntilLive(epoch int) {
-	log.Infof("waiting for epoch %d to go live before performing a hot restart", epoch)
-
-	// Timeout after 20 seconds. Envoy internally uses a 15s timer, so we set ours a bit above that.
-	interval := time.NewTicker(500 * time.Millisecond)
-	timer := time.NewTimer(20 * time.Second)
-
-	isDone := func() bool {
-		if !a.isActive(epoch) {
-			log.Warnf("epoch %d exited while waiting for it to go live.", epoch)
-			return true
-		}
-
-		return a.proxy.IsLive()
-	}
-
-	defer func() {
-		interval.Stop()
-		timer.Stop()
-	}()
-
-	// Do an initial check to avoid an initial wait.
-	if isDone() {
-		return
-	}
-
-	for {
-		select {
-		case <-timer.C:
-			log.Warnf("timed out waiting for epoch %d to go live.", epoch)
-			return
-		case <-interval.C:
-			if isDone() {
-				return
-			}
-		}
-	}
-}
-
-func (a *agent) isActive(epoch int) bool {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
-	_, ok := a.activeEpochs[epoch]
-	return ok
-}
-
-func (a *agent) Run(ctx context.Context) error {
+// Run starts the envoy and waits until it terminates.
+func (a *Agent) Run(ctx context.Context) {
 	log.Info("Starting proxy agent")
-	for {
-		select {
-		case status := <-a.statusCh:
-			a.mutex.Lock()
-			if status.err != nil {
-				if status.err.Error() == errOutOfMemory {
-					log.Warnf("Envoy may have been out of memory killed. Check memory usage and limits.")
-				}
-				log.Errorf("Epoch %d exited with error: %v", status.epoch, status.err)
-			} else {
-				log.Infof("Epoch %d exited normally", status.epoch)
+	go a.runWait(a.abortCh)
+
+	select {
+	case status := <-a.statusCh:
+		if status.err != nil {
+			if status.err.Error() == errOutOfMemory {
+				log.Warnf("Envoy may have been out of memory killed. Check memory usage and limits.")
 			}
-
-			delete(a.activeEpochs, status.epoch)
-
-			active := len(a.activeEpochs)
-			a.mutex.Unlock()
-
-			if active == 0 {
-				log.Infof("No more active epochs, terminating")
-				return nil
-			}
-
-			log.Infof("%d active epochs running", active)
-
-		case <-ctx.Done():
-			a.terminate()
-			log.Info("Agent has successfully terminated")
-			return nil
+			log.Errorf("Envoy exited with error: %v", status.err)
+		} else {
+			log.Infof("Envoy exited normally")
 		}
+
+	case <-ctx.Done():
+		a.terminate()
+		status := <-a.statusCh
+		if status.err == errAbort {
+			log.Infof("Envoy aborted normally")
+		} else {
+			log.Warnf("Envoy aborted abnormally")
+		}
+		log.Info("Agent has successfully terminated")
 	}
 }
 
-func (a *agent) terminate() {
+func (a *Agent) terminate() {
 	log.Infof("Agent draining Proxy")
 	e := a.proxy.Drain()
 	if e != nil {
 		log.Warnf("Error in invoking drain listeners endpoint %v", e)
 	}
-	log.Infof("Graceful termination period is %v, starting...", a.terminationDrainDuration)
-	time.Sleep(a.terminationDrainDuration)
-	log.Infof("Graceful termination period complete, terminating remaining proxies.")
-	a.abortAll()
+	// If exitOnZeroActiveConnections is enabled, always sleep minimumDrainDuration then exit
+	// after min(all connections close, terminationGracePeriodSeconds-minimumDrainDuration).
+	// exitOnZeroActiveConnections is disabled (default), retain the existing behavior.
+	if a.exitOnZeroActiveConnections {
+		log.Infof("Agent draining proxy for %v, then waiting for active connections to terminate...", a.minDrainDuration)
+		time.Sleep(a.minDrainDuration)
+		log.Infof("Checking for active connections...")
+		ticker := time.NewTicker(activeConnectionCheckDelay)
+		for range ticker.C {
+			ac, err := a.activeProxyConnections()
+			if err != nil {
+				log.Errorf(err.Error())
+				a.abortCh <- errAbort
+				return
+			}
+			if ac == -1 {
+				log.Info("downstream_cx_active are not available. This either means there are no downstream connection established yet" +
+					" or the stats are not enabled. Skipping active connections check...")
+				a.abortCh <- errAbort
+				return
+			}
+			if ac == 0 {
+				log.Info("There are no more active connections. terminating proxy...")
+				a.abortCh <- errAbort
+				return
+			}
+			log.Infof("There are still %d active connections", ac)
+		}
+	} else {
+		log.Infof("Graceful termination period is %v, starting...", a.terminationDrainDuration)
+		time.Sleep(a.terminationDrainDuration)
+		log.Infof("Graceful termination period complete, terminating remaining proxies.")
+		a.abortCh <- errAbort
+	}
+	log.Warnf("Aborted proxy instance")
+}
+
+func (a *Agent) activeProxyConnections() (int, error) {
+	activeConnectionsURL := fmt.Sprintf("http://%s:%d/stats?usedonly&filter=downstream_cx_active$", a.localhost, a.adminPort)
+	stats, err := http.DoHTTPGet(activeConnectionsURL)
+	if err != nil {
+		return -1, fmt.Errorf("unable to get listener stats from Envoy : %v", err)
+	}
+	if stats.Len() == 0 {
+		return -1, nil
+	}
+	activeConnections := 0
+	for stats.Len() > 0 {
+		line, _ := stats.ReadString('\n')
+		parts := strings.Split(line, ":")
+		if len(parts) != 2 {
+			log.Warnf("envoy stat line is missing separator. line:%s", line)
+			continue
+		}
+		// downstream_cx_active is accounted under "http." and "listener." for http listeners.
+		// Only consider listener stats. Listener stats also will have per worker stats, we can
+		// ignore them.
+		if !strings.HasPrefix(parts[0], "listener.") || strings.Contains(parts[0], "worker_") {
+			continue
+		}
+		// If the stat is for a known Istio listener skip it.
+		if a.knownIstioListeners.Contains(parts[0]) {
+			continue
+		}
+		val, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64)
+		if err != nil {
+			log.Warnf("failed parsing Envoy stat %s (error: %s) line: %s", parts[0], err.Error(), line)
+			continue
+		}
+		activeConnections += int(val)
+	}
+	if activeConnections > 0 {
+		log.Debugf("Active connections stats: %s", stats.String())
+	}
+	return activeConnections, nil
 }
 
 // runWait runs the start-up command as a go routine and waits for it to finish
-func (a *agent) runWait(config interface{}, epoch int, abortCh <-chan error) {
-	log.Infof("Epoch %d starting", epoch)
-	err := a.proxy.Run(config, epoch, abortCh)
-	a.proxy.Cleanup(epoch)
-	a.statusCh <- exitStatus{epoch: epoch, err: err}
-}
-
-// abortAll sends abort error to all proxies
-func (a *agent) abortAll() {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
-	for epoch, abortCh := range a.activeEpochs {
-		log.Warnf("Aborting epoch %d...", epoch)
-		abortCh <- errAbort
-	}
-	log.Warnf("Aborted all epochs")
+func (a *Agent) runWait(abortCh <-chan error) {
+	log.Infof("starting")
+	err := a.proxy.Run(abortCh)
+	a.proxy.Cleanup()
+	a.statusCh <- exitStatus{err: err}
 }

@@ -1,4 +1,4 @@
-// Copyright 2020 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import (
 
 	v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 )
 
 func TestListenerFilter_Verify(t *testing.T) {
@@ -76,12 +77,14 @@ func TestListenerFilter_Verify(t *testing.T) {
 				Type: "HTTP",
 			},
 			inListener: &listener.Listener{
-				FilterChains: []*listener.FilterChain{{
-					Filters: []*listener.Filter{{
-						Name: "envoy.http_connection_manager",
+				FilterChains: []*listener.FilterChain{
+					{
+						Filters: []*listener.Filter{
+							{
+								Name: wellknown.HTTPConnectionManager,
+							},
+						},
 					},
-					},
-				},
 				},
 			},
 			expect: true,
@@ -93,15 +96,17 @@ func TestListenerFilter_Verify(t *testing.T) {
 			},
 			inListener: &listener.Listener{
 				FilterChains: []*listener.FilterChain{{
-					Filters: []*listener.Filter{{
-						Name: "envoy.tcp_proxy",
-					},
+					Filters: []*listener.Filter{
 						{
-							Name: "envoy.tcp_proxy",
+							Name: wellknown.TCPProxy,
 						},
 						{
-							Name: "envoy.http_connection_manager",
-						}},
+							Name: wellknown.TCPProxy,
+						},
+						{
+							Name: wellknown.HTTPConnectionManager,
+						},
+					},
 				}},
 			},
 			expect: true,
@@ -114,7 +119,7 @@ func TestListenerFilter_Verify(t *testing.T) {
 			inListener: &listener.Listener{
 				FilterChains: []*listener.FilterChain{{
 					Filters: []*listener.Filter{{
-						Name: "envoy.tcp_proxy",
+						Name: wellknown.TCPProxy,
 					}},
 				}},
 			},
@@ -129,6 +134,22 @@ func TestListenerFilter_Verify(t *testing.T) {
 				FilterChains: []*listener.FilterChain{{
 					Filters: []*listener.Filter{},
 				}},
+			},
+			expect: true,
+		},
+		{
+			desc: "listener-pipe",
+			inFilter: &ListenerFilter{
+				Address: "",
+				Port:    0,
+				Type:    "",
+			},
+			inListener: &listener.Listener{
+				Address: &v3.Address{
+					Address: &v3.Address_Pipe{
+						Pipe: &v3.Pipe{Path: "unix:///dev/shm/uds.socket"},
+					},
+				},
 			},
 			expect: true,
 		},

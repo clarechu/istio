@@ -16,12 +16,15 @@ package mesh
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
 
-	"istio.io/istio/operator/pkg/helm"
+	"istio.io/istio/operator/pkg/manifest"
 	"istio.io/istio/operator/pkg/util"
+	"istio.io/istio/operator/pkg/util/clog"
+	"istio.io/pkg/log"
 )
 
 type profileDiffArgs struct {
@@ -34,11 +37,16 @@ func addProfileDiffFlags(cmd *cobra.Command, args *profileDiffArgs) {
 	cmd.PersistentFlags().StringVarP(&args.manifestsPath, "manifests", "d", "", ManifestsFlagHelpStr)
 }
 
-func profileDiffCmd(rootArgs *rootArgs, pfArgs *profileDiffArgs) *cobra.Command {
+func profileDiffCmd(rootArgs *RootArgs, pfArgs *profileDiffArgs, logOpts *log.Options) *cobra.Command {
 	return &cobra.Command{
-		Use:   "diff <file1.yaml> <file2.yaml>",
+		Use:   "diff <profile|file1.yaml> <profile|file2.yaml>",
 		Short: "Diffs two Istio configuration profiles",
 		Long:  "The diff subcommand displays the differences between two Istio configuration profiles.",
+		Example: `  # Profile diff by providing yaml files
+  istioctl profile diff manifests/profiles/default.yaml manifests/profiles/demo.yaml
+
+  # Profile diff by providing a profile name
+  istioctl profile diff default demo`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) != 2 {
 				return fmt.Errorf("diff requires two profiles")
@@ -46,32 +54,51 @@ func profileDiffCmd(rootArgs *rootArgs, pfArgs *profileDiffArgs) *cobra.Command 
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return profileDiff(rootArgs, pfArgs, args)
-		}}
-
+			isdifferent, err := profileDiff(cmd, rootArgs, pfArgs, args, logOpts)
+			if err != nil {
+				return err
+			}
+			if isdifferent {
+				os.Exit(1)
+			}
+			return nil
+		},
+	}
 }
 
 // profileDiff compare two profile files.
-func profileDiff(rootArgs *rootArgs, pfArgs *profileDiffArgs, args []string) error {
+func profileDiff(cmd *cobra.Command, rootArgs *RootArgs, pfArgs *profileDiffArgs, args []string, logOpts *log.Options) (bool, error) {
 	initLogsOrExit(rootArgs)
 
-	a, err := helm.ReadProfileYAML(args[0], pfArgs.manifestsPath)
+	l := clog.NewConsoleLogger(cmd.OutOrStdout(), cmd.OutOrStderr(), nil)
+	setFlags := make([]string, 0)
+	if pfArgs.manifestsPath != "" {
+		setFlags = append(setFlags, fmt.Sprintf("installPackagePath=%s", pfArgs.manifestsPath))
+	}
+	if err := configLogs(logOpts); err != nil {
+		return false, fmt.Errorf("could not configure logs: %s", err)
+	}
+	return profileDiffInternal(args[0], args[1], setFlags, cmd.OutOrStdout(), l)
+}
+
+func profileDiffInternal(profileA, profileB string, setFlags []string, writer io.Writer, l clog.Logger) (bool, error) {
+	a, _, err := manifest.GenIOPFromProfile(profileA, "", setFlags, true, true, nil, l)
 	if err != nil {
-		return fmt.Errorf("could not read %q: %v", args[0], err)
+		return false, fmt.Errorf("could not read %q: %v", profileA, err)
 	}
 
-	b, err := helm.ReadProfileYAML(args[1], pfArgs.manifestsPath)
+	b, _, err := manifest.GenIOPFromProfile(profileB, "", setFlags, true, true, nil, l)
 	if err != nil {
-		return fmt.Errorf("could not read %q: %v", args[1], err)
+		return false, fmt.Errorf("could not read %q: %v", profileB, err)
 	}
 
 	diff := util.YAMLDiff(a, b)
 	if diff == "" {
-		fmt.Println("Profiles are identical")
+		fmt.Fprintln(writer, "Profiles are identical")
 	} else {
-		fmt.Printf("Difference of profiles:\n%s", diff)
-		os.Exit(1)
+		fmt.Fprintf(writer, "The difference between profiles:\n%s", diff)
+		return true, nil
 	}
 
-	return nil
+	return false, nil
 }

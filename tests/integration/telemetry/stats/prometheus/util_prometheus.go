@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 //  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,93 +19,48 @@ package prometheus
 
 import (
 	"fmt"
-	"strings"
-	"testing"
 	"time"
 
+	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/prometheus"
 	"istio.io/istio/pkg/test/util/retry"
+	util "istio.io/istio/tests/integration/telemetry"
 )
 
 // QueryPrometheus queries prometheus and returns the result once the query stabilizes
-func QueryPrometheus(t *testing.T, query string, promInst prometheus.Instance) error {
-	t.Logf("query prometheus with: %v", query)
-	val, err := promInst.WaitForQuiesce(query)
-	if err != nil {
-		return err
-	}
-	got, err := promInst.Sum(val, nil)
-	if err != nil {
-		t.Logf("value: %s", val.String())
-		return fmt.Errorf("could not find metric value: %v", err)
-	}
-	t.Logf("get value %v", got)
-	return nil
-}
-
-// QueryFirstPrometheus queries prometheus and returns the result once a timeseries exists
-func QueryFirstPrometheus(t *testing.T, query string, promInst prometheus.Instance) error {
-	t.Logf("query prometheus with: %v", query)
-	val, err := promInst.WaitForOneOrMore(query)
-	if err != nil {
-		return err
-	}
-	got, err := promInst.Sum(val, nil)
-	if err != nil {
-		t.Logf("value: %s", val.String())
-		return fmt.Errorf("could not find metric value: %v", err)
-	}
-	t.Logf("get value %v", got)
-	return nil
-}
-
-func ValidateMetric(t *testing.T, prometheus prometheus.Instance, query, metricName string, want float64) {
-	var got float64
-	retry.UntilSuccessOrFail(t, func() error {
-		var err error
-		got, err = getMetric(t, prometheus, query, metricName)
-		return err
-	}, retry.Delay(time.Second), retry.Timeout(2*time.Minute))
-
-	t.Logf("%s: %f", metricName, got)
-	if got < want {
-		t.Logf("prometheus values for %s:\n%s", metricName, PromDump(prometheus, metricName))
-		t.Errorf("bad metric value: got %f, want at least %f", got, want)
-	}
-}
-
-func getMetric(t *testing.T, prometheus prometheus.Instance, query, metricName string) (float64, error) {
+func QueryPrometheus(t framework.TestContext, cluster cluster.Cluster, query prometheus.Query, promInst prometheus.Instance) (string, error) {
 	t.Helper()
+	t.Logf("query prometheus with: %v", query)
 
-	t.Logf("prometheus query: %s", query)
-	value, err := prometheus.WaitForQuiesce(query)
+	val, err := promInst.Query(cluster, query)
 	if err != nil {
-		return 0, fmt.Errorf("could not get metrics from prometheus: %v", err)
+		return "", err
 	}
-
-	got, err := prometheus.Sum(value, nil)
+	got, err := prometheus.Sum(val)
 	if err != nil {
-		t.Logf("value: %s", value.String())
-		t.Logf("prometheus values for %s:\n%s", metricName, PromDump(prometheus, metricName))
-		return 0, fmt.Errorf("could not find metric value: %v", err)
+		t.Logf("value: %s", val.String())
+		return "", fmt.Errorf("could not find metric value: %v", err)
 	}
-
-	return got, nil
+	t.Logf("get value %v", got)
+	return val.String(), nil
 }
 
-// promDump gets all of the recorded values for a metric by name and generates a report of the values.
-// used for debugging of failures to provide a comprehensive view of traffic experienced.
-func PromDump(prometheus prometheus.Instance, metric string) string {
-	return PromDumpWithAttributes(prometheus, metric, nil)
-}
-
-// promDumpWithAttributes is used to get all of the recorded values of a metric for particular attributes.
-// Attributes have to be of format %s=\"%s\"
-// nolint: unparam
-func PromDumpWithAttributes(prometheus prometheus.Instance, metric string, attributes []string) string {
-	if value, err := prometheus.WaitForQuiesce(fmt.Sprintf("%s{%s}", metric, strings.Join(attributes, ", "))); err == nil {
-		return value.String()
+func ValidateMetric(t framework.TestContext, cluster cluster.Cluster, prometheus prometheus.Instance, query prometheus.Query, want float64) {
+	t.Helper()
+	err := retry.UntilSuccess(func() error {
+		got, err := prometheus.QuerySum(cluster, query)
+		t.Logf("%s: %f", query.Metric, got)
+		if err != nil {
+			return err
+		}
+		if got < want {
+			return fmt.Errorf("bad metric value: got %f, want at least %f", got, want)
+		}
+		return nil
+	}, retry.Delay(time.Second), retry.Timeout(time.Second*20))
+	if err != nil {
+		util.PromDiff(t, prometheus, cluster, query)
+		t.Fatal(err)
 	}
-
-	return ""
 }

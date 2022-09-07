@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,19 +15,15 @@ package xds_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"testing"
 
-	"istio.io/istio/pkg/test/env"
-	"istio.io/istio/pkg/util/gogoprotomarshal"
-	"istio.io/istio/tests/util"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+
+	"istio.io/istio/pilot/pkg/xds"
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 )
 
-// TestRDS is running RDSv2 tests.
 func TestRDS(t *testing.T) {
-	_, tearDown := initLocalPilotTestEnv(t)
-	defer tearDown()
-
 	tests := []struct {
 		name   string
 		node   string
@@ -52,29 +48,28 @@ func TestRDS(t *testing.T) {
 		},
 	}
 
-	for idx, tt := range tests {
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rdsr, cancel, err := connectADS(util.MockPilotGrpcAddr)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer cancel()
-
-			err = sendRDSReq(tt.node, tt.routes, "", "", rdsr)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			res, err := rdsr.Recv()
-			if err != nil {
-				t.Fatal("Failed to receive RDS", err)
-			}
-
-			strResponse, _ := gogoprotomarshal.ToJSONWithIndent(res, " ")
-			_ = ioutil.WriteFile(env.IstioOut+fmt.Sprintf("/rdsv2/%s_%d.json", tt.name, idx), []byte(strResponse), 0644)
-			if len(res.Resources) == 0 {
-				t.Fatal("No response")
-			}
+			ads := s.ConnectADS().WithType(v3.RouteType).WithID(tt.node)
+			ads.RequestResponseAck(t, &discovery.DiscoveryRequest{ResourceNames: tt.routes})
 		})
 	}
+}
+
+const (
+	app3Ip    = "10.2.0.1"
+	gatewayIP = "10.3.0.1"
+)
+
+// Common code for the xds testing.
+// The tests in this package use an in-process pilot using mock service registry and
+// envoy.
+
+func sidecarID(ip, deployment string) string { // nolint: unparam
+	return fmt.Sprintf("sidecar~%s~%s-644fc65469-96dza.testns~testns.svc.cluster.local", ip, deployment)
+}
+
+func gatewayID(ip string) string { //nolint: unparam
+	return fmt.Sprintf("router~%s~istio-gateway-644fc65469-96dzt.istio-system~istio-system.svc.cluster.local", ip)
 }

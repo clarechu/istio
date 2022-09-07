@@ -16,17 +16,19 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"cloud.google.com/go/compute/metadata"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"google.golang.org/api/compute/v1"
-	"google.golang.org/api/option"
 
 	"istio.io/pkg/env"
 	"istio.io/pkg/log"
@@ -36,19 +38,28 @@ const (
 	GCPProject           = "gcp_project"
 	GCPProjectNumber     = "gcp_project_number"
 	GCPCluster           = "gcp_gke_cluster_name"
+	GCPClusterURL        = "gcp_gke_cluster_url"
 	GCPLocation          = "gcp_location"
 	GCEInstance          = "gcp_gce_instance"
 	GCEInstanceID        = "gcp_gce_instance_id"
 	GCEInstanceTemplate  = "gcp_gce_instance_template"
 	GCEInstanceCreatedBy = "gcp_gce_instance_created_by"
+	GCPQuotaProject      = "gcp_quota_project"
 )
 
 var (
-	gcpMetadataVar = env.RegisterStringVar("GCP_METADATA", "", "Pipe separted GCP metadata, schemed as PROJECT_ID|PROJECT_NUMBER|CLUSTER_NAME|CLUSTER_ZONE")
+	GCPMetadata = env.Register("GCP_METADATA", "", "Pipe separated GCP metadata, schemed as PROJECT_ID|PROJECT_NUMBER|CLUSTER_NAME|CLUSTER_ZONE").Get()
+
+	// GCPQuotaProjectVar holds the value of the `GCP_QUOTA_PROJECT` environment variable.
+	GCPQuotaProjectVar = env.Register("GCP_QUOTA_PROJECT", "", "Allows specification of a quota project to be used in requests to GCP APIs.").Get()
 )
 
 var (
-	shouldFillMetadata = metadata.OnGCE
+	// shouldFillMetadata returns whether the workload is running on GCP and the metadata endpoint is accessible
+	// In contrast, DiscoverWithTimeout only checks if the workload is running on GCP
+	shouldFillMetadata = func() bool {
+		return metadata.OnGCE() && isMetadataEndpointAccessible()
+	}
 	projectIDFn        = metadata.ProjectID
 	numericProjectIDFn = metadata.NumericProjectID
 	instanceNameFn     = metadata.InstanceName
@@ -82,19 +93,47 @@ var (
 		}
 		return cb, nil
 	}
+
+	constructGKEClusterURL = func(md map[string]string) (string, error) {
+		projectID, found := md[GCPProject]
+		if !found {
+			return "", fmt.Errorf("error constructing GKE cluster url: %s not found in GCP Metadata", GCPProject)
+		}
+		clusterLocation, found := md[GCPLocation]
+		if !found {
+			return "", fmt.Errorf("error constructing GKE cluster url: %s not found in GCP Metadata", GCPLocation)
+		}
+		clusterName, found := md[GCPCluster]
+		if !found {
+			return "", fmt.Errorf("error constructing GKE cluster url: %s not found in GCP Metadata", GCPCluster)
+		}
+		return fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
+			projectID, clusterLocation, clusterName), nil
+	}
 )
 
-type shouldFillFn func() bool
-type metadataFn func() (string, error)
+type (
+	shouldFillFn     func() bool
+	metadataFn       func() (string, error)
+	metadataSupplier struct {
+		Property string
+		Fn       func() (string, error)
+	}
+)
 
 type gcpEnv struct {
 	sync.Mutex
 	metadata map[string]string
 }
 
+var (
+	fillMetadata bool
+	gcpEnvOnce   sync.Once
+)
+
 // IsGCP returns whether or not the platform for bootstrapping is Google Cloud Platform.
 func IsGCP() bool {
-	if gcpMetadataVar.Get() != "" {
+	if GCPMetadata != "" {
 		// Assume this is running on GCP if GCP project env variable is set.
 		return true
 	}
@@ -111,11 +150,15 @@ func NewGCP() Environment {
 // Metadata returns GCP environmental data, including project, cluster name, and
 // location information.
 func (e *gcpEnv) Metadata() map[string]string {
+	gcpEnvOnce.Do(func() {
+		fillMetadata = shouldFillMetadata()
+	})
+
 	md := map[string]string{}
 	if e == nil {
 		return md
 	}
-	if gcpMetadataVar.Get() == "" && !shouldFillMetadata() {
+	if GCPMetadata == "" && !fillMetadata {
 		return md
 	}
 
@@ -125,53 +168,97 @@ func (e *gcpEnv) Metadata() map[string]string {
 		return e.metadata
 	}
 	envPid, envNPid, envCN, envLoc := parseGCPMetadata()
+
 	if envPid != "" {
 		md[GCPProject] = envPid
-	} else if pid, err := projectIDFn(); err == nil {
-		md[GCPProject] = pid
 	}
 	if envNPid != "" {
 		md[GCPProjectNumber] = envNPid
-	} else if npid, err := numericProjectIDFn(); err == nil {
-		md[GCPProjectNumber] = npid
 	}
 	if envLoc != "" {
 		md[GCPLocation] = envLoc
-	} else if l, err := clusterLocationFn(); err == nil {
-		md[GCPLocation] = l
 	}
 	if envCN != "" {
 		md[GCPCluster] = envCN
-	} else if cn, err := clusterNameFn(); err == nil {
-		md[GCPCluster] = cn
 	}
-	if in, err := instanceNameFn(); err == nil {
-		md[GCEInstance] = in
+
+	if fillMetadata {
+		// suppliers is an array of functions that supply the metadata for missing properties
+		var suppliers []metadataSupplier
+		if _, found := md[GCPProject]; !found {
+			suppliers = append(suppliers, createMetadataSupplier(GCPProject, projectIDFn))
+		}
+		if _, found := md[GCPProjectNumber]; !found {
+			suppliers = append(suppliers, createMetadataSupplier(GCPProjectNumber, numericProjectIDFn))
+		}
+		if _, found := md[GCPLocation]; !found {
+			suppliers = append(suppliers, createMetadataSupplier(GCPLocation, clusterLocationFn))
+		}
+		if _, found := md[GCPCluster]; !found {
+			suppliers = append(suppliers, createMetadataSupplier(GCPCluster, clusterNameFn))
+		}
+
+		wg := waitForMetadataSuppliers(suppliers, md)
+		wg.Wait()
 	}
-	if id, err := instanceIDFn(); err == nil {
-		md[GCEInstanceID] = id
+
+	if GCPQuotaProjectVar != "" {
+		md[GCPQuotaProject] = GCPQuotaProjectVar
 	}
-	if it, err := instanceTemplateFn(); err == nil {
-		md[GCEInstanceTemplate] = it
+	// Exit early now if not on GCE. This allows setting env var when not on GCE.
+	if !fillMetadata {
+		e.metadata = md
+		return md
 	}
-	if cb, err := createdByFn(); err == nil {
-		md[GCEInstanceCreatedBy] = cb
+
+	suppliers := []metadataSupplier{
+		createMetadataSupplier(GCEInstance, instanceNameFn),
+		createMetadataSupplier(GCEInstanceID, instanceIDFn),
+		createMetadataSupplier(GCEInstanceTemplate, instanceTemplateFn),
+		createMetadataSupplier(GCEInstanceCreatedBy, createdByFn),
+	}
+
+	wg := waitForMetadataSuppliers(suppliers, md)
+	wg.Wait()
+
+	if clusterURL, err := constructGKEClusterURL(md); err == nil {
+		md[GCPClusterURL] = clusterURL
 	}
 	e.metadata = md
 	return md
 }
 
+func waitForMetadataSuppliers(suppliers []metadataSupplier, md map[string]string) *sync.WaitGroup {
+	wg := sync.WaitGroup{}
+	mx := sync.Mutex{}
+	for _, mdSupplier := range suppliers {
+		wg.Add(1)
+		property, supplierFunction := mdSupplier.Property, mdSupplier.Fn
+		go func() {
+			defer wg.Done()
+			if result, err := supplierFunction(); err == nil {
+				mx.Lock()
+				md[property] = result
+				mx.Unlock()
+			} else {
+				log.Warnf("Error fetching GCP Metadata property %s: %v", property, err)
+			}
+		}()
+	}
+	return &wg
+}
+
 var (
-	envOnce     sync.Once
-	envPid      string
-	envNpid     string
-	envCluster  string
-	envLocation string
+	parseMetadataOnce sync.Once
+	envPid            string
+	envNpid           string
+	envCluster        string
+	envLocation       string
 )
 
 func parseGCPMetadata() (pid, npid, cluster, location string) {
-	envOnce.Do(func() {
-		gcpmd := gcpMetadataVar.Get()
+	parseMetadataOnce.Do(func() {
+		gcpmd := GCPMetadata
 		if len(gcpmd) > 0 {
 			log.Infof("Extract GCP metadata from env variable GCP_METADATA: %v", gcpmd)
 			parts := strings.Split(gcpmd, "|")
@@ -183,6 +270,7 @@ func parseGCPMetadata() (pid, npid, cluster, location string) {
 			}
 		}
 	})
+
 	return envPid, envNpid, envCluster, envLocation
 }
 
@@ -200,7 +288,7 @@ func zoneToRegion(z string) (string, error) {
 // Locality returns the GCP-specific region and zone.
 func (e *gcpEnv) Locality() *core.Locality {
 	var l core.Locality
-	if metadata.OnGCE() {
+	if fillMetadata {
 		z, zerr := metadata.Zone()
 		if zerr != nil {
 			log.Warnf("Error fetching GCP zone: %v", zerr)
@@ -218,6 +306,8 @@ func (e *gcpEnv) Locality() *core.Locality {
 	return &l
 }
 
+const ComputeReadonlyScope = "https://www.googleapis.com/auth/compute.readonly"
+
 // Labels attempts to retrieve the GCE instance labels within the timeout
 // Requires read access to the Compute API (compute.instances.get)
 func (e *gcpEnv) Labels() map[string]string {
@@ -230,26 +320,28 @@ func (e *gcpEnv) Labels() map[string]string {
 	var instanceLabels map[string]string
 	go func() {
 		// use explicit credentials with compute.instances.get IAM permissions
-		creds, err := google.FindDefaultCredentials(ctx, compute.ComputeReadonlyScope)
+		creds, err := google.FindDefaultCredentials(ctx, ComputeReadonlyScope)
 		if err != nil {
 			log.Warnf("failed to find default credentials: %v", err)
 			success <- false
 			return
 		}
-		computeService, err := compute.NewService(ctx, option.WithCredentials(creds))
+		url := fmt.Sprintf("https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s", md[GCPProject], md[GCPLocation], md[GCEInstance])
+		resp, err := oauth2.NewClient(ctx, creds.TokenSource).Get(url)
 		if err != nil {
-			log.Warnf("failed to create new service: %v", err)
+			log.Warnf("unable to retrieve instance labels: %v", err)
+			success <- false
+			return
+
+		}
+		defer resp.Body.Close()
+		instance := &GcpInstance{}
+		if err := json.NewDecoder(resp.Body).Decode(instance); err != nil {
+			log.Warnf("failed to decode response: %v", err)
 			success <- false
 			return
 		}
-		// instance.Labels is nil if no labels are present
-		instanceObj, err := computeService.Instances.Get(md[GCPProject], md[GCPLocation], md[GCEInstance]).Do()
-		if err != nil {
-			log.Warnf("unable to retrieve instance: %v", err)
-			success <- false
-			return
-		}
-		instanceLabels = instanceObj.Labels
+		instanceLabels = instance.Labels
 		success <- true
 	}()
 	select {
@@ -263,9 +355,31 @@ func (e *gcpEnv) Labels() map[string]string {
 	return labels
 }
 
+// GcpInstance the instances response. Only contains fields we care about, rest are ignored
+type GcpInstance struct {
+	// Labels: Labels to apply to this instance.
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
 // Checks metadata to see if GKE metadata or Kubernetes env vars exist
 func (e *gcpEnv) IsKubernetes() bool {
 	md := e.Metadata()
 	_, onKubernetes := os.LookupEnv(KubernetesServiceHost)
 	return md[GCPCluster] != "" || onKubernetes
+}
+
+func createMetadataSupplier(property string, fn func() (string, error)) metadataSupplier {
+	return metadataSupplier{
+		Property: property,
+		Fn:       fn,
+	}
+}
+
+func isMetadataEndpointAccessible() bool {
+	_, err := net.DialTimeout("tcp", "metadata.google.internal:80", 5*time.Second)
+	if err != nil {
+		log.Warnf("cannot reach the Google Instance metadata endpoint %v", err)
+		return false
+	}
+	return true
 }

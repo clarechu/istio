@@ -23,14 +23,12 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/golang/protobuf/jsonpb"
-
-	"gopkg.in/d4l3k/messagediff.v1"
+	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/proto"
+	"k8s.io/client-go/util/jsonpath"
 
 	"istio.io/istio/pkg/test"
-
-	"k8s.io/client-go/util/jsonpath"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
 var (
@@ -39,7 +37,7 @@ var (
 )
 
 type Instance struct {
-	structure     interface{}
+	structure     any
 	isJSON        bool
 	constraints   []constraint
 	creationError error
@@ -77,21 +75,21 @@ func newErrorInstance(err error) *Instance {
 	}
 }
 
-func protoToParsedJSON(message proto.Message) (interface{}, error) {
+func protoToParsedJSON(message proto.Message) (any, error) {
 	// Convert proto to json and then parse into struct
-	jsonText, err := (&jsonpb.Marshaler{Indent: " "}).MarshalToString(message)
+	jsonText, err := protomarshal.MarshalIndent(message, "  ")
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert proto to JSON: %v", err)
 	}
-	var parsed interface{}
-	err = json.Unmarshal([]byte(jsonText), &parsed)
+	var parsed any
+	err = json.Unmarshal(jsonText, &parsed)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse into JSON struct: %v", err)
 	}
 	return parsed, nil
 }
 
-func (i *Instance) Select(path string, args ...interface{}) *Instance {
+func (i *Instance) Select(path string, args ...any) *Instance {
 	if i.creationError != nil {
 		// There was an error during the creation of this Instance. Just return the
 		// same instance since it will error on Check anyway.
@@ -119,7 +117,7 @@ func (i *Instance) appendConstraint(fn func() error) *Instance {
 	return i
 }
 
-func (i *Instance) Equals(expected interface{}, path string, args ...interface{}) *Instance {
+func (i *Instance) Equals(expected any, path string, args ...any) *Instance {
 	path = fmt.Sprintf(path, args...)
 	return i.appendConstraint(func() error {
 		typeOf := reflect.TypeOf(expected)
@@ -202,14 +200,14 @@ func (i *Instance) equalsStruct(proto proto.Message, path string) error {
 	if err != nil {
 		return err
 	}
-	diff, b := messagediff.PrettyDiff(reflect.ValueOf(v).Interface(), jsonStruct)
-	if !b {
+	diff := cmp.Diff(reflect.ValueOf(v).Interface(), jsonStruct)
+	if diff != "" {
 		return fmt.Errorf("structs did not match: %v", diff)
 	}
 	return nil
 }
 
-func (i *Instance) Exists(path string, args ...interface{}) *Instance {
+func (i *Instance) Exists(path string, args ...any) *Instance {
 	path = fmt.Sprintf(path, args...)
 	return i.appendConstraint(func() error {
 		v, err := i.findValue(path)
@@ -223,7 +221,7 @@ func (i *Instance) Exists(path string, args ...interface{}) *Instance {
 	})
 }
 
-func (i *Instance) NotExists(path string, args ...interface{}) *Instance {
+func (i *Instance) NotExists(path string, args ...any) *Instance {
 	path = fmt.Sprintf(path, args...)
 	return i.appendConstraint(func() error {
 		parser := jsonpath.New("path")
@@ -234,6 +232,9 @@ func (i *Instance) NotExists(path string, args ...interface{}) *Instance {
 		values, err := parser.AllowMissingKeys(true).FindResults(i.structure)
 		if err != nil {
 			return fmt.Errorf("err finding results for path: %v - %v", path, err)
+		}
+		if len(values) == 0 {
+			return nil
 		}
 		if len(values[0]) > 0 {
 			return fmt.Errorf("expected no result but got: %v for path: %v", values[0], path)
@@ -289,7 +290,7 @@ func (i *Instance) execute(path string) (string, error) {
 	return buf.String(), nil
 }
 
-func (i *Instance) findValue(path string) (interface{}, error) {
+func (i *Instance) findValue(path string) (any, error) {
 	parser := jsonpath.New("path")
 	err := parser.Parse(i.fixPath(path))
 	if err != nil {

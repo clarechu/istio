@@ -21,18 +21,18 @@
 set -e
 
 # Match pilot/docker/Dockerfile.proxyv2
-export ISTIO_META_ISTIO_VERSION="1.8.0"
+export ISTIO_META_ISTIO_VERSION="1.16.0"
 
 set -a
 # Load optional config variables
-ISTIO_SIDECAR_CONFIG=${ISTIO_SIDECAR_CONFIG:-/var/lib/istio/envoy/sidecar.env}
+ISTIO_SIDECAR_CONFIG=${ISTIO_SIDECAR_CONFIG:-./var/lib/istio/envoy/sidecar.env}
 if [[ -r ${ISTIO_SIDECAR_CONFIG} ]]; then
   # shellcheck disable=SC1090
   . "$ISTIO_SIDECAR_CONFIG"
 fi
 
 # Load config variables ISTIO_SYSTEM_NAMESPACE, CONTROL_PLANE_AUTH_POLICY
-ISTIO_CLUSTER_CONFIG=${ISTIO_CLUSTER_CONFIG:-/var/lib/istio/envoy/cluster.env}
+ISTIO_CLUSTER_CONFIG=${ISTIO_CLUSTER_CONFIG:-./var/lib/istio/envoy/cluster.env}
 if [[ -r ${ISTIO_CLUSTER_CONFIG} ]]; then
   # shellcheck disable=SC1090
   . "$ISTIO_CLUSTER_CONFIG"
@@ -41,14 +41,10 @@ set +a
 
 # Set defaults
 ISTIO_BIN_BASE=${ISTIO_BIN_BASE:-/usr/local/bin}
-ISTIO_LOG_DIR=${ISTIO_LOG_DIR:-/var/log/istio}
+ISTIO_LOG_DIR=${ISTIO_LOG_DIR:-./var/log/istio}
 NS=${ISTIO_NAMESPACE:-default}
 SVC=${ISTIO_SERVICE:-rawvm}
 ISTIO_SYSTEM_NAMESPACE=${ISTIO_SYSTEM_NAMESPACE:-istio-system}
-
-# The default matches the default istio.yaml - use sidecar.env to override this if you
-# enable auth. This requires node-agent to be running.
-ISTIO_PILOT_PORT=${ISTIO_PILOT_PORT:-15012}
 
 # If set, override the default
 CONTROL_PLANE_AUTH_POLICY=${ISTIO_CP_AUTH:-"MUTUAL_TLS"}
@@ -59,6 +55,14 @@ fi
 
 if [ -z "${POD_NAME:-}" ]; then
   POD_NAME=$(hostname -s)
+fi
+
+if [[ ${1-} == "clean" ]] ; then
+  if [ "${ISTIO_CUSTOM_IP_TABLES}" != "true" ] ; then
+    # clean the previous Istio iptables chains.
+    "${ISTIO_BIN_BASE}/pilot-agent" istio-clean-iptables
+  fi
+  exit 0
 fi
 
 # Init option will only initialize iptables. set ISTIO_CUSTOM_IP_TABLES to true if you would like to ignore this step
@@ -91,13 +95,18 @@ if [ "${ISTIO_INBOUND_INTERCEPTION_MODE}" = "TPROXY" ] ; then
   EXEC_USER=root
 fi
 
-if [ -z "${PILOT_ADDRESS:-}" ]; then
-  PILOT_ADDRESS=istiod.${ISTIO_SYSTEM_NAMESPACE}.svc:${ISTIO_PILOT_PORT}
+# The default matches the default istio.yaml - use sidecar.env to override ISTIO_PILOT_PORT or CA_ADDR if you
+# enable auth. This requires node-agent to be running.
+DEFAULT_PILOT_ADDRESS="istiod.${ISTIO_SYSTEM_NAMESPACE}.svc:15012"
+CUSTOM_PILOT_ADDRESS="${PILOT_ADDRESS:-}"
+if [ -z "${CUSTOM_PILOT_ADDRESS}" ] && [ -n "${ISTIO_PILOT_PORT:-}" ]; then
+  CUSTOM_PILOT_ADDRESS=istiod.${ISTIO_SYSTEM_NAMESPACE}.svc:${ISTIO_PILOT_PORT}
 fi
 
-CA_ADDR=${CA_ADDR:-${PILOT_ADDRESS}}
-PROV_CERT=${PROV_CERT-/etc/certs}
-OUTPUT_CERTS=${OUTPUT_CERTS-/etc/certs}
+# CA_ADDR > PILOT_ADDRESS > ISTIO_PILOT_PORT
+CA_ADDR=${CA_ADDR:-${CUSTOM_PILOT_ADDRESS:-${DEFAULT_PILOT_ADDRESS}}}
+PROV_CERT=${PROV_CERT-./etc/certs}
+OUTPUT_CERTS=${OUTPUT_CERTS-./etc/certs}
 
 export PROV_CERT
 export OUTPUT_CERTS
@@ -108,11 +117,18 @@ ISTIO_AGENT_FLAGS=${ISTIO_AGENT_FLAGS:-}
 # Split ISTIO_AGENT_FLAGS by spaces.
 IFS=' ' read -r -a ISTIO_AGENT_FLAGS_ARRAY <<< "$ISTIO_AGENT_FLAGS"
 
-export PROXY_CONFIG=${PROXY_CONFIG:-"
+DEFAULT_PROXY_CONFIG="
 serviceCluster: $SVC
 controlPlaneAuthPolicy: ${CONTROL_PLANE_AUTH_POLICY}
-discoveryAddress: ${PILOT_ADDRESS}
-"}
+"
+if [ -n "${CUSTOM_PILOT_ADDRESS}" ]; then
+  PROXY_CONFIG="$PROXY_CONFIG
+discoveryAddress: ${CUSTOM_PILOT_ADDRESS}
+"
+fi
+
+# PROXY_CONFIG > PILOT_ADDRESS > ISTIO_PILOT_PORT
+export PROXY_CONFIG=${PROXY_CONFIG:-${DEFAULT_PROXY_CONFIG}}
 
 if [ ${EXEC_USER} == "${USER:-}" ] ; then
   # if started as istio-proxy (or current user), do a normal start, without
@@ -120,6 +136,11 @@ if [ ${EXEC_USER} == "${USER:-}" ] ; then
   INSTANCE_IP=${ISTIO_SVC_IP} POD_NAME=${POD_NAME} POD_NAMESPACE=${NS} "${ISTIO_BIN_BASE}/pilot-agent" proxy "${ISTIO_AGENT_FLAGS_ARRAY[@]}"
 else
 
+# su will mess with the limits set on the process we run. This may lead to quickly exhausting the file limits
+# We will get the host limit and set it in the child as well.
+# TODO(https://superuser.com/questions/1645513/why-does-executing-a-command-in-su-change-limits) can we do better?
+currentLimit=$(ulimit -n)
+
 # Will run: ${ISTIO_BIN_BASE}/envoy -c $ENVOY_CFG --restart-epoch 0 --drain-time-s 2 --parent-shutdown-time-s 3 --service-cluster $SVC --service-node 'sidecar~${ISTIO_SVC_IP}~${POD_NAME}.${NS}.svc.cluster.local~${NS}.svc.cluster.local' $ISTIO_DEBUG >${ISTIO_LOG_DIR}/istio.log" istio-proxy
-exec su -s /bin/bash -c "INSTANCE_IP=${ISTIO_SVC_IP} POD_NAME=${POD_NAME} POD_NAMESPACE=${NS} exec ${ISTIO_BIN_BASE}/pilot-agent proxy ${ISTIO_AGENT_FLAGS_ARRAY[*]} 2> ${ISTIO_LOG_DIR}/istio.err.log > ${ISTIO_LOG_DIR}/istio.log" ${EXEC_USER}
+exec sudo -E -u ${EXEC_USER} -s /bin/bash -c "ulimit -n ${currentLimit}; INSTANCE_IP=${ISTIO_SVC_IP} POD_NAME=${POD_NAME} POD_NAMESPACE=${NS} exec ${ISTIO_BIN_BASE}/pilot-agent proxy ${ISTIO_AGENT_FLAGS_ARRAY[*]} 2>> ${ISTIO_LOG_DIR}/istio.err.log >> ${ISTIO_LOG_DIR}/istio.log"
 fi

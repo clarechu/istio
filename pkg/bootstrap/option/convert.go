@@ -15,10 +15,10 @@
 package option
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -26,26 +26,28 @@ import (
 	auth "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/conversion"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
-	"github.com/gogo/protobuf/types"
-	pstruct "github.com/golang/protobuf/ptypes/struct"
-	"github.com/golang/protobuf/ptypes/wrappers"
+	"google.golang.org/protobuf/types/known/durationpb"
+	pstruct "google.golang.org/protobuf/types/known/structpb"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
+	meshAPI "istio.io/api/mesh/v1alpha1"
 	networkingAPI "istio.io/api/networking/v1alpha3"
-	"istio.io/pkg/log"
-
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
 	authn_model "istio.io/istio/pilot/pkg/security/model"
+	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/security"
+	"istio.io/pkg/log"
 )
 
-//TransportSocket wraps UpstreamTLSContext
+// TransportSocket wraps UpstreamTLSContext
 type TransportSocket struct {
 	Name        string          `json:"name,omitempty"`
 	TypedConfig *pstruct.Struct `json:"typed_config,omitempty"`
 }
 
 func keepaliveConverter(value *networkingAPI.ConnectionPoolSettings_TCPSettings_TcpKeepalive) convertFunc {
-	return func(*instance) (interface{}, error) {
+	return func(*instance) (any, error) {
 		upstreamConnectionOptions := &cluster.UpstreamConnectionOptions{
 			TcpKeepalive: &core.TcpKeepalive{},
 		}
@@ -66,8 +68,7 @@ func keepaliveConverter(value *networkingAPI.ConnectionPoolSettings_TCPSettings_
 }
 
 func transportSocketConverter(tls *networkingAPI.ClientTLSSettings, sniName string, metadata *model.BootstrapNodeMetadata, isH2 bool) convertFunc {
-
-	return func(*instance) (interface{}, error) {
+	return func(*instance) (any, error) {
 		tlsContext := tlsContextConvert(tls, sniName, metadata)
 		if tlsContext == nil {
 			return "", nil
@@ -78,7 +79,7 @@ func transportSocketConverter(tls *networkingAPI.ClientTLSSettings, sniName stri
 		// This double conversion is to encode the typed config and get it out as struct
 		// so that convertToJSON properly encodes the structure. Since this is just for
 		// bootstrap generation this is better than having our custom structs.
-		tlsContextStruct, _ := conversion.MessageToStruct(util.MessageToAny(tlsContext))
+		tlsContextStruct, _ := conversion.MessageToStruct(protoconv.MessageToAny(tlsContext))
 		transportSocket := &TransportSocket{
 			Name:        wellknown.TransportSocketTls,
 			TypedConfig: tlsContextStruct,
@@ -95,7 +96,7 @@ func tlsContextConvert(tls *networkingAPI.ClientTLSSettings, sniName string, met
 
 	switch tls.Mode {
 	case networkingAPI.ClientTLSSettings_SIMPLE:
-		res := model.SdsCertificateConfig{
+		res := security.SdsCertificateConfig{
 			CaCertificatePath: model.GetOrDefault(metadata.TLSClientRootCert, tls.CaCertificates),
 		}
 
@@ -106,8 +107,9 @@ func tlsContextConvert(tls *networkingAPI.ClientTLSSettings, sniName string, met
 			},
 		}
 		tlsContext.CommonTlsContext.AlpnProtocols = util.ALPNH2Only
+		tlsContext.Sni = tls.Sni
 	case networkingAPI.ClientTLSSettings_MUTUAL:
-		res := model.SdsCertificateConfig{
+		res := security.SdsCertificateConfig{
 			CertificatePath:   model.GetOrDefault(metadata.TLSClientCertChain, tls.ClientCertificate),
 			PrivateKeyPath:    model.GetOrDefault(metadata.TLSClientKey, tls.PrivateKey),
 			CaCertificatePath: model.GetOrDefault(metadata.TLSClientRootCert, tls.CaCertificates),
@@ -124,6 +126,7 @@ func tlsContextConvert(tls *networkingAPI.ClientTLSSettings, sniName string, met
 			},
 		}
 		tlsContext.CommonTlsContext.AlpnProtocols = util.ALPNH2Only
+		tlsContext.Sni = tls.Sni
 	case networkingAPI.ClientTLSSettings_ISTIO_MUTUAL:
 		tlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(tlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs,
 			authn_model.ConstructSdsSecretConfig(authn_model.SDSDefaultResourceName))
@@ -135,18 +138,20 @@ func tlsContextConvert(tls *networkingAPI.ClientTLSSettings, sniName string, met
 			},
 		}
 		tlsContext.CommonTlsContext.AlpnProtocols = util.ALPNInMeshH2
+		tlsContext.Sni = tls.Sni
+		// For ISTIO_MUTUAL if custom SNI is not provided, use the default SNI name.
+		if len(tls.Sni) == 0 {
+			tlsContext.Sni = sniName
+		}
 	default:
 		// No TLS.
 		return nil
 	}
-	if len(sniName) > 0 {
-		tlsContext.Sni = sniName
-	}
 	return tlsContext
 }
 
-func nodeMetadataConverter(metadata *model.BootstrapNodeMetadata, rawMeta map[string]interface{}) convertFunc {
-	return func(*instance) (interface{}, error) {
+func nodeMetadataConverter(metadata *model.BootstrapNodeMetadata, rawMeta map[string]any) convertFunc {
+	return func(*instance) (any, error) {
 		marshalString, err := marshalMetadata(metadata, rawMeta)
 		if err != nil {
 			return "", err
@@ -156,7 +161,7 @@ func nodeMetadataConverter(metadata *model.BootstrapNodeMetadata, rawMeta map[st
 }
 
 func sanConverter(sans []string) convertFunc {
-	return func(*instance) (interface{}, error) {
+	return func(*instance) (any, error) {
 		matchers := []string{}
 		for _, s := range sans {
 			matchers = append(matchers, fmt.Sprintf(`{"exact":"%s"}`, s))
@@ -166,29 +171,68 @@ func sanConverter(sans []string) convertFunc {
 }
 
 func addressConverter(addr string) convertFunc {
-	return func(o *instance) (interface{}, error) {
+	return func(o *instance) (any, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, fmt.Errorf("unable to parse %s address %q: %v", o.name, addr, err)
+		}
+		if host == "$(HOST_IP)" {
+			// Replace host with HOST_IP env var if it is "$(HOST_IP)".
+			// This is to support some tracer setting (Datadog, Zipkin), where "$(HOST_IP)"" is used for address.
+			// Tracer address used to be specified within proxy container params, and thus could be interpreted with pod HOST_IP env var.
+			// Now tracer config is passed in with mesh config volumn at gateway, k8s env var interpretation does not work.
+			// This is to achieve the same interpretation as k8s.
+			hostIPEnv := os.Getenv("HOST_IP")
+			if hostIPEnv != "" {
+				host = hostIPEnv
+			}
 		}
 
 		return fmt.Sprintf("{\"address\": \"%s\", \"port_value\": %s}", host, port), nil
 	}
 }
 
-func durationConverter(value *types.Duration) convertFunc {
-	return func(*instance) (interface{}, error) {
-		return value.String(), nil
+func jsonConverter(d any) convertFunc {
+	return func(o *instance) (any, error) {
+		b, err := json.Marshal(d)
+		return string(b), err
 	}
 }
 
-func podIPConverter(value net.IP) convertFunc {
-	return func(*instance) (interface{}, error) {
-		return base64.StdEncoding.EncodeToString(value), nil
+func durationConverter(value *durationpb.Duration) convertFunc {
+	return func(*instance) (any, error) {
+		return value.AsDuration().String(), nil
 	}
 }
 
-func convertToJSON(v interface{}) string {
+// openCensusAgentContextConverter returns a converter that returns the list of
+// distributed trace contexts to propagate with envoy.
+func openCensusAgentContextConverter(contexts []meshAPI.Tracing_OpenCensusAgent_TraceContext) convertFunc {
+	allContexts := `["TRACE_CONTEXT","GRPC_TRACE_BIN","CLOUD_TRACE_CONTEXT","B3"]`
+	return func(*instance) (any, error) {
+		if len(contexts) == 0 {
+			return allContexts, nil
+		}
+
+		var envoyContexts []string
+		for _, c := range contexts {
+			switch c {
+			// Ignore UNSPECIFIED
+			case meshAPI.Tracing_OpenCensusAgent_W3C_TRACE_CONTEXT:
+				envoyContexts = append(envoyContexts, "TRACE_CONTEXT")
+			case meshAPI.Tracing_OpenCensusAgent_GRPC_BIN:
+				envoyContexts = append(envoyContexts, "GRPC_TRACE_BIN")
+			case meshAPI.Tracing_OpenCensusAgent_CLOUD_TRACE_CONTEXT:
+				envoyContexts = append(envoyContexts, "CLOUD_TRACE_CONTEXT")
+			case meshAPI.Tracing_OpenCensusAgent_B3:
+				envoyContexts = append(envoyContexts, "B3")
+			}
+		}
+		return convertToJSON(envoyContexts), nil
+	}
+}
+
+func convertToJSON(v any) string {
 	if v == nil {
 		return ""
 	}
@@ -202,12 +246,12 @@ func convertToJSON(v interface{}) string {
 
 // marshalMetadata combines type metadata and untyped metadata and marshals to json
 // This allows passing arbitrary metadata to Envoy, while still supported typed metadata for known types
-func marshalMetadata(metadata *model.BootstrapNodeMetadata, rawMeta map[string]interface{}) (string, error) {
+func marshalMetadata(metadata *model.BootstrapNodeMetadata, rawMeta map[string]any) (string, error) {
 	b, err := json.Marshal(metadata)
 	if err != nil {
 		return "", err
 	}
-	var output map[string]interface{}
+	var output map[string]any
 	if err := json.Unmarshal(b, &output); err != nil {
 		return "", err
 	}

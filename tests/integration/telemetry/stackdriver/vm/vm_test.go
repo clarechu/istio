@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,189 +19,144 @@ package vm
 
 import (
 	"fmt"
-	"io/ioutil"
+	"reflect"
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/jsonpb"
+	"google.golang.org/genproto/googleapis/devtools/cloudtrace/v1"
 	loggingpb "google.golang.org/genproto/googleapis/logging/v2"
 	monitoring "google.golang.org/genproto/googleapis/monitoring/v3"
 	"google.golang.org/protobuf/proto"
 
-	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/components/echo/echoboot"
+	"istio.io/istio/pkg/test/framework/components/stackdriver"
 	"istio.io/istio/pkg/test/util/retry"
-	"istio.io/istio/pkg/test/util/tmpl"
+	sdtest "istio.io/istio/tests/integration/telemetry/stackdriver"
+	"istio.io/pkg/log"
 )
 
 func TestVMTelemetry(t *testing.T) {
 	framework.
 		NewTest(t).
 		Features("observability.telemetry.stackdriver").
-		Run(func(ctx framework.TestContext) {
+		Run(func(t framework.TestContext) {
 			// Set up strict mTLS. This gives a bit more assurance the calls are actually going through envoy,
 			// and certs are set up correctly.
-			ctx.Config().ApplyYAMLOrFail(ctx, ns.Name(), `
-apiVersion: security.istio.io/v1beta1
-kind: PeerAuthentication
-metadata:
-  name: default
-spec:
-  mtls:
-    mode: STRICT
----
-apiVersion: networking.istio.io/v1alpha3
-kind: DestinationRule
-metadata:
-  name: send-mtls
-spec:
-  host: "*.svc.cluster.local"
-  trafficPolicy:
-    tls:
-      mode: ISTIO_MUTUAL
-`)
-			ports := []echo.Port{
-				{
-					Name:     "http",
-					Protocol: protocol.HTTP,
-					// Due to a bug in WorkloadEntry, service port must equal target port for now
-					InstancePort: 8090,
-					ServicePort:  8090,
-				},
-			}
+			t.ConfigIstio().YAML(ns.Name(), enforceMTLS).ApplyOrFail(t)
 
-			// builder to build the instances iteratively
-			echoboot.NewBuilder(ctx).
-				With(&clt, echo.Config{
-					Service:   "client",
-					Namespace: ns,
-					Ports:     ports,
-					Subsets: []echo.SubsetConfig{
-						{
-							Annotations: map[echo.Annotation]*echo.AnnotationValue{
-								echo.SidecarBootstrapOverride: {
-									Value: sdBootstrapConfigMap,
-								},
-							},
-						},
-					},
-				}).
-				BuildOrFail(t)
+			clientBuilder.BuildOrFail(t)
+			serverBuilder.BuildOrFail(t)
 
-			echoboot.NewBuilder(ctx).
-				With(&srv, echo.Config{
-					Service:       "server",
-					Namespace:     ns,
-					Ports:         ports,
-					DeployAsVM:    true,
-					VMEnvironment: vmEnv,
-				}).
-				BuildOrFail(t)
-
-			srvReceived := false
-			cltReceived := false
-			logReceived := false
 			retry.UntilSuccessOrFail(t, func() error {
-				_, err := clt.Call(echo.CallOptions{
-					Target:   srv,
-					PortName: "http",
-					Count:    1,
-				})
-				if err != nil {
+				// send single request from client -> server
+				if _, err := client.Call(echo.CallOptions{
+					To: server,
+					Port: echo.Port{
+						Name: "http",
+					},
+					Count: 1,
+					Retry: echo.Retry{
+						NoRetry: true,
+					},
+				}); err != nil {
 					return err
 				}
+
 				// Verify stackdriver metrics
-				wantClt, wantSrv, err := getWantRequestCountTS()
-				if err != nil {
-					return err
-				}
-				// Traverse all time series received and compare with expected client and server time series.
-				ts, err := sdInst.ListTimeSeries()
-				if err != nil {
-					return err
-				}
-				for _, tt := range ts {
-					// Making resource nil, as test can run on various platforms.
-					tt.Resource = nil
-					if proto.Equal(tt, &wantSrv) {
-						srvReceived = true
-					}
-					if proto.Equal(tt, &wantClt) {
-						cltReceived = true
-					}
-				}
+				gotMetrics := gotRequestCountMetrics(t, wantClientReqs, wantServerReqs)
 
 				// Verify log entry
-				wantLog, err := getWantServerLogEntry()
-				if err != nil {
-					return fmt.Errorf("failed to parse wanted log entry: %v", err)
-				}
-				// Traverse all log entries received and compare with expected server log entry.
-				entries, err := sdInst.ListLogEntries()
-				if err != nil {
-					return fmt.Errorf("failed to get received log entries: %v", err)
-				}
-				for _, l := range entries {
-					if proto.Equal(l, &wantLog) {
-						logReceived = true
-					}
+				gotLogs := gotLogEntry(t, wantLogEntry)
+
+				// verify traces
+				gotTraces := gotTrace(t, wantTrace)
+
+				if !(gotMetrics && gotLogs && gotTraces) {
+					return fmt.Errorf("did not receive all expected telemetry; status: metrics=%t, logs=%t, traces=%t", gotMetrics, gotLogs, gotTraces)
 				}
 
-				// Check if both client and server side request count metrics are received
-				if !srvReceived || !cltReceived {
-					return fmt.Errorf("stackdriver server does not received expected server or client request count, server %v client %v", srvReceived, cltReceived)
-				}
-				if !logReceived {
-					return fmt.Errorf("stackdriver server does not received expected log entry")
-				}
 				return nil
 			}, retry.Delay(3*time.Second), retry.Timeout(40*time.Second))
 		})
 }
 
-func getWantRequestCountTS() (cltRequestCount, srvRequestCount monitoring.TimeSeries, err error) {
-	srvRequestCountTmpl, err := ioutil.ReadFile(serverRequestCount)
-	if err != nil {
-		return
+func traceEqual(got, want *cloudtrace.Trace) bool {
+	if len(got.Spans) != len(want.Spans) {
+		log.Infof("incorrect number of spans: got %d, want: %d", len(got.Spans), len(want.Spans))
+		return false
 	}
-	sr, err := tmpl.Evaluate(string(srvRequestCountTmpl), map[string]interface{}{
-		"EchoNamespace": ns.Name(),
-	})
-	if err != nil {
-		return
+	if got.ProjectId != want.ProjectId {
+		log.Errorf("mismatched project ids: got %q, want %q", got.ProjectId, want.ProjectId)
+		return false
 	}
-	if err = jsonpb.UnmarshalString(sr, &srvRequestCount); err != nil {
-		return
+
+	for _, wantSpan := range want.Spans {
+		foundSpan := false
+		for _, gotSpan := range got.Spans {
+			delete(gotSpan.Labels, "guid:x-request-id")
+			delete(gotSpan.Labels, "node_id")
+			delete(gotSpan.Labels, "peer.address")
+			delete(gotSpan.Labels, "zone")
+			delete(gotSpan.Labels, "g.co/agent")    // ignore OpenCensus lib versions
+			delete(gotSpan.Labels, "response_size") // this could be slightly off, just ignore
+			if foundSpan = reflect.DeepEqual(gotSpan.Labels, wantSpan.Labels); foundSpan {
+				break
+			}
+		}
+		if !foundSpan {
+			log.Errorf("missing span from trace: got %v\nwant %v", got, want)
+			return false
+		}
 	}
-	cltRequestCountTmpl, err := ioutil.ReadFile(clientRequestCount)
-	if err != nil {
-		return
-	}
-	cr, err := tmpl.Evaluate(string(cltRequestCountTmpl), map[string]interface{}{
-		"EchoNamespace": ns.Name(),
-	})
-	if err != nil {
-		return
-	}
-	err = jsonpb.UnmarshalString(cr, &cltRequestCount)
-	return
+
+	return true
 }
 
-func getWantServerLogEntry() (srvLogEntry loggingpb.LogEntry, err error) {
-	srvlogEntryTmpl, err := ioutil.ReadFile(serverLogEntry)
+func gotRequestCountMetrics(t framework.TestContext, wantClient, wantServer *monitoring.TimeSeries) bool {
+	ts, err := sdInst.ListTimeSeries(ns.Name(), "")
 	if err != nil {
-		return
+		log.Errorf("could not get list of time-series from stackdriver: %v", err)
+		return false
 	}
-	sr, err := tmpl.Evaluate(string(srvlogEntryTmpl), map[string]interface{}{
-		"EchoNamespace": ns.Name(),
-	})
+
+	var gotServer, gotClient bool
+	for _, series := range ts {
+		// Making resource nil, as test can run on various platforms.
+		series.Resource = nil
+		if proto.Equal(series, wantServer) {
+			gotServer = true
+		}
+		if proto.Equal(series, wantClient) {
+			gotClient = true
+		}
+	}
+
+	if !gotServer {
+		sdtest.LogMetricsDiff(t, wantServer, ts)
+	}
+	if !gotClient {
+		sdtest.LogMetricsDiff(t, wantClient, ts)
+	}
+	return gotServer && gotClient
+}
+
+func gotLogEntry(t framework.TestContext, want *loggingpb.LogEntry) bool {
+	return sdtest.ValidateLogEntry(t, want, stackdriver.ServerAccessLog, "") == nil
+}
+
+func gotTrace(t framework.TestContext, want *cloudtrace.Trace) bool {
+	traces, err := sdInst.ListTraces(ns.Name(), "")
 	if err != nil {
-		return
+		log.Errorf("failed to retrieve list of tracespans from stackdriver: %v", err)
+		return false
 	}
-	if err = jsonpb.UnmarshalString(sr, &srvLogEntry); err != nil {
-		return
+
+	for _, trace := range traces {
+		if found := traceEqual(trace, want); found {
+			return true
+		}
 	}
-	return
+	sdtest.LogTraceDiff(t, want, traces)
+	return false
 }

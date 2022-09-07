@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 //  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,23 +23,25 @@ import (
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/label"
+	"istio.io/istio/pkg/test/framework/resource"
 )
 
-var (
-	inst istio.Instance
-)
+var inst istio.Instance
 
 func TestMain(m *testing.M) {
 	// Integration test for provisioning DNS certificates.
 	// TODO (lei-tang): investigate whether this test can be moved to integration/security.
+	// nolint: staticcheck
 	framework.NewSuite(m).
-		RequireSingleCluster().
 		Label(label.CustomSetup).
+		// https://github.com/istio/istio/issues/22161. 1.22 drops support for legacy-unknown signer
+		RequireMaxVersion(21).
+		RequireMultiPrimary().
 		Setup(istio.Setup(&inst, setupConfig)).
 		Run()
 }
 
-func setupConfig(cfg *istio.Config) {
+func setupConfig(_ resource.Context, cfg *istio.Config) {
 	if cfg == nil {
 		return
 	}

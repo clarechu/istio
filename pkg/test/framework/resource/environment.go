@@ -14,6 +14,8 @@
 
 package resource
 
+import "istio.io/istio/pkg/test/framework/components/cluster"
+
 // EnvironmentFactory creates an Environment.
 type EnvironmentFactory func(ctx Context) (Environment, error)
 
@@ -31,35 +33,10 @@ type Environment interface {
 	EnvironmentName() string
 
 	// Clusters in this Environment. There will always be at least one.
-	Clusters() Clusters
-}
+	Clusters() cluster.Clusters
 
-var _ Environment = FakeEnvironment{}
-
-// FakeEnvironment for testing.
-type FakeEnvironment struct {
-	Name        string
-	NumClusters int
-	IDValue     string
-}
-
-func (f FakeEnvironment) ID() ID {
-	return FakeID(f.IDValue)
-}
-
-func (f FakeEnvironment) EnvironmentName() string {
-	if len(f.Name) == 0 {
-		return "fake"
-	}
-	return f.Name
-}
-
-func (f FakeEnvironment) Clusters() Clusters {
-	out := make([]Cluster, f.NumClusters)
-	for i := 0; i < f.NumClusters; i++ {
-		out[i] = FakeCluster{
-			IndexValue: i,
-		}
-	}
-	return out
+	// AllClusters in this Environment, including external control planes.
+	AllClusters() cluster.Clusters
+	IsMultiCluster() bool
+	IsMultiNetwork() bool
 }

@@ -19,6 +19,7 @@ features:
   observability:
     telemetry:
       stackdriver:
+      logging:
       stats:
         prometheus:
           customize-metric:
@@ -35,6 +36,7 @@ features:
       istioctl:
   # features relating to controlling the traffic of the service mesh.
   traffic:
+    locality:
     reachability:
     shifting:
     routing:
@@ -42,6 +44,19 @@ features:
     mirroring:
     ingress:
       loadbalancing:
+      custom:
+      topology:
+    ratelimit:
+      envoy:
+    original-source-ip:
+    mcs:
+      autoexport:
+      servicediscovery:
+    cni:
+      race-condition-repair:
+      upgrade:
+    tunneling:
+    gateway:
   usability:
     observability:
       describe:
@@ -51,39 +66,113 @@ features:
       proxy-config:
       proxy-status:
       authz-check:
+      remote-clusters:
+      analysis:
+        line-numbers:
+      tcp-probe:
+      grpc-probe:
     helpers:
       add-to-mesh:
       remove-from-mesh:
+      kube-inject:
   # features that allow users to secure their services and service mesh.
   security:
+    externalca:
+      reachability:
     peer:
       secure-naming:
+      trust-domain-validation:
+      trust-domain-alias-secure-naming:
+      file-mounted-certs:
+      ecc-signature-algorithm:
+      multiple-root:
     user:
     ingress:
       mtls:
+        secretrotation:
+        generic-compoundrotation:
+        nongeneric-compoundrotation:
+        gateway:
       tls:
+        secretrotation:
+        gateway:
+          invalid-secret:
+          K8sca:
+          valid-secret:
+      quic:
+        sds:
+          tls:
+          mtls:
+        sds-k8sca:
+          tls:
+          mtls:
     egress:
       mtls:
         sds:
       tls:
         filebased:
         sds:
+    authorization:
+      mtls-local:
+      jwt-token:
+      workload-selector:
+      deny-action:
+      negative-match:
+      ingress-gateway:
+      egress-gateway:
+      tcp:
+      conditions:
+      grpc-protocol:
+      path-normalization:
+      custom:
+    authentication:
+      jwt:
+      ingressjwt:
+    reachability:
+    healthcheck:
+    filterchain:
     control-plane:
       k8s-certs:
+        dns-certificate:
+        k8sca:
+        jwt:
+        webhook:
       plugin-cert:
+    normalization:
+    fuzz:
+      authorization:
+      jwt:
   # features which allow extending or deep integrations with istio and other products
   extensibility:
+    wasm:
+      remote-load:
+      image-pull-policy:
   # features releated to the lifecycle of istio installations
   installation:
     istioctl:
+      install:
       uninstall_revision:
       uninstall_manifest:
       uninstall_purge:
+      postinstall_verify:
+      revision_centric_view:
+      revision_tags:
     multicluster:
-      central-istiod:
+      cluster_local:
       multimaster:
       remote:
+      centralremotekubeconfig:
+    istiodremote:
+    helm:
+      default:
+        install:
+        upgrade:
+      firstpartyjwt:
+        install:
+    upgrade:
   # describes internal build and testing infrastrcuture
   infrastructure:
     # the testing framework
     framework:
+  vm:
+    autoregistration:

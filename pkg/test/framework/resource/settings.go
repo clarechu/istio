@@ -16,18 +16,62 @@ package resource
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"strings"
 
 	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/framework/label"
+	"istio.io/istio/pkg/util/sets"
 )
 
 const (
 	// maxTestIDLength is the maximum length allowed for testID.
 	maxTestIDLength = 30
 )
+
+// ImageSettings for container images.
+type ImageSettings struct {
+	// Hub value to use in Helm templates
+	Hub string
+
+	// Tag value to use in Helm templates
+	Tag string
+
+	// Image pull policy to use for deployments. If not specified, the defaults of each deployment will be used.
+	PullPolicy string
+
+	// PullSecret path to a file containing a k8s secret in yaml so test pods can pull from protected registries.
+	PullSecret string
+}
+
+func (s *ImageSettings) PullSecretName() (string, error) {
+	if s.PullSecret == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(s.PullSecret)
+	if err != nil {
+		return "", err
+	}
+	secret := unstructured.Unstructured{Object: map[string]any{}}
+	if err := yaml.Unmarshal(data, secret.Object); err != nil {
+		return "", err
+	}
+	return secret.GetName(), nil
+}
+
+func (s *ImageSettings) PullSecretNameOrFail(t test.Failer) string {
+	t.Helper()
+	out, err := s.PullSecretName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
 
 // Settings is the set of arguments to the test driver.
 type Settings struct {
@@ -60,12 +104,82 @@ type Settings struct {
 	// The label selector that the user has specified.
 	SelectorString string
 
+	// The regex specifying which tests to skip. This follows inverted semantics of golang's
+	// -test.run flag, which only supports positive match. If an entire package is meant to be
+	// excluded, it can be filtered with `go list` and explicitly passing the list of desired
+	// packages. For example: `go test $(go list ./... | grep -v bad-package)`.
+	SkipString  ArrayFlags
+	SkipMatcher *Matcher
+
+	// SkipWorkloadClasses can be used to skip deploying special workload types like TPROXY, VMs, etc.
+	SkipWorkloadClasses ArrayFlags
+
+	// OnlyWorkloadClasses can be used to only deploy specific workload types like TPROXY, VMs, etc.
+	OnlyWorkloadClasses ArrayFlags
+
 	// The label selector, in parsed form.
 	Selector label.Selector
 
 	// EnvironmentFactory allows caller to override the environment creation. If nil, a default is used based
 	// on the known environment names.
 	EnvironmentFactory EnvironmentFactory
+
+	// Deprecated: prefer to use `--istio.test.revisions=<revision name>`.
+	// The revision label on a namespace for injection webhook.
+	// If set to XXX, all the namespaces created with istio-injection=enabled will be replaced with istio.io/rev=XXX.
+	Revision string
+
+	// Skip VM related parts for all the tests.
+	SkipVM bool
+
+	// Skip Delta XDS related parts for all the tests.
+	SkipDelta bool
+
+	// Skip TProxy related parts for all the tests.
+	SkipTProxy bool
+
+	// Compatibility determines whether we should transparently deploy echo workloads attached to each revision
+	// specified in `Revisions` when creating echo instances. Used primarily for compatibility testing between revisions
+	// on different control plane versions.
+	Compatibility bool
+
+	// Revisions maps the Istio revisions that are available to each cluster to their corresponding versions.
+	// This flag must be used with --istio.test.kube.deploy=false with the versions pre-installed.
+	// This flag should be passed in as comma-separated values, such as "rev-a=1.7.3,rev-b=1.8.2,rev-c=1.9.0", and the test framework will
+	// spin up pods pointing to these revisions for each echo instance and skip tests accordingly.
+	// To configure it so that an Istio revision is on the latest version simply list the revision name without the version (i.e. "rev-a,rev-b")
+	// If using this flag with --istio.test.revision, this flag will take precedence.
+	Revisions RevVerMap
+
+	// Image settings
+	Image ImageSettings
+
+	// EchoImage is the app image to be used by echo deployments.
+	EchoImage string
+
+	// CustomGRPCEchoImage if specified will run an extra container in the echo Pods responsible for gRPC ports
+	CustomGRPCEchoImage string
+
+	// MaxDumps is the maximum number of full test dumps that are allowed to occur within a test suite.
+	MaxDumps uint64
+}
+
+func (s Settings) Skip(class string) bool {
+	if s.SkipWorkloadClassesAsSet().Contains(class) {
+		return true
+	}
+	if len(s.OnlyWorkloadClasses) > 0 && !s.OnlyWorkloadClassesAsSet().Contains(class) {
+		return true
+	}
+	return false
+}
+
+func (s *Settings) SkipWorkloadClassesAsSet() sets.Set {
+	return sets.New(s.SkipWorkloadClasses...)
+}
+
+func (s *Settings) OnlyWorkloadClassesAsSet() sets.Set {
+	return sets.New(s.OnlyWorkloadClasses...)
 }
 
 // RunDir is the name of the dir to output, for this particular run.
@@ -91,7 +205,8 @@ func (s *Settings) Clone() *Settings {
 // DefaultSettings returns a default settings instance.
 func DefaultSettings() *Settings {
 	return &Settings{
-		RunID: uuid.New(),
+		RunID:    uuid.New(),
+		MaxDumps: 10,
 	}
 }
 
@@ -105,5 +220,28 @@ func (s *Settings) String() string {
 	result += fmt.Sprintf("BaseDir:           %s\n", s.BaseDir)
 	result += fmt.Sprintf("Selector:          %v\n", s.Selector)
 	result += fmt.Sprintf("FailOnDeprecation: %v\n", s.FailOnDeprecation)
+	result += fmt.Sprintf("CIMode:            %v\n", s.CIMode)
+	result += fmt.Sprintf("Retries:           %v\n", s.Retries)
+	result += fmt.Sprintf("StableNamespaces:  %v\n", s.StableNamespaces)
+	result += fmt.Sprintf("Revision:          %v\n", s.Revision)
+	result += fmt.Sprintf("SkipWorkloads      %v\n", s.SkipWorkloadClasses)
+	result += fmt.Sprintf("Compatibility:     %v\n", s.Compatibility)
+	result += fmt.Sprintf("Revisions:         %v\n", s.Revisions.String())
+	result += fmt.Sprintf("Hub:               %s\n", s.Image.Hub)
+	result += fmt.Sprintf("Tag:               %s\n", s.Image.Tag)
+	result += fmt.Sprintf("PullPolicy:        %s\n", s.Image.PullPolicy)
+	result += fmt.Sprintf("PullSecret:        %s\n", s.Image.PullSecret)
+	result += fmt.Sprintf("MaxDumps:          %d\n", s.MaxDumps)
 	return result
+}
+
+type ArrayFlags []string
+
+func (i *ArrayFlags) String() string {
+	return fmt.Sprint([]string(*i))
+}
+
+func (i *ArrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
 }

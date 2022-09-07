@@ -17,8 +17,9 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -32,10 +33,6 @@ const (
 	AzureDefaultAPIVersion = "2019-08-15"
 	SysVendorPath          = "/sys/class/dmi/id/sys_vendor"
 	MicrosoftIdentifier    = "Microsoft Corporation"
-
-	AzureName     = "azure_name"
-	AzureLocation = "azure_location"
-	AzureVMID     = "azure_vm_id"
 )
 
 var (
@@ -49,16 +46,17 @@ var (
 
 type azureEnv struct {
 	APIVersion      string
-	computeMetadata map[string]interface{}
-	networkMetadata map[string]interface{}
+	prefix          string
+	computeMetadata map[string]any
+	networkMetadata map[string]any
 }
 
 // IsAzure returns whether or not the platform for bootstrapping is Azure
 // Checks the system vendor file (similar to https://github.com/banzaicloud/satellite/blob/master/providers/azure.go)
 func IsAzure() bool {
-	sysVendor, err := ioutil.ReadFile(SysVendorPath)
+	sysVendor, err := os.ReadFile(SysVendorPath)
 	if err != nil {
-		log.Warnf("Error reading sys_vendor in Azure platform detection: %v", err)
+		log.Debugf("Error reading sys_vendor in Azure platform detection: %v", err)
 	}
 	return strings.Contains(string(sysVendor), MicrosoftIdentifier)
 }
@@ -68,7 +66,7 @@ func IsAzure() bool {
 func (e *azureEnv) updateAPIVersion() {
 	bodyJSON := stringToJSON(azureAPIVersionsFn())
 	if newestVersions, ok := bodyJSON["newest-versions"]; ok {
-		for _, version := range newestVersions.([]interface{}) {
+		for _, version := range newestVersions.([]any) {
 			if strings.Compare(version.(string), e.APIVersion) > 0 {
 				e.APIVersion = version.(string)
 			}
@@ -77,21 +75,32 @@ func (e *azureEnv) updateAPIVersion() {
 }
 
 // NewAzure returns a platform environment for Azure
+// Default prefix is azure_
 func NewAzure() Environment {
+	return NewAzureWithPrefix("azure_")
+}
+
+func NewAzureWithPrefix(prefix string) Environment {
 	e := &azureEnv{APIVersion: AzureDefaultAPIVersion}
 	e.updateAPIVersion()
 	e.parseMetadata(e.azureMetadata())
+	e.prefix = prefix
 	return e
+}
+
+// Returns the name with the prefix attached
+func (e *azureEnv) prefixName(name string) string {
+	return e.prefix + name
 }
 
 // Retrieves Azure instance metadata response body stores it in the Azure environment
 func (e *azureEnv) parseMetadata(metadata string) {
 	bodyJSON := stringToJSON(metadata)
 	if computeMetadata, ok := bodyJSON["compute"]; ok {
-		e.computeMetadata = computeMetadata.(map[string]interface{})
+		e.computeMetadata = computeMetadata.(map[string]any)
 	}
 	if networkMetadata, ok := bodyJSON["network"]; ok {
-		e.networkMetadata = networkMetadata.(map[string]interface{})
+		e.networkMetadata = networkMetadata.(map[string]any)
 	}
 }
 
@@ -115,7 +124,7 @@ func metadataRequest(query string) string {
 		log.Warnf("HTTP request unsuccessful with status: %v", response.Status)
 	}
 	defer response.Body.Close()
-	body, err := ioutil.ReadAll(response.Body)
+	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		log.Warnf("Could not read response body: %v", err)
 		return ""
@@ -123,8 +132,8 @@ func metadataRequest(query string) string {
 	return string(body)
 }
 
-func stringToJSON(s string) map[string]interface{} {
-	var stringJSON map[string]interface{}
+func stringToJSON(s string) map[string]any {
+	var stringJSON map[string]any
 	if err := json.Unmarshal([]byte(s), &stringJSON); err != nil {
 		log.Warnf("Could not unmarshal response: %v:", err)
 	}
@@ -135,13 +144,13 @@ func stringToJSON(s string) map[string]interface{} {
 func (e *azureEnv) Metadata() map[string]string {
 	md := map[string]string{}
 	if an := e.azureName(); an != "" {
-		md[AzureName] = an
+		md[e.prefixName("name")] = an
 	}
 	if al := e.azureLocation(); al != "" {
-		md[AzureLocation] = al
+		md[e.prefixName("location")] = al
 	}
 	if aid := e.azureVMID(); aid != "" {
-		md[AzureVMID] = aid
+		md[e.prefixName("vmId")] = aid
 	}
 	for k, v := range e.azureTags() {
 		md[k] = v
@@ -176,13 +185,34 @@ func (e *azureEnv) azureName() string {
 	return ""
 }
 
-// Returns the Azure tags prefixed by "azure_"
+// Returns the Azure tags
 func (e *azureEnv) azureTags() map[string]string {
 	tags := map[string]string{}
+	if tl, ok := e.computeMetadata["tagsList"]; ok {
+		tlByte, err := json.Marshal(tl)
+		if err != nil {
+			return tags
+		}
+		var atl []azureTag
+		err = json.Unmarshal(tlByte, &atl)
+		if err != nil {
+			return tags
+		}
+		for _, tag := range atl {
+			tags[e.prefixName(tag.Name)] = tag.Value
+		}
+		return tags
+	}
+	// fall back to tags if tagsList is not available
 	if at, ok := e.computeMetadata["tags"]; ok && len(at.(string)) > 0 {
 		for _, tag := range strings.Split(at.(string), ";") {
-			kv := strings.Split(tag, ":")
-			tags["azure_"+kv[0]] = kv[1]
+			kv := strings.SplitN(tag, ":", 2)
+			switch len(kv) {
+			case 2:
+				tags[e.prefixName(kv[0])] = kv[1]
+			case 1:
+				tags[e.prefixName(kv[0])] = ""
+			}
 		}
 	}
 	return tags
@@ -207,4 +237,10 @@ func (e *azureEnv) azureVMID() string {
 		return aid.(string)
 	}
 	return ""
+}
+
+// used for simpler JSON parsing
+type azureTag struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }

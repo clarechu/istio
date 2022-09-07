@@ -26,10 +26,16 @@ import (
 func TestKind(t *testing.T) {
 	obj := crd.IstioKind{}
 
-	spec := map[string]interface{}{"a": "b"}
+	spec := map[string]any{"a": "b"}
 	obj.Spec = spec
 	if got := obj.GetSpec(); !reflect.DeepEqual(spec, got) {
 		t.Errorf("GetSpec() => got %v, want %v", got, spec)
+	}
+
+	status := map[string]any{"yo": "lit"}
+	obj.Status = status
+	if got := obj.GetStatus(); !reflect.DeepEqual(status, got) {
+		t.Errorf("GetStatus() => got %v, want %v", got, status)
 	}
 
 	meta := meta_v1.ObjectMeta{Name: "test"}

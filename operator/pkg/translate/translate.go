@@ -16,17 +16,22 @@
 package translate
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
 
-	"github.com/ghodss/yaml"
-	"github.com/gogo/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/api/operator/v1alpha1"
+	"istio.io/istio/operator/pkg/apis/istio"
 	iopv1alpha1 "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/object"
@@ -46,13 +51,13 @@ const (
 	HelmValuesHubSubpath = "hub"
 	// HelmValuesTagSubpath is the subpath from the component root to the tag parameter.
 	HelmValuesTagSubpath = "tag"
-	// devDbg generates lots of output useful in development.
-	devDbg = false
+	// default ingress gateway name
+	defaultIngressGWName = "istio-ingressgateway"
+	// default egress gateway name
+	defaultEgressGWName = "istio-egressgateway"
 )
 
-var (
-	scope = log.RegisterScope("translator", "API translator", 0)
-)
+var scope = log.RegisterScope("translator", "API translator", 0)
 
 // Translator is a set of mappings to translate between API paths, charts, values.yaml and k8s paths.
 type Translator struct {
@@ -68,6 +73,9 @@ type Translator struct {
 	GlobalNamespaces map[name.ComponentName]string `yaml:"globalNamespaces"`
 	// ComponentMaps is a set of mappings for each Istio component.
 	ComponentMaps map[name.ComponentName]*ComponentMaps `yaml:"componentMaps"`
+	// checkedDeprecatedAutoscalingFields represents whether the translator already checked the deprecated fields already.
+	// Different components do not need to rerun the translation logic
+	checkedDeprecatedAutoscalingFields bool
 }
 
 // ComponentMaps is a set of mappings for an Istio component.
@@ -87,13 +95,13 @@ type ComponentMaps struct {
 }
 
 // TranslationFunc maps a yamlStr API path into a YAML values tree.
-type TranslationFunc func(t *Translation, root map[string]interface{}, valuesPath string, value interface{}) error
+type TranslationFunc func(t *Translation, root map[string]any, valuesPath string, value any) error
 
 // Translation is a mapping to an output path using a translation function.
 type Translation struct {
 	// OutPath defines the position in the yaml file
-	OutPath         string          `yaml:"outPath"`
-	translationFunc TranslationFunc `yaml:"TranslationFunc,omitempty"`
+	OutPath         string `yaml:"outPath"`
+	translationFunc TranslationFunc
 }
 
 // NewTranslator creates a new translator for minorVersion and returns a ptr to it.
@@ -101,11 +109,10 @@ func NewTranslator() *Translator {
 	t := &Translator{
 		Version: oversion.OperatorBinaryVersion.MinorVersion,
 		APIMapping: map[string]*Translation{
-			"Hub":         {OutPath: "global.hub"},
-			"Tag":         {OutPath: "global.tag"},
-			"K8SDefaults": {OutPath: "global.resources"},
-			"Revision":    {OutPath: "revision"},
-			"MeshConfig":  {OutPath: "meshConfig"},
+			"hub":        {OutPath: "global.hub"},
+			"tag":        {OutPath: "global.tag"},
+			"revision":   {OutPath: "revision"},
+			"meshConfig": {OutPath: "meshConfig"},
 		},
 		GlobalNamespaces: map[name.ComponentName]string{
 			name.PilotComponentName: "istioNamespace",
@@ -149,13 +156,6 @@ func NewTranslator() *Translator {
 				ToHelmValuesTreeRoot: "global",
 				SkipReverseTranslate: true,
 			},
-			name.ComponentName("Istiocoredns"): {
-				ResourceType:         "Deployment",
-				ResourceName:         "istiocoredns",
-				ContainerName:        "coredns",
-				HelmSubdir:           "istiocoredns",
-				ToHelmValuesTreeRoot: "istiocoredns",
-			},
 		},
 		// nolint: lll
 		KubernetesMapping: map[string]*Translation{
@@ -174,6 +174,7 @@ func NewTranslator() *Translator {
 			"Components.{{.ComponentName}}.K8S.Tolerations":         {OutPath: "[{{.ResourceType}}:{{.ResourceName}}].spec.template.spec.tolerations"},
 			"Components.{{.ComponentName}}.K8S.ServiceAnnotations":  {OutPath: "[Service:{{.ResourceName}}].metadata.annotations"},
 			"Components.{{.ComponentName}}.K8S.Service":             {OutPath: "[Service:{{.ResourceName}}].spec"},
+			"Components.{{.ComponentName}}.K8S.SecurityContext":     {OutPath: "[{{.ResourceType}}:{{.ResourceName}}].spec.template.spec.securityContext"},
 		},
 	}
 	return t
@@ -181,47 +182,44 @@ func NewTranslator() *Translator {
 
 // OverlayK8sSettings overlays k8s settings from iop over the manifest objects, based on t's translation mappings.
 func (t *Translator) OverlayK8sSettings(yml string, iop *v1alpha1.IstioOperatorSpec, componentName name.ComponentName,
-	resourceName string, addonName string, index int) (string, error) {
-	objects, err := object.ParseK8sObjectsFromYAMLManifest(yml)
-	if err != nil {
-		return "", err
-	}
-	scope.Debugf("Manifest contains the following objects:")
-	for _, o := range objects {
-		scope.Debugf("%s", o.HashNameKind())
-	}
+	resourceName string, index int) (string, error,
+) {
 	// om is a map of kind:name string to Object ptr.
-	om := objects.ToNameKindMap()
+	// This is lazy loaded to avoid parsing when there are no overlays
+	var om map[string]*object.K8sObject
+	var objects object.K8sObjects
+
 	for inPath, v := range t.KubernetesMapping {
 		inPath, err := renderFeatureComponentPathTemplate(inPath, componentName)
 		if err != nil {
 			return "", err
 		}
-		inPath = strings.Replace(inPath, "gressGateways.", "gressGateways."+fmt.Sprint(index)+".", 1)
-		scope.Debugf("Checking for path %s in IstioOperatorSpec", inPath)
+		renderedInPath := strings.Replace(inPath, "gressGateways.", "gressGateways."+fmt.Sprint(index)+".", 1)
+		scope.Debugf("Checking for path %s in IstioOperatorSpec", renderedInPath)
 
-		m, found, err := getK8SSpecFromIOP(iop, componentName, inPath, addonName)
+		m, found, err := tpath.GetFromStructPath(iop, renderedInPath)
 		if err != nil {
 			return "", err
 		}
 		if !found {
-			scope.Debugf("path %s not found in IstioOperatorSpec, skip mapping.", inPath)
+			scope.Debugf("path %s not found in IstioOperatorSpec, skip mapping.", renderedInPath)
 			continue
 		}
 		if mstr, ok := m.(string); ok && mstr == "" {
-			scope.Debugf("path %s is empty string, skip mapping.", inPath)
+			scope.Debugf("path %s is empty string, skip mapping.", renderedInPath)
 			continue
 		}
 		// Zero int values are due to proto3 compiling to scalars rather than ptrs. Skip these because values of 0 are
 		// the default in destination fields and need not be set explicitly.
 		if mint, ok := util.ToIntValue(m); ok && mint == 0 {
-			scope.Debugf("path %s is int 0, skip mapping.", inPath)
+			scope.Debugf("path %s is int 0, skip mapping.", renderedInPath)
 			continue
 		}
 		if componentName == name.IstioBaseComponentName {
 			return "", fmt.Errorf("base component can only have k8s.overlays, not other K8s settings")
 		}
-		outPath, err := t.renderResourceComponentPathTemplate(v.OutPath, componentName, resourceName, addonName, iop.Revision)
+		inPathParts := strings.Split(inPath, ".")
+		outPath, err := t.renderResourceComponentPathTemplate(v.OutPath, componentName, resourceName, iop.Revision)
 		if err != nil {
 			return "", err
 		}
@@ -232,6 +230,22 @@ func (t *Translator) OverlayK8sSettings(yml string, iop *v1alpha1.IstioOperatorS
 		if !util.IsKVPathElement(pe) {
 			return "", fmt.Errorf("path %s has an unexpected first element %s in OverlayK8sSettings", path, pe)
 		}
+
+		// We need to apply overlay, lazy load om
+		if om == nil {
+			objects, err = object.ParseK8sObjectsFromYAMLManifest(yml)
+			if err != nil {
+				return "", err
+			}
+			if scope.DebugEnabled() {
+				scope.Debugf("Manifest contains the following objects:")
+				for _, o := range objects {
+					scope.Debugf("%s", o.HashNameKind())
+				}
+			}
+			om = objects.ToNameKindMap()
+		}
+
 		// After brackets are removed, the remaining "kind:name" is the same format as the keys in om.
 		pe, _ = util.RemoveBrackets(pe)
 		oo, ok := om[pe]
@@ -241,29 +255,279 @@ func (t *Translator) OverlayK8sSettings(yml string, iop *v1alpha1.IstioOperatorS
 			continue
 		}
 
+		// When autoscale is enabled we should not overwrite replica count, consider following scenario:
+		// 0. Set values.pilot.autoscaleEnabled=true, components.pilot.k8s.replicaCount=1
+		// 1. In istio operator it "caches" the generated manifests (with istiod.replicas=1)
+		// 2. HPA autoscales our pilot replicas to 3
+		// 3. Set values.pilot.autoscaleEnabled=false
+		// 4. The generated manifests (with istiod.replicas=1) is same as istio operator "cache",
+		//    the deployment will not get updated unless istio operator is restarted.
+		if inPathParts[len(inPathParts)-1] == "ReplicaCount" {
+			if skipReplicaCountWithAutoscaleEnabled(iop, componentName) {
+				continue
+			}
+		}
+
 		// strategic merge overlay m to the base object oo
 		mergedObj, err := MergeK8sObject(oo, m, path[1:])
 		if err != nil {
 			return "", err
 		}
+
+		// Apply the workaround for merging service ports with (port,protocol) composite
+		// keys instead of just the merging by port.
+		if inPathParts[len(inPathParts)-1] == "Service" {
+			if msvc, ok := m.(*v1alpha1.ServiceSpec); ok {
+				mergedObj, err = t.fixMergedObjectWithCustomServicePortOverlay(oo, msvc, mergedObj)
+				if err != nil {
+					return "", err
+				}
+			}
+		}
+
 		// Update the original object in objects slice, since the output should be ordered.
 		*(om[pe]) = *mergedObj
 	}
 
-	return objects.YAMLManifest()
+	if objects != nil {
+		return objects.YAMLManifest()
+	}
+	return yml, nil
+}
+
+var componentToAutoScaleEnabledPath = map[name.ComponentName]string{
+	name.PilotComponentName:   "pilot.autoscaleEnabled",
+	name.IngressComponentName: "gateways.istio-ingressgateway.autoscaleEnabled",
+	name.EgressComponentName:  "gateways.istio-egressgateway.autoscaleEnabled",
+}
+
+// checkDeprecatedHPAFields is a helper function to check for the deprecated fields usage in HorizontalPodAutoscalerSpec
+func checkDeprecatedHPAFields(iop *v1alpha1.IstioOperatorSpec) bool {
+	hpaSpecs := []*v1alpha1.HorizontalPodAutoscalerSpec{}
+	if iop.GetComponents().GetPilot().GetK8S().GetHpaSpec() != nil {
+		hpaSpecs = append(hpaSpecs, iop.GetComponents().GetPilot().GetK8S().GetHpaSpec())
+	}
+	for _, gwSpec := range iop.GetComponents().GetIngressGateways() {
+		if gwSpec.Name == defaultIngressGWName && gwSpec.GetK8S().GetHpaSpec() != nil {
+			hpaSpecs = append(hpaSpecs, gwSpec.GetK8S().GetHpaSpec())
+		}
+	}
+	for _, gwSpec := range iop.GetComponents().GetEgressGateways() {
+		if gwSpec.Name == defaultEgressGWName && gwSpec.GetK8S().GetHpaSpec() != nil {
+			hpaSpecs = append(hpaSpecs, gwSpec.GetK8S().GetHpaSpec())
+		}
+	}
+	for _, hpaSpec := range hpaSpecs {
+		if hpaSpec.GetMetrics() != nil {
+			for _, me := range hpaSpec.GetMetrics() {
+				// nolint: staticcheck
+				if me.GetObject().GetMetricName() != "" || me.GetObject().GetAverageValue() != nil ||
+					// nolint: staticcheck
+					me.GetObject().GetSelector() != nil || me.GetObject().GetTargetValue() != nil {
+					return true
+				}
+				// nolint: staticcheck
+				if me.GetPods().GetMetricName() != "" || me.GetPods().GetSelector() != nil ||
+					// nolint: staticcheck
+					me.GetPods().GetTargetAverageValue() != nil {
+					return true
+				}
+				// nolint: staticcheck
+				if me.GetResource().GetTargetAverageValue() != nil || me.GetResource().GetTargetAverageUtilization() != 0 {
+					return true
+				}
+				// nolint: staticcheck
+				if me.GetExternal().GetTargetAverageValue() != nil || me.GetExternal().GetTargetValue() != nil ||
+					// nolint: staticcheck
+					me.GetExternal().GetMetricName() != "" || me.GetExternal().GetMetricSelector() != nil {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// translateDeprecatedAutoscalingFields checks for existence of deprecated HPA fields, if found, set values.global.autoscalingv2API to false
+// It only needs to run the logic for the first component because we are setting the values.global field instead of per component ones.
+// we do not set per component values because we may want to avoid mixture of v2 and v2beta1 autoscaling templates usage
+func (t *Translator) translateDeprecatedAutoscalingFields(values map[string]any, iop *v1alpha1.IstioOperatorSpec) error {
+	if t.checkedDeprecatedAutoscalingFields || checkDeprecatedHPAFields(iop) {
+		path := util.PathFromString("global.autoscalingv2API")
+		if err := tpath.WriteNode(values, path, false); err != nil {
+			return fmt.Errorf("failed to set autoscalingv2API path: %v", err)
+		}
+		t.checkedDeprecatedAutoscalingFields = true
+	}
+	return nil
+}
+
+func skipReplicaCountWithAutoscaleEnabled(iop *v1alpha1.IstioOperatorSpec, componentName name.ComponentName) bool {
+	values := iop.GetValues().AsMap()
+	path, ok := componentToAutoScaleEnabledPath[componentName]
+	if !ok {
+		return false
+	}
+
+	enabledVal, found, err := tpath.GetFromStructPath(values, path)
+	if err != nil || !found {
+		return false
+	}
+
+	enabled, ok := enabledVal.(bool)
+	return ok && enabled
+}
+
+func (t *Translator) fixMergedObjectWithCustomServicePortOverlay(oo *object.K8sObject,
+	msvc *v1alpha1.ServiceSpec, mergedObj *object.K8sObject,
+) (*object.K8sObject, error) {
+	var basePorts []*v1.ServicePort
+	bps, _, err := unstructured.NestedSlice(oo.Unstructured(), "spec", "ports")
+	if err != nil {
+		return nil, err
+	}
+	bby, err := json.Marshal(bps)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal(bby, &basePorts); err != nil {
+		return nil, err
+	}
+	overlayPorts := make([]*v1.ServicePort, 0, len(msvc.GetPorts()))
+	for _, p := range msvc.GetPorts() {
+		var pr v1.Protocol
+		switch strings.ToLower(p.GetProtocol()) {
+		case "udp":
+			pr = v1.ProtocolUDP
+		default:
+			pr = v1.ProtocolTCP
+		}
+		port := &v1.ServicePort{
+			Name:     p.GetName(),
+			Protocol: pr,
+			Port:     p.GetPort(),
+			NodePort: p.GetNodePort(),
+		}
+		if p.TargetPort != nil {
+			port.TargetPort = p.TargetPort.ToKubernetes()
+		}
+		overlayPorts = append(overlayPorts, port)
+	}
+	mergedPorts := strategicMergePorts(basePorts, overlayPorts)
+	mpby, err := json.Marshal(mergedPorts)
+	if err != nil {
+		return nil, err
+	}
+	var mergedPortSlice []any
+	if err = json.Unmarshal(mpby, &mergedPortSlice); err != nil {
+		return nil, err
+	}
+	if err = unstructured.SetNestedSlice(mergedObj.Unstructured(), mergedPortSlice, "spec", "ports"); err != nil {
+		return nil, err
+	}
+	// Now fix the merged object
+	mjsonby, err := json.Marshal(mergedObj.Unstructured())
+	if err != nil {
+		return nil, err
+	}
+	if mergedObj, err = object.ParseJSONToK8sObject(mjsonby); err != nil {
+		return nil, err
+	}
+	return mergedObj, nil
+}
+
+type portWithProtocol struct {
+	port     int32
+	protocol v1.Protocol
+}
+
+func portIndexOf(element portWithProtocol, data []portWithProtocol) int {
+	for k, v := range data {
+		if element == v {
+			return k
+		}
+	}
+	return len(data)
+}
+
+// strategicMergePorts merges the base with the given overlay considering both
+// port and the protocol as the merge keys. This is a workaround for the strategic
+// merge patch in Kubernetes which only uses port number as the key. This causes
+// an issue when we have to expose the same port with different protocols.
+// See - https://github.com/kubernetes/kubernetes/issues/103544
+// TODO(su225): Remove this once the above issue is addressed in Kubernetes
+func strategicMergePorts(base, overlay []*v1.ServicePort) []*v1.ServicePort {
+	// We want to keep the original port order with base first and then the newly
+	// added ports through the overlay. This is because there are some cases where
+	// port order actually matters. For instance, some cloud load balancers use the
+	// first port for health-checking (in Istio it is 15021). So we must keep maintain
+	// it in order not to break the users
+	// See - https://github.com/istio/istio/issues/12503 for more information
+	//
+	// Or changing port order might generate weird diffs while upgrading or changing
+	// IstioOperator spec. It is annoying. So better maintain original order while
+	// appending newly added ports through overlay.
+	portPriority := make([]portWithProtocol, 0, len(base)+len(overlay))
+	for _, p := range base {
+		if p.Protocol == "" {
+			p.Protocol = v1.ProtocolTCP
+		}
+		portPriority = append(portPriority, portWithProtocol{port: p.Port, protocol: p.Protocol})
+	}
+	for _, p := range overlay {
+		if p.Protocol == "" {
+			p.Protocol = v1.ProtocolTCP
+		}
+		portPriority = append(portPriority, portWithProtocol{port: p.Port, protocol: p.Protocol})
+	}
+	sortFn := func(ps []*v1.ServicePort) func(int, int) bool {
+		return func(i, j int) bool {
+			pi := portIndexOf(portWithProtocol{port: ps[i].Port, protocol: ps[i].Protocol}, portPriority)
+			pj := portIndexOf(portWithProtocol{port: ps[j].Port, protocol: ps[j].Protocol}, portPriority)
+			return pi < pj
+		}
+	}
+	if overlay == nil {
+		sort.Slice(base, sortFn(base))
+		return base
+	}
+	if base == nil {
+		sort.Slice(overlay, sortFn(overlay))
+		return overlay
+	}
+	// first add the base and then replace appropriate
+	// keys with the items in the overlay list
+	merged := make(map[portWithProtocol]*v1.ServicePort)
+	for _, p := range base {
+		key := portWithProtocol{port: p.Port, protocol: p.Protocol}
+		merged[key] = p
+	}
+	for _, p := range overlay {
+		key := portWithProtocol{port: p.Port, protocol: p.Protocol}
+		merged[key] = p
+	}
+	res := make([]*v1.ServicePort, 0, len(merged))
+	for _, pv := range merged {
+		res = append(res, pv)
+	}
+	sort.Slice(res, sortFn(res))
+	return res
 }
 
 // ProtoToValues traverses the supplied IstioOperatorSpec and returns a values.yaml translation from it.
 func (t *Translator) ProtoToValues(ii *v1alpha1.IstioOperatorSpec) (string, error) {
-	root := make(map[string]interface{})
-
-	errs := t.ProtoToHelmValues(ii, root, nil)
-	if len(errs) != 0 {
-		return "", errs.ToError()
+	root, err := t.ProtoToHelmValues2(ii)
+	if err != nil {
+		return "", err
 	}
 
 	// Special additional handling not covered by simple translation rules.
 	if err := t.setComponentProperties(root, ii); err != nil {
+		return "", err
+	}
+
+	// Special handling of the settings of legacy fields in autoscaling/v2beta1
+	if err := t.translateDeprecatedAutoscalingFields(root, ii); err != nil {
 		return "", err
 	}
 
@@ -274,15 +538,15 @@ func (t *Translator) ProtoToValues(ii *v1alpha1.IstioOperatorSpec) (string, erro
 
 	y, err := yaml.Marshal(root)
 	if err != nil {
-		return "", util.AppendErr(errs, err).ToError()
+		return "", err
 	}
 
-	return string(y), errs.ToError()
+	return string(y), nil
 }
 
 // TranslateHelmValues creates a Helm values.yaml config data tree from iop using the given translator.
-func (t *Translator) TranslateHelmValues(iop *v1alpha1.IstioOperatorSpec, componentsSpec interface{}, componentName name.ComponentName) (string, error) {
-	globalVals, globalUnvalidatedVals, apiVals := make(map[string]interface{}), make(map[string]interface{}), make(map[string]interface{})
+func (t *Translator) TranslateHelmValues(iop *v1alpha1.IstioOperatorSpec, componentsSpec any, componentName name.ComponentName) (string, error) {
+	apiVals := make(map[string]any)
 
 	// First, translate the IstioOperator API to helm Values.
 	apiValsStr, err := t.ProtoToValues(iop)
@@ -294,23 +558,17 @@ func (t *Translator) TranslateHelmValues(iop *v1alpha1.IstioOperatorSpec, compon
 		return "", err
 	}
 
-	if devDbg {
-		scope.Infof("Values translated from IstioOperator API:\n%s", apiValsStr)
-	}
+	scope.Debugf("Values translated from IstioOperator API:\n%s", apiValsStr)
 
 	// Add global overlay from IstioOperatorSpec.Values/UnvalidatedValues.
-	_, err = tpath.SetFromPath(iop, "Values", &globalVals)
-	if err != nil {
-		return "", err
+	globalVals := iop.GetValues().AsMap()
+	globalUnvalidatedVals := iop.GetUnvalidatedValues().AsMap()
+
+	if scope.DebugEnabled() {
+		scope.Debugf("Values from IstioOperatorSpec.Values:\n%s", util.ToYAML(globalVals))
+		scope.Debugf("Values from IstioOperatorSpec.UnvalidatedValues:\n%s", util.ToYAML(globalUnvalidatedVals))
 	}
-	_, err = tpath.SetFromPath(iop, "UnvalidatedValues", &globalUnvalidatedVals)
-	if err != nil {
-		return "", err
-	}
-	if devDbg {
-		scope.Infof("Values from IstioOperatorSpec.Values:\n%s", util.ToYAML(globalVals))
-		scope.Infof("Values from IstioOperatorSpec.UnvalidatedValues:\n%s", util.ToYAML(globalUnvalidatedVals))
-	}
+
 	mergedVals, err := util.OverlayTrees(apiVals, globalVals)
 	if err != nil {
 		return "", err
@@ -335,11 +593,11 @@ func (t *Translator) TranslateHelmValues(iop *v1alpha1.IstioOperatorSpec, compon
 
 // applyGatewayTranslations writes gateway name gwName at the appropriate values path in iop and maps k8s.service.ports
 // to values. It returns the resulting YAML tree.
-func applyGatewayTranslations(iop []byte, componentName name.ComponentName, componentSpec interface{}) ([]byte, error) {
+func applyGatewayTranslations(iop []byte, componentName name.ComponentName, componentSpec any) ([]byte, error) {
 	if !componentName.IsGateway() {
 		return iop, nil
 	}
-	iopt := make(map[string]interface{})
+	iopt := make(map[string]any)
 	if err := yaml.Unmarshal(iop, &iopt); err != nil {
 		return nil, err
 	}
@@ -351,7 +609,7 @@ func applyGatewayTranslations(iop []byte, componentName name.ComponentName, comp
 		if len(gwSpec.Label) != 0 {
 			setYAMLNodeByMapPath(iopt, util.PathFromString("gateways.istio-ingressgateway.labels"), gwSpec.Label)
 		}
-		if k8s != nil && k8s.Service != nil {
+		if k8s != nil && k8s.Service != nil && k8s.Service.Ports != nil {
 			setYAMLNodeByMapPath(iopt, util.PathFromString("gateways.istio-ingressgateway.ports"), k8s.Service.Ports)
 		}
 	case name.EgressComponentName:
@@ -359,7 +617,7 @@ func applyGatewayTranslations(iop []byte, componentName name.ComponentName, comp
 		if len(gwSpec.Label) != 0 {
 			setYAMLNodeByMapPath(iopt, util.PathFromString("gateways.istio-egressgateway.labels"), gwSpec.Label)
 		}
-		if k8s != nil && k8s.Service != nil {
+		if k8s != nil && k8s.Service != nil && k8s.Service.Ports != nil {
 			setYAMLNodeByMapPath(iopt, util.PathFromString("gateways.istio-egressgateway.ports"), k8s.Service.Ports)
 		}
 	}
@@ -368,13 +626,13 @@ func applyGatewayTranslations(iop []byte, componentName name.ComponentName, comp
 
 // setYAMLNodeByMapPath sets the value at the given path to val in treeNode. The path cannot traverse lists and
 // treeNode must be a YAML tree unmarshaled into a plain map data structure.
-func setYAMLNodeByMapPath(treeNode interface{}, path util.Path, val interface{}) {
+func setYAMLNodeByMapPath(treeNode any, path util.Path, val any) {
 	if len(path) == 0 || treeNode == nil {
 		return
 	}
 	pe := path[0]
 	switch nt := treeNode.(type) {
-	case map[interface{}]interface{}:
+	case map[any]any:
 		if len(path) == 1 {
 			nt[pe] = val
 			return
@@ -383,7 +641,7 @@ func setYAMLNodeByMapPath(treeNode interface{}, path util.Path, val interface{})
 			return
 		}
 		setYAMLNodeByMapPath(nt[pe], path[1:], val)
-	case map[string]interface{}:
+	case map[string]any:
 		if len(path) == 1 {
 			nt[pe] = val
 			return
@@ -403,13 +661,28 @@ func (t *Translator) ComponentMap(cns string) *ComponentMaps {
 	return t.ComponentMaps[cn]
 }
 
+func (t *Translator) ProtoToHelmValues2(ii *v1alpha1.IstioOperatorSpec) (map[string]any, error) {
+	by, err := json.Marshal(ii)
+	if err != nil {
+		return nil, err
+	}
+	res := map[string]any{}
+	err = json.Unmarshal(by, &res)
+	if err != nil {
+		return nil, err
+	}
+	r2 := map[string]any{}
+	errs := t.ProtoToHelmValues(res, r2, nil)
+	return r2, errs.ToError()
+}
+
 // ProtoToHelmValues function below is used by third party for integrations and has to be public
 
 // ProtoToHelmValues takes an interface which must be a struct ptr and recursively iterates through all its fields.
 // For each leaf, if looks for a mapping from the struct data path to the corresponding YAML path and if one is
 // found, it calls the associated mapping function if one is defined to populate the values YAML path.
 // If no mapping function is defined, it uses the default mapping function.
-func (t *Translator) ProtoToHelmValues(node interface{}, root map[string]interface{}, path util.Path) (errs util.Errors) {
+func (t *Translator) ProtoToHelmValues(node any, root map[string]any, path util.Path) (errs util.Errors) {
 	scope.Debugf("ProtoToHelmValues with path %s, %v (%T)", path, node, node)
 	if util.IsValueNil(node) {
 		return nil
@@ -429,6 +702,9 @@ func (t *Translator) ProtoToHelmValues(node interface{}, root map[string]interfa
 			fieldValue := vv.Field(i)
 			scope.Debugf("Checking field %s", fieldName)
 			if a, ok := vv.Type().Field(i).Tag.Lookup("json"); ok && a == "-" {
+				continue
+			}
+			if !fieldValue.CanInterface() {
 				continue
 			}
 			errs = util.AppendErrs(errs, t.ProtoToHelmValues(fieldValue.Interface(), root, append(path, fieldName)))
@@ -457,7 +733,7 @@ func (t *Translator) ProtoToHelmValues(node interface{}, root map[string]interfa
 
 // setComponentProperties translates properties (e.g., enablement and namespace) of each component
 // in the baseYAML values tree, based on feature/component inheritance relationship.
-func (t *Translator) setComponentProperties(root map[string]interface{}, iop *v1alpha1.IstioOperatorSpec) error {
+func (t *Translator) setComponentProperties(root map[string]any, iop *v1alpha1.IstioOperatorSpec) error {
 	var keys []string
 	for k := range t.ComponentMaps {
 		if k != name.IngressComponentName && k != name.EgressComponentName {
@@ -502,9 +778,9 @@ func (t *Translator) setComponentProperties(root map[string]interface{}, iop *v1
 		}
 
 		tag, found, _ := tpath.GetFromStructPath(iop, "Components."+string(cn)+".Tag")
-		tagStr, ok := tag.(string)
-		if found && !(ok && tagStr == "") {
-			if err := tpath.WriteNode(root, util.PathFromString(c.ToHelmValuesTreeRoot+"."+HelmValuesTagSubpath), tag); err != nil {
+		tagv, ok := tag.(*structpb.Value)
+		if found && !(ok && util.ValueString(tagv) == "") {
+			if err := tpath.WriteNode(root, util.PathFromString(c.ToHelmValuesTreeRoot+"."+HelmValuesTagSubpath), util.ValueString(tagv)); err != nil {
 				return err
 			}
 		}
@@ -533,10 +809,10 @@ func (t *Translator) IsComponentEnabled(cn name.ComponentName, iop *v1alpha1.Ist
 }
 
 // insertLeaf inserts a leaf with value into root at path, which is first mapped using t.APIMapping.
-func (t *Translator) insertLeaf(root map[string]interface{}, path util.Path, value reflect.Value) (errs util.Errors) {
+func (t *Translator) insertLeaf(root map[string]any, path util.Path, value reflect.Value) (errs util.Errors) {
 	// Must be a scalar leaf. See if we have a mapping.
 	valuesPath, m := getValuesPathMapping(t.APIMapping, path)
-	var v interface{}
+	var v any
 	if value.Kind() == reflect.Ptr {
 		v = value.Elem().Interface()
 	} else {
@@ -595,14 +871,12 @@ func renderFeatureComponentPathTemplate(tmpl string, componentName name.Componen
 // renderResourceComponentPathTemplate renders a template of the form <path>{{.ResourceName}}<path>{{.ContainerName}}<path> with
 // the supplied parameters.
 func (t *Translator) renderResourceComponentPathTemplate(tmpl string, componentName name.ComponentName,
-	resourceName, addonName, revision string) (string, error) {
+	resourceName, revision string,
+) (string, error) {
 	cn := string(componentName)
-	if componentName == name.AddonComponentName {
-		cn = addonName
-	}
 	cmp := t.ComponentMap(cn)
 	if cmp == nil {
-		return "", fmt.Errorf("component: %s does not exist in the componentMap", addonName)
+		return "", fmt.Errorf("component: %s does not exist in the componentMap", cn)
 	}
 	if resourceName == "" {
 		resourceName = cmp.ResourceName
@@ -623,33 +897,8 @@ func (t *Translator) renderResourceComponentPathTemplate(tmpl string, componentN
 	return util.RenderTemplate(tmpl, ts)
 }
 
-// getK8SSpecFromIOP is helper function to get k8s spec node from iop using inPath
-// 1. if component is not an addonComponent, get the node directly from iop using the inPath.
-// 2. otherwise convert the inPath and point the root to the entry of addonComponents map with addonName as key.
-// e.x: original inPath: "Components.AddonComponents.K8S.ReplicaCount" and root: iop would be converted to
-// new inPath: "K8S.ReplicaCount" and root: "iop.AddonComponents.addonName"
-func getK8SSpecFromIOP(iop *v1alpha1.IstioOperatorSpec, componentName name.ComponentName, inPath string,
-	addonName string) (m interface{}, found bool, err error) {
-	if componentName != name.AddonComponentName {
-		return tpath.GetFromStructPath(iop, inPath)
-	}
-	inPath = strings.Replace(inPath, "Components.AddonComponents.", "", 1)
-	scope.Debugf("Checking for path %s in K8S Spec of AddonComponents: %s", inPath, addonName)
-	addonMaps := iop.AddonComponents
-	if extSpec, ok := addonMaps[addonName]; ok {
-		m, found, err = tpath.GetFromStructPath(extSpec, inPath)
-		if err != nil {
-			return nil, false, err
-		}
-	} else {
-		scope.Debugf("path %s not found in AddonComponents.%s, skip mapping.", inPath, addonName)
-		return nil, false, nil
-	}
-	return m, found, nil
-}
-
 // defaultTranslationFunc is the default translation to values. It maps a Go data path into a YAML path.
-func defaultTranslationFunc(m *Translation, root map[string]interface{}, valuesPath string, value interface{}) error {
+func defaultTranslationFunc(m *Translation, root map[string]any, valuesPath string, value any) error {
 	var path []string
 
 	if util.IsEmptyString(value) {
@@ -675,7 +924,7 @@ func firstCharToLower(s string) string {
 // MergeK8sObject function below is used by third party for integrations and has to be public
 
 // MergeK8sObject does strategic merge for overlayNode on the base object.
-func MergeK8sObject(base *object.K8sObject, overlayNode interface{}, path util.Path) (*object.K8sObject, error) {
+func MergeK8sObject(base *object.K8sObject, overlayNode any, path util.Path) (*object.K8sObject, error) {
 	overlay, err := createPatchObjectFromPath(overlayNode, path)
 	if err != nil {
 		return nil, err
@@ -710,25 +959,27 @@ func MergeK8sObject(base *object.K8sObject, overlayNode interface{}, path util.P
 		return nil, err
 	}
 
-	return newObj, nil
+	return newObj.ResolveK8sConflict(), nil
 }
 
 // createPatchObjectFromPath constructs patch object for node with path, returns nil object and error if the path is invalid.
 // eg. node:
-//     - name: NEW_VAR
-//       value: new_value
+//   - name: NEW_VAR
+//     value: new_value
+//
 // and path:
-//       spec.template.spec.containers.[name:discovery].env
-//     will constructs the following patch object:
-//       spec:
-//         template:
-//           spec:
-//             containers:
-//             - name: discovery
-//               env:
-//               - name: NEW_VAR
-//                 value: new_value
-func createPatchObjectFromPath(node interface{}, path util.Path) (map[string]interface{}, error) {
+//
+//	  spec.template.spec.containers.[name:discovery].env
+//	will constructs the following patch object:
+//	  spec:
+//	    template:
+//	      spec:
+//	        containers:
+//	        - name: discovery
+//	          env:
+//	          - name: NEW_VAR
+//	            value: new_value
+func createPatchObjectFromPath(node any, path util.Path) (map[string]any, error) {
 	if len(path) == 0 {
 		return nil, fmt.Errorf("empty path %s", path)
 	}
@@ -740,14 +991,14 @@ func createPatchObjectFromPath(node interface{}, path util.Path) (map[string]int
 		return nil, fmt.Errorf("path %s has an unexpected last element %s", path, path[length-1])
 	}
 
-	patchObj := make(map[string]interface{})
-	var currentNode, nextNode interface{}
+	patchObj := make(map[string]any)
+	var currentNode, nextNode any
 	nextNode = patchObj
 	for i, pe := range path {
 		currentNode = nextNode
 		// last path element
 		if i == length-1 {
-			currentNode, ok := currentNode.(map[string]interface{})
+			currentNode, ok := currentNode.(map[string]any)
 			if !ok {
 				return nil, fmt.Errorf("path %s has an unexpected non KV element %s", path, pe)
 			}
@@ -756,7 +1007,7 @@ func createPatchObjectFromPath(node interface{}, path util.Path) (map[string]int
 		}
 
 		if util.IsKVPathElement(pe) {
-			currentNode, ok := currentNode.([]interface{})
+			currentNode, ok := currentNode.([]any)
 			if !ok {
 				return nil, fmt.Errorf("path %s has an unexpected KV element %s", path, pe)
 			}
@@ -767,20 +1018,20 @@ func createPatchObjectFromPath(node interface{}, path util.Path) (map[string]int
 			if k == "" || v == "" {
 				return nil, fmt.Errorf("path %s has an invalid KV element %s", path, pe)
 			}
-			currentNode[0] = map[string]interface{}{k: v}
+			currentNode[0] = map[string]any{k: v}
 			nextNode = currentNode[0]
 			continue
 		}
 
-		currentNode, ok := currentNode.(map[string]interface{})
+		currentNode, ok := currentNode.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("path %s has an unexpected non KV element %s", path, pe)
 		}
 		// next path element determines the next node type
 		if util.IsKVPathElement(path[i+1]) {
-			currentNode[pe] = make([]interface{}, 1)
+			currentNode[pe] = make([]any, 1)
 		} else {
-			currentNode[pe] = make(map[string]interface{})
+			currentNode[pe] = make(map[string]any)
 		}
 		nextNode = currentNode[pe]
 	}
@@ -793,8 +1044,8 @@ func IOPStoIOP(iops proto.Message, name, namespace string) (*iopv1alpha1.IstioOp
 	if err != nil {
 		return nil, err
 	}
-	iop := &iopv1alpha1.IstioOperator{}
-	if err := util.UnmarshalWithJSONPB(iopStr, iop, false); err != nil {
+	iop, err := istio.UnmarshalIstioOperator(iopStr, false)
+	if err != nil {
 		return nil, err
 	}
 	return iop, nil

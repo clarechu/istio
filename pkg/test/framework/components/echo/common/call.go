@@ -16,161 +16,182 @@ package common
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
-	"net/http"
-	"reflect"
 	"strconv"
+	"time"
 
-	"istio.io/istio/pkg/config/protocol"
-	"istio.io/istio/pkg/test/echo/client"
+	echoclient "istio.io/istio/pkg/test/echo"
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/echo/common/scheme"
 	"istio.io/istio/pkg/test/echo/proto"
+	"istio.io/istio/pkg/test/echo/server/forwarder"
 	"istio.io/istio/pkg/test/framework/components/echo"
+	"istio.io/istio/pkg/test/scopes"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
-var (
-	// IdentityOutboundPortSelector is an OutboundPortSelectorFunc that always returns the original service port.
-	IdentityOutboundPortSelector OutboundPortSelectorFunc = func(servicePort int) (int, error) {
-		return servicePort, nil
-	}
-)
+type sendFunc func(req *proto.ForwardEchoRequest) (echoclient.Responses, error)
 
-// OutboundPortSelectorFunc is a function that selects the appropriate outbound port for sending
-// requests to a target service.
-type OutboundPortSelectorFunc func(servicePort int) (int, error)
+func callInternal(srcName string, from echo.Caller, opts echo.CallOptions, send sendFunc) (echo.CallResult, error) {
+	// Create the proto request.
+	req := newForwardRequest(opts)
+	sendAndValidate := func() (echo.CallResult, error) {
+		responses, err := send(req)
 
-func CallEcho(c *client.Instance, opts *echo.CallOptions, outboundPortSelector OutboundPortSelectorFunc) (client.ParsedResponses, error) {
-	if err := fillInCallOptions(opts); err != nil {
-		return nil, err
-	}
+		// Verify the number of responses matches the expected.
+		if err == nil && len(responses) != opts.Count {
+			err = fmt.Errorf("unexpected number of responses: expected %d, received %d",
+				opts.Count, len(responses))
+		}
 
-	port, err := outboundPortSelector(opts.Port.ServicePort)
-	if err != nil {
-		return nil, err
-	}
+		// Convert to a CallResult.
+		result := echo.CallResult{
+			From:      from,
+			Opts:      opts,
+			Responses: responses,
+		}
 
-	// Forward a request from 'this' service to the destination service.
-	targetHost := net.JoinHostPort(opts.Host, strconv.Itoa(port))
-	var targetURL string
-	if opts.Scheme != scheme.TCP {
-		targetURL = fmt.Sprintf("%s://%s%s", string(opts.Scheme), targetHost, opts.Path)
-	} else {
-		targetURL = fmt.Sprintf("%s://%s", string(opts.Scheme), targetHost)
-	}
-	protoHeaders := []*proto.Header{
-		{
-			Key:   "Host",
-			Value: targetHost,
-		},
-	}
-	// Add headers in opts.Headers, e.g., authorization header, etc.
-	// If host header is set, it will override targetService.
-	for k := range opts.Headers {
-		protoHeaders = append(protoHeaders, &proto.Header{Key: k, Value: opts.Headers.Get(k)})
+		// Return the results from the validator.
+		err = opts.Check(result, err)
+		if err != nil {
+			err = fmt.Errorf("call failed from %s to %s (using %s): %v",
+				srcName, getTargetURL(opts), opts.Scheme, err)
+		}
+
+		return result, err
 	}
 
-	req := &proto.ForwardEchoRequest{
-		Url:           targetURL,
-		Count:         int32(opts.Count),
-		Headers:       protoHeaders,
-		TimeoutMicros: common.DurationToMicros(opts.Timeout),
-		Message:       opts.Message,
-		Http2:         opts.HTTP2,
+	if opts.Retry.NoRetry {
+		// Retry is disabled, just send once.
+		t0 := time.Now()
+		defer scopes.Framework.Debugf("echo call complete with duration %v", time.Since(t0))
+		return sendAndValidate()
 	}
 
-	resp, err := c.ForwardEcho(context.Background(), req)
-	if err != nil {
-		return nil, err
-	}
+	// Retry the call until it succeeds or times out.
+	var result echo.CallResult
+	var err error
+	_, _ = retry.UntilComplete(func() (any, bool, error) {
+		result, err = sendAndValidate()
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, true, nil
+	}, opts.Retry.Options...)
 
-	if len(resp) != opts.Count {
-		return nil, fmt.Errorf("unexpected number of responses: expected %d, received %d", opts.Count, len(resp))
-	}
-	return resp, err
+	return result, err
 }
 
-func fillInCallOptions(opts *echo.CallOptions) error {
-	if opts.Target == nil {
-		return errors.New("callOptions: missing Target")
+type Caller struct {
+	f *forwarder.Instance
+}
+
+func NewCaller() *Caller {
+	return &Caller{
+		f: forwarder.New(),
+	}
+}
+
+func (c *Caller) Close() error {
+	return c.f.Close()
+}
+
+func (c *Caller) CallEcho(from echo.Caller, opts echo.CallOptions) (echo.CallResult, error) {
+	if err := opts.FillDefaults(); err != nil {
+		return echo.CallResult{}, err
 	}
 
-	targetPorts := opts.Target.Config().Ports
-	if opts.PortName == "" {
-		// Validate the Port value.
+	send := func(req *proto.ForwardEchoRequest) (echoclient.Responses, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
+		defer cancel()
 
-		if opts.Port == nil {
-			return errors.New("callOptions: PortName or Port must be provided")
+		ret, err := c.f.ForwardEcho(ctx, &forwarder.Config{
+			Request: req,
+			Proxy:   opts.HTTP.HTTPProxy,
+		})
+		if err != nil {
+			return nil, err
 		}
+		resp := echoclient.ParseResponses(req, ret)
+		return resp, nil
+	}
+	return callInternal("TestRunner", from, opts, send)
+}
 
-		// Check the specified port for a match against the Target Instance
-		found := false
-		for _, port := range targetPorts {
-			if reflect.DeepEqual(port, *opts.Port) {
-				found = true
-				break
-			}
+func newForwardRequest(opts echo.CallOptions) *proto.ForwardEchoRequest {
+	return &proto.ForwardEchoRequest{
+		Url:                     getTargetURL(opts),
+		Count:                   int32(opts.Count),
+		Headers:                 common.HTTPToProtoHeaders(opts.HTTP.Headers),
+		TimeoutMicros:           common.DurationToMicros(opts.Timeout),
+		Message:                 opts.Message,
+		ExpectedResponse:        opts.TCP.ExpectedResponse,
+		Http2:                   opts.HTTP.HTTP2,
+		Http3:                   opts.HTTP.HTTP3,
+		Method:                  opts.HTTP.Method,
+		ServerFirst:             opts.Port.ServerFirst,
+		Cert:                    opts.TLS.Cert,
+		Key:                     opts.TLS.Key,
+		CaCert:                  opts.TLS.CaCert,
+		CertFile:                opts.TLS.CertFile,
+		KeyFile:                 opts.TLS.KeyFile,
+		CaCertFile:              opts.TLS.CaCertFile,
+		InsecureSkipVerify:      opts.TLS.InsecureSkipVerify,
+		Alpn:                    getProtoALPN(opts.TLS.Alpn),
+		FollowRedirects:         opts.HTTP.FollowRedirects,
+		ServerName:              opts.TLS.ServerName,
+		NewConnectionPerRequest: opts.NewConnectionPerRequest,
+		ForceDNSLookup:          opts.ForceDNSLookup,
+	}
+}
+
+func getProtoALPN(alpn []string) *proto.Alpn {
+	if alpn != nil {
+		return &proto.Alpn{
+			Value: alpn,
 		}
-		if !found {
-			return fmt.Errorf("callOptions: Port does not match any Target port")
-		}
-	} else {
-		// Look up the port.
-		found := false
-		for _, port := range targetPorts {
-			if opts.PortName == port.Name {
-				found = true
-				opts.Port = &port
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("callOptions: no port named %s available in Target Instance", opts.PortName)
-		}
 	}
-
-	if opts.Scheme == "" {
-		// No protocol, fill it in.
-		var err error
-		if opts.Scheme, err = schemeForPort(opts.Port); err != nil {
-			return err
-		}
-	}
-
-	if opts.Headers == nil {
-		opts.Headers = make(http.Header)
-	}
-
-	if opts.Host == "" {
-		// No host specified, use the fully qualified domain name for the service.
-		opts.Host = opts.Target.Config().FQDN()
-	}
-
-	if opts.Timeout <= 0 {
-		opts.Timeout = common.DefaultRequestTimeout
-	}
-
-	if opts.Count <= 0 {
-		opts.Count = common.DefaultCount
-	}
-
 	return nil
 }
 
-func schemeForPort(port *echo.Port) (scheme.Instance, error) {
-	switch port.Protocol {
-	case protocol.GRPC, protocol.GRPCWeb, protocol.HTTP2:
-		return scheme.GRPC, nil
-	case protocol.HTTP:
-		return scheme.HTTP, nil
-	case protocol.HTTPS:
-		return scheme.HTTPS, nil
-	case protocol.TCP:
-		return scheme.TCP, nil
+// EchoClientProvider provides dynamic creation of Echo clients. This allows retries to potentially make
+// use of different (ready) workloads for forward requests.
+type EchoClientProvider func() (*echoclient.Client, error)
+
+func ForwardEcho(srcName string, from echo.Caller, opts echo.CallOptions, clientProvider EchoClientProvider) (echo.CallResult, error) {
+	if err := opts.FillDefaults(); err != nil {
+		return echo.CallResult{}, err
+	}
+
+	res, err := callInternal(srcName, from, opts, func(req *proto.ForwardEchoRequest) (echoclient.Responses, error) {
+		c, err := clientProvider()
+		if err != nil {
+			return nil, err
+		}
+		return c.ForwardEcho(context.Background(), req)
+	})
+	if err != nil {
+		return echo.CallResult{}, fmt.Errorf("failed calling %s->'%s': %v",
+			srcName,
+			getTargetURL(opts),
+			err)
+	}
+	return res, nil
+}
+
+func getTargetURL(opts echo.CallOptions) string {
+	port := opts.Port.ServicePort
+	addressAndPort := net.JoinHostPort(opts.Address, strconv.Itoa(port))
+	// Forward a request from 'this' service to the destination service.
+	switch opts.Scheme {
+	case scheme.DNS:
+		return fmt.Sprintf("%s://%s", string(opts.Scheme), opts.Address)
+	case scheme.TCP, scheme.GRPC:
+		return fmt.Sprintf("%s://%s", string(opts.Scheme), addressAndPort)
+	case scheme.XDS:
+		return fmt.Sprintf("%s:///%s", string(opts.Scheme), addressAndPort)
 	default:
-		return "", fmt.Errorf("failed creating call for port %s: unsupported protocol %s",
-			port.Name, port.Protocol)
+		return fmt.Sprintf("%s://%s%s", string(opts.Scheme), addressAndPort, opts.HTTP.Path)
 	}
 }

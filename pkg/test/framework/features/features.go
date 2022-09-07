@@ -16,13 +16,12 @@ package features
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 
+	"sigs.k8s.io/yaml"
+
 	"istio.io/istio/pkg/test/env"
-
-	"github.com/ghodss/yaml"
-
 	"istio.io/pkg/log"
 )
 
@@ -34,23 +33,23 @@ type Checker interface {
 }
 
 type checkerImpl struct {
-	m map[string]interface{}
+	m map[string]any
 }
 
 func BuildChecker(yamlPath string) (Checker, error) {
-	data, err := ioutil.ReadFile(yamlPath)
+	data, err := os.ReadFile(yamlPath)
 	if err != nil {
 		log.Errorf("Error reading feature file: %s", yamlPath)
 		return nil, err
 	}
-	m := make(map[string]interface{})
+	m := make(map[string]any)
 
 	err = yaml.Unmarshal(data, &m)
 	if err != nil {
 		log.Errorf("Error parsing features file: %s", err)
 		return nil, err
 	}
-	return &checkerImpl{m["features"].(map[string]interface{})}, nil
+	return &checkerImpl{m["features"].(map[string]any)}, nil
 }
 
 // returns true if the feature is defined in features.yaml,
@@ -59,10 +58,13 @@ func (c *checkerImpl) Check(feature Feature) (check bool, scenario string) {
 	return checkPathSegment(c.m, strings.Split(string(feature), "."))
 }
 
-func checkPathSegment(m map[string]interface{}, path []string) (check bool, scenario string) {
+func checkPathSegment(m map[string]any, path []string) (check bool, scenario string) {
+	if len(path) < 1 {
+		return false, ""
+	}
 	segment := path[0]
 	if val, ok := m[segment]; ok {
-		if valmap, ok := val.(map[string]interface{}); ok {
+		if valmap, ok := val.(map[string]any); ok {
 			return checkPathSegment(valmap, path[1:])
 		} else if val == nil {
 			return true, strings.Join(path[1:], ".")
@@ -79,7 +81,7 @@ type Allowlist struct {
 
 func fromFile(path string) *Allowlist {
 	result := &Allowlist{hashset: map[string]bool{}}
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Errorf("Error reading allowlist file: %s", path)
 		return nil
@@ -91,7 +93,6 @@ func fromFile(path string) *Allowlist {
 		result.hashset[i] = true
 	}
 	return result
-
 }
 
 func (w *Allowlist) Contains(suite, test string) bool {

@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,15 +15,9 @@ package xds
 
 import (
 	"net"
-	"sync"
 
-	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
-
-	"istio.io/istio/pkg/adsc"
-
-	"istio.io/pkg/log"
 
 	configaggregate "istio.io/istio/pilot/pkg/config/aggregate"
 	"istio.io/istio/pilot/pkg/config/memory"
@@ -54,7 +48,7 @@ type SimpleServer struct {
 
 	// MemoryStore is an in-memory config store, part of the aggregate store
 	// used by the discovery server.
-	MemoryConfigStore model.IstioConfigStore
+	MemoryConfigStore model.ConfigStore
 
 	// GRPCListener is the listener used for GRPC. For agent it is
 	// an insecure port, bound to 127.0.0.1
@@ -64,9 +58,7 @@ type SimpleServer struct {
 	// which needs to happen before serving requests.
 	syncCh chan string
 
-	ConfigStoreCache model.ConfigStoreCache
-
-	m sync.RWMutex
+	ConfigStoreCache model.ConfigStoreController
 }
 
 // Creates an basic, functional discovery server, using the same code as Istiod, but
@@ -75,18 +67,17 @@ type SimpleServer struct {
 // Can be used in tests, or as a minimal XDS discovery server with no dependency on K8S or
 // the complex bootstrap used by Istiod. A memory registry and memory config store are used to
 // generate the configs - they can be programmatically updated.
-func NewXDS() *SimpleServer {
+func NewXDS(stop chan struct{}) *SimpleServer {
 	// Prepare a working XDS server, with aggregate config and registry stores and a memory store for each.
 	// TODO: refactor bootstrap code to use this server, and add more registries.
 
-	env := &model.Environment{
-		PushContext: model.NewPushContext(),
-	}
-	mc := mesh.DefaultMeshConfig()
-	env.Watcher = mesh.NewFixedWatcher(&mc)
+	env := model.NewEnvironment()
+	env.Watcher = mesh.NewFixedWatcher(mesh.DefaultMeshConfig())
 	env.PushContext.Mesh = env.Watcher.Mesh()
+	env.Init()
 
-	ds := NewDiscoveryServer(env, nil)
+	ds := NewDiscoveryServer(env, "istiod", map[string]string{})
+	ds.InitGenerators(env, "istio-system", nil)
 	ds.CachesSynced()
 
 	// Config will have a fixed format:
@@ -107,18 +98,13 @@ func NewXDS() *SimpleServer {
 	s.MemoryConfigStore = model.MakeIstioStore(configController)
 
 	// Endpoints/Clusters - using the config store for ServiceEntries
-	serviceControllers := aggregate.NewController()
+	serviceControllers := aggregate.NewController(aggregate.Options{})
 
-	serviceEntryStore := serviceentry.NewServiceDiscovery(configController, s.MemoryConfigStore, ds)
-	serviceEntryRegistry := serviceregistry.Simple{
-		ProviderID:       "External",
-		Controller:       serviceEntryStore,
-		ServiceDiscovery: serviceEntryStore,
-	}
-	serviceControllers.AddRegistry(serviceEntryRegistry)
+	serviceEntryController := serviceentry.NewController(configController, s.MemoryConfigStore, ds)
+	serviceControllers.AddRegistry(serviceEntryController)
 
-	sd := controllermemory.NewServiceDiscovery(nil)
-	sd.EDSUpdater = ds
+	sd := controllermemory.NewServiceDiscovery()
+	sd.XdsUpdater = ds
 	ds.MemRegistry = sd
 	serviceControllers.AddRegistry(serviceregistry.Simple{
 		ProviderID:       "Mem",
@@ -127,27 +113,27 @@ func NewXDS() *SimpleServer {
 	})
 	env.ServiceDiscovery = serviceControllers
 
-	go configController.Run(make(chan struct{}))
+	go configController.Run(stop)
 
 	// configStoreCache - with HasSync interface
-	aggregateConfigController, err := configaggregate.MakeCache([]model.ConfigStoreCache{
+	aggregateConfigController, err := configaggregate.MakeCache([]model.ConfigStoreController{
 		configController,
 	})
 	if err != nil {
-		log.Fatala("Creating aggregate config ", err)
+		log.Fatalf("Creating aggregate config: %v", err)
 	}
 
 	// TODO: fix the mess of store interfaces - most are too generic for their own good.
 	s.ConfigStoreCache = aggregateConfigController
-	env.IstioConfigStore = model.MakeIstioStore(aggregateConfigController)
+	env.ConfigStore = model.MakeIstioStore(aggregateConfigController)
 
 	return s
 }
 
-func (s *SimpleServer) StartGRPC(addr string) error {
+func (s *SimpleServer) StartGRPC(addr string) (string, error) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return "", err
 	}
 	gs := grpc.NewServer()
 	s.DiscoveryServer.Register(gs)
@@ -156,58 +142,8 @@ func (s *SimpleServer) StartGRPC(addr string) error {
 	go func() {
 		err = gs.Serve(lis)
 		if err != nil {
-			log.Infoa("Serve done ", err)
+			log.Infof("Serve done with %v", err)
 		}
 	}()
-	return nil
-}
-
-// ProxyGen implements a proxy generator - any request is forwarded using the agent ADSC connection.
-// Responses are forwarded back on the connection that they are received.
-type ProxyGen struct {
-	adsc   *adsc.ADSC
-	server *SimpleServer
-}
-
-// HandleResponse will dispatch a response from a federated
-// XDS server to all connections listening for that type.
-func (p *ProxyGen) HandleResponse(con *adsc.ADSC, res *discovery.DiscoveryResponse) {
-	// TODO: filter the push to only connections that
-	// match a filter.
-	p.server.DiscoveryServer.PushAll(res)
-}
-
-func (s *SimpleServer) NewProxy() *ProxyGen {
-	return &ProxyGen{
-		server: s,
-	}
-}
-
-func (p *ProxyGen) AddClient(adsc *adsc.ADSC) {
-	p.server.m.Lock()
-	p.adsc = adsc // TODO: list
-	p.server.m.Unlock()
-}
-
-// TODO: remove clients, multiple clients (agent has only one)
-
-// Generate will forward the request to all remote XDS servers.
-// Responses will be forwarded back to the client.
-//
-// TODO: allow clients to indicate which requests they handle ( similar with topic )
-func (p *ProxyGen) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, updates model.XdsUpdates) model.Resources {
-	if p.adsc == nil {
-		return nil
-	}
-
-	// TODO: track requests to connections, so resonses from server are dispatched to the right con
-	//
-	// TODO: Envoy (or client) may send multiple requests without waiting for the ack.
-	// Need to change the signature of Generator to take Request as parameter.
-	err := p.adsc.Send(w.LastRequest)
-	if err != nil {
-		log.Debuga("Failed to send, connection probably closed ", err)
-	}
-
-	return nil
+	return lis.Addr().String(), nil
 }

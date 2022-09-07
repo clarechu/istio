@@ -19,23 +19,21 @@ import (
 	"sort"
 	"testing"
 
-	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
-	structpb "github.com/golang/protobuf/ptypes/struct"
-	"github.com/golang/protobuf/ptypes/wrappers"
 
-	meshconfig "istio.io/api/mesh/v1alpha1"
-
-	"istio.io/istio/pilot/pkg/config/memory"
+	networking "istio.io/api/networking/v1alpha3"
+	security "istio.io/api/security/v1beta1"
+	"istio.io/api/type/v1beta1"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/util"
-	memregistry "istio.io/istio/pilot/pkg/serviceregistry/memory"
-	"istio.io/istio/pkg/config/mesh"
-	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/test"
 )
 
 type LbEpInfo struct {
-	network string
 	address string
 	// nolint: structcheck
 	weight uint32
@@ -46,341 +44,521 @@ type LocLbEpInfo struct {
 	weight uint32
 }
 
-var expectedMetadata = &structpb.Struct{
-	Fields: map[string]*structpb.Value{
-		model.TLSModeLabelShortname: {Kind: &structpb.Value_StringValue{StringValue: "istio"}},
+func (i LocLbEpInfo) getAddrs() []string {
+	addrs := make([]string, 0)
+	for _, ep := range i.lbEps {
+		addrs = append(addrs, ep.address)
+	}
+	return addrs
+}
+
+var networkFiltered = []networkFilterCase{
+	{
+		name: "from_network1_cluster1a",
+		conn: xdsConnection("network1", "cluster1a"),
+		want: []LocLbEpInfo{
+			{
+				lbEps: []LbEpInfo{
+					// 2 local endpoints on network1
+					{address: "10.0.0.1", weight: 6},
+					{address: "10.0.0.2", weight: 6},
+					// 1 endpoint on network2, cluster2a
+					{address: "2.2.2.2", weight: 6},
+					// 2 endpoints on network2, cluster2b
+					{address: "2.2.2.20", weight: 6},
+					{address: "2.2.2.21", weight: 6},
+					// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+					{address: "40.0.0.1", weight: 6},
+				},
+				weight: 36,
+			},
+		},
+	},
+	{
+		name: "from_network1_cluster1b",
+		conn: xdsConnection("network1", "cluster1b"),
+		want: []LocLbEpInfo{
+			{
+				lbEps: []LbEpInfo{
+					// 2 local endpoints on network1
+					{address: "10.0.0.1", weight: 6},
+					{address: "10.0.0.2", weight: 6},
+					// 1 endpoint on network2, cluster2a
+					{address: "2.2.2.2", weight: 6},
+					// 2 endpoints on network2, cluster2b
+					{address: "2.2.2.20", weight: 6},
+					{address: "2.2.2.21", weight: 6},
+					// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+					{address: "40.0.0.1", weight: 6},
+				},
+				weight: 36,
+			},
+		},
+	},
+	{
+		name: "from_network2_cluster2a",
+		conn: xdsConnection("network2", "cluster2a"),
+		want: []LocLbEpInfo{
+			{
+				lbEps: []LbEpInfo{
+					// 3 local endpoints in network2
+					{address: "20.0.0.1", weight: 6},
+					{address: "20.0.0.2", weight: 6},
+					{address: "20.0.0.3", weight: 6},
+					// 2 endpoint on network1 with weight aggregated at the gateway
+					{address: "1.1.1.1", weight: 12},
+					// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+					{address: "40.0.0.1", weight: 6},
+				},
+				weight: 36,
+			},
+		},
+	},
+	{
+		name: "from_network2_cluster2b",
+		conn: xdsConnection("network2", "cluster2b"),
+		want: []LocLbEpInfo{
+			{
+				lbEps: []LbEpInfo{
+					// 3 local endpoints in network2
+					{address: "20.0.0.1", weight: 6},
+					{address: "20.0.0.2", weight: 6},
+					{address: "20.0.0.3", weight: 6},
+					// 2 endpoint on network1 with weight aggregated at the gateway
+					{address: "1.1.1.1", weight: 12},
+					// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+					{address: "40.0.0.1", weight: 6},
+				},
+				weight: 36,
+			},
+		},
+	},
+	{
+		name: "from_network3_cluster3",
+		conn: xdsConnection("network3", "cluster3"),
+		want: []LocLbEpInfo{
+			{
+				lbEps: []LbEpInfo{
+					// 2 endpoint on network2 with weight aggregated at the gateway
+					{address: "1.1.1.1", weight: 12},
+					// 1 endpoint on network2, cluster2a
+					{address: "2.2.2.2", weight: 6},
+					// 2 endpoints on network2, cluster2b
+					{address: "2.2.2.20", weight: 6},
+					{address: "2.2.2.21", weight: 6},
+					// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+					{address: "40.0.0.1", weight: 6},
+				},
+				weight: 36,
+			},
+		},
+	},
+	{
+		name: "from_network4_cluster4",
+		conn: xdsConnection("network4", "cluster4"),
+		want: []LocLbEpInfo{
+			{
+				lbEps: []LbEpInfo{
+					// 1 local endpoint on network4
+					{address: "40.0.0.1", weight: 6},
+					// 2 endpoint on network2 with weight aggregated at the gateway
+					{address: "1.1.1.1", weight: 12},
+					// 1 endpoint on network2, cluster2a
+					{address: "2.2.2.2", weight: 6},
+					// 2 endpoints on network2, cluster2b
+					{address: "2.2.2.20", weight: 6},
+					{address: "2.2.2.21", weight: 6},
+				},
+				weight: 36,
+			},
+		},
+	},
+}
+
+var mtlsCases = map[string]map[string]struct {
+	Config         config.Config
+	Configs        []config.Config
+	IsMtlsDisabled bool
+}{
+	gvk.PeerAuthentication.String(): {
+		"mtls-off-ineffective": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.PeerAuthentication,
+					Name:             "mtls-partial",
+					Namespace:        "istio-system",
+				},
+				Spec: &security.PeerAuthentication{
+					Selector: &v1beta1.WorkloadSelector{
+						// shouldn't affect our test workload
+						MatchLabels: map[string]string{"app": "b"},
+					},
+					Mtls: &security.PeerAuthentication_MutualTLS{Mode: security.PeerAuthentication_MutualTLS_DISABLE},
+				},
+			},
+			IsMtlsDisabled: false,
+		},
+		"mtls-on-strict": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.PeerAuthentication,
+					Name:             "mtls-on",
+					Namespace:        "istio-system",
+				},
+				Spec: &security.PeerAuthentication{
+					Mtls: &security.PeerAuthentication_MutualTLS{Mode: security.PeerAuthentication_MutualTLS_STRICT},
+				},
+			},
+			IsMtlsDisabled: false,
+		},
+		"mtls-off-global": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.PeerAuthentication,
+					Name:             "mtls-off",
+					Namespace:        "istio-system",
+				},
+				Spec: &security.PeerAuthentication{
+					Mtls: &security.PeerAuthentication_MutualTLS{Mode: security.PeerAuthentication_MutualTLS_DISABLE},
+				},
+			},
+			IsMtlsDisabled: true,
+		},
+		"mtls-off-namespace": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.PeerAuthentication,
+					Name:             "mtls-off",
+					Namespace:        "ns",
+				},
+				Spec: &security.PeerAuthentication{
+					Mtls: &security.PeerAuthentication_MutualTLS{Mode: security.PeerAuthentication_MutualTLS_DISABLE},
+				},
+			},
+			IsMtlsDisabled: true,
+		},
+		"mtls-off-workload": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.PeerAuthentication,
+					Name:             "mtls-off",
+					Namespace:        "ns",
+				},
+				Spec: &security.PeerAuthentication{
+					Selector: &v1beta1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "example"},
+					},
+					Mtls: &security.PeerAuthentication_MutualTLS{Mode: security.PeerAuthentication_MutualTLS_DISABLE},
+				},
+			},
+			IsMtlsDisabled: true,
+		},
+		"mtls-off-port": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.PeerAuthentication,
+					Name:             "mtls-off",
+					Namespace:        "ns",
+				},
+				Spec: &security.PeerAuthentication{
+					Selector: &v1beta1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "example"},
+					},
+					PortLevelMtls: map[uint32]*security.PeerAuthentication_MutualTLS{
+						8080: {Mode: security.PeerAuthentication_MutualTLS_DISABLE},
+					},
+				},
+			},
+			IsMtlsDisabled: true,
+		},
+	},
+	gvk.DestinationRule.String(): {
+		"mtls-on-override-pa": {
+			Configs: []config.Config{
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.PeerAuthentication,
+						Name:             "mtls-off",
+						Namespace:        "ns",
+					},
+					Spec: &security.PeerAuthentication{
+						Mtls: &security.PeerAuthentication_MutualTLS{Mode: security.PeerAuthentication_MutualTLS_DISABLE},
+					},
+				},
+				{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.DestinationRule,
+						Name:             "mtls-on",
+						Namespace:        "ns",
+					},
+					Spec: &networking.DestinationRule{
+						Host: "example.ns.svc.cluster.local",
+						TrafficPolicy: &networking.TrafficPolicy{
+							Tls: &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_ISTIO_MUTUAL},
+						},
+					},
+				},
+			},
+			IsMtlsDisabled: false,
+		},
+		"mtls-off-innefective": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "mtls-off",
+					Namespace:        "ns",
+				},
+				Spec: &networking.DestinationRule{
+					Host: "other.ns.svc.cluster.local",
+					TrafficPolicy: &networking.TrafficPolicy{
+						Tls: &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_DISABLE},
+					},
+				},
+			},
+			IsMtlsDisabled: false,
+		},
+		"mtls-on-destination-level": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "mtls-on",
+					Namespace:        "ns",
+				},
+				Spec: &networking.DestinationRule{
+					Host: "example.ns.svc.cluster.local",
+					TrafficPolicy: &networking.TrafficPolicy{
+						Tls: &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_ISTIO_MUTUAL},
+					},
+				},
+			},
+			IsMtlsDisabled: false,
+		},
+		"mtls-on-port-level": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "mtls-on",
+					Namespace:        "ns",
+				},
+				Spec: &networking.DestinationRule{
+					Host: "example.ns.svc.cluster.local",
+					TrafficPolicy: &networking.TrafficPolicy{
+						PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{{
+							Port: &networking.PortSelector{Number: 80},
+							Tls:  &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_ISTIO_MUTUAL},
+						}},
+					},
+				},
+			},
+			IsMtlsDisabled: false,
+		},
+		"mtls-off-destination-level": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "mtls-off",
+					Namespace:        "ns",
+				},
+				Spec: &networking.DestinationRule{
+					Host: "example.ns.svc.cluster.local",
+					TrafficPolicy: &networking.TrafficPolicy{
+						Tls: &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_DISABLE},
+					},
+				},
+			},
+			IsMtlsDisabled: true,
+		},
+		"mtls-off-port-level": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "mtls-off",
+					Namespace:        "ns",
+				},
+				Spec: &networking.DestinationRule{
+					Host: "example.ns.svc.cluster.local",
+					TrafficPolicy: &networking.TrafficPolicy{
+						PortLevelSettings: []*networking.TrafficPolicy_PortTrafficPolicy{{
+							Port: &networking.PortSelector{Number: 80},
+							Tls:  &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_DISABLE},
+						}},
+					},
+				},
+			},
+			IsMtlsDisabled: true,
+		},
+		"mtls-off-subset-level": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "mtls-off",
+					Namespace:        "ns",
+				},
+				Spec: &networking.DestinationRule{
+					Host: "example.ns.svc.cluster.local",
+					TrafficPolicy: &networking.TrafficPolicy{
+						// should be overridden by subset
+						Tls: &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_ISTIO_MUTUAL},
+					},
+					Subsets: []*networking.Subset{{
+						Name:   "disable-tls",
+						Labels: map[string]string{"app": "example"},
+						TrafficPolicy: &networking.TrafficPolicy{
+							Tls: &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_DISABLE},
+						},
+					}},
+				},
+			},
+			IsMtlsDisabled: true,
+		},
+		"mtls-on-subset-level": {
+			Config: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.DestinationRule,
+					Name:             "mtls-on",
+					Namespace:        "ns",
+				},
+				Spec: &networking.DestinationRule{
+					Host: "example.ns.svc.cluster.local",
+					TrafficPolicy: &networking.TrafficPolicy{
+						// should be overridden by subset
+						Tls: &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_DISABLE},
+					},
+					Subsets: []*networking.Subset{{
+						Name:   "disable-tls",
+						Labels: map[string]string{"app": "example"},
+						TrafficPolicy: &networking.TrafficPolicy{
+							Tls: &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_ISTIO_MUTUAL},
+						},
+					}},
+				},
+			},
+			IsMtlsDisabled: false,
+		},
 	},
 }
 
 func TestEndpointsByNetworkFilter(t *testing.T) {
-
-	// Environment defines the networks with:
-	//  - 1 gateway for network1
-	//  - 2 gateway for network2
-	//  - 1 gateway for network3
-	//  - 0 gateways for network4
-	env := environment()
-
-	// Test endpoints creates:
-	//  - 2 endpoints in network1
-	//  - 1 endpoints in network2
-	//  - 0 endpoints in network3
-	//  - 1 endpoints in network4
-	testEndpoints := testEndpoints()
-
+	env := environment(t)
+	env.Env().InitNetworksManager(env.Discovery)
 	// The tests below are calling the endpoints filter from each one of the
 	// networks and examines the returned filtered endpoints
-	tests := []struct {
-		name      string
-		endpoints []*endpoint.LocalityLbEndpoints
-		conn      *Connection
-		env       *model.Environment
-		want      []LocLbEpInfo
-	}{
-		{
-			name:      "from_network1",
-			conn:      xdsConnection("network1"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 2 local endpoints
-						{address: "10.0.0.1", weight: 2},
-						{address: "10.0.0.2", weight: 2},
-						// 1 endpoint to gateway of network2 with weight 1 because it has 1 endpoint
-						{address: "2.2.2.2", weight: 1},
-						{address: "2.2.2.20", weight: 1},
-						// network4 has no gateway, which means it can be accessed from network1
-						{address: "40.0.0.1", weight: 2},
-					},
-					weight: 8,
-				},
-			},
-		},
-		{
-			name:      "from_network2",
-			conn:      xdsConnection("network2"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 local endpoint
-						{address: "20.0.0.1", weight: 2},
-						// 1 endpoint to gateway of network1 with weight 4 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 4},
-						{address: "40.0.0.1", weight: 2},
-					},
-					weight: 8,
-				},
-			},
-		},
-		{
-			name:      "from_network3",
-			conn:      xdsConnection("network3"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 endpoint to gateway of network1 with weight 4 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 4},
-						// 1 endpoint to gateway of network2 with weight 2 because it has 1 endpoint
-						{address: "2.2.2.2", weight: 1},
-						{address: "2.2.2.20", weight: 1},
-						{address: "40.0.0.1", weight: 2},
-					},
-					weight: 8,
-				},
-			},
-		},
-		{
-			name:      "from_network4",
-			conn:      xdsConnection("network4"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 local endpoint
-						{address: "40.0.0.1", weight: 2},
-						// 1 endpoint to gateway of network1 with weight 2 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 4},
-						// 1 endpoint to gateway of network2 with weight 1 because it has 1 endpoint
-						{address: "2.2.2.2", weight: 1},
-						{address: "2.2.2.20", weight: 1},
-					},
-					weight: 8,
-				},
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			push := model.NewPushContext()
-			_ = push.InitContext(tt.env, nil, nil)
-			filtered := EndpointsByNetworkFilter(push, tt.conn.node.Metadata.Network, tt.endpoints)
-			if len(filtered) != len(tt.want) {
-				t.Errorf("Unexpected number of filtered endpoints: got %v, want %v", len(filtered), len(tt.want))
-				return
-			}
-
-			sort.Slice(filtered, func(i, j int) bool {
-				addrI := filtered[i].LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().Address
-				addrJ := filtered[j].LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().Address
-				return addrI < addrJ
-			})
-
-			for i, ep := range filtered {
-				if len(ep.LbEndpoints) != len(tt.want[i].lbEps) {
-					t.Errorf("Unexpected number of LB endpoints within endpoint %d: %v, want %v", i, len(ep.LbEndpoints), len(tt.want[i].lbEps))
-				}
-
-				if ep.LoadBalancingWeight.GetValue() != tt.want[i].weight {
-					t.Errorf("Unexpected weight for endpoint %d: got %v, want %v", i, ep.LoadBalancingWeight.GetValue(), tt.want[i].weight)
-				}
-
-				for _, lbEp := range ep.LbEndpoints {
-					if lbEp.Metadata == nil {
-						t.Errorf("Expected endpoint metadata")
-					} else {
-						// ensure that all endpoints (direct ones and remote gateway endpoints have the tls mode label.
-						m := lbEp.Metadata.FilterMetadata[util.EnvoyTransportSocketMetadataKey]
-						if !reflect.DeepEqual(m, expectedMetadata) {
-							t.Errorf("Did not find the expected tlsMode metadata. got %v, want %v", m, expectedMetadata)
-						}
-					}
-					addr := lbEp.GetEndpoint().Address.GetSocketAddress().Address
-					found := false
-					for _, wantLbEp := range tt.want[i].lbEps {
-						if addr == wantLbEp.address {
-							found = true
-							break
-						}
-					}
-					if !found {
-						t.Errorf("Unexpected address for endpoint %d: %v", i, addr)
-					}
-				}
-			}
-		})
-	}
+	runNetworkFilterTest(t, env, networkFiltered)
 }
 
-func TestEndpointsByNetworkFilter_RegistryServiceName(t *testing.T) {
-	//  - 1 gateway for network1
-	//  - 1 gateway for network2
-	//  - 1 gateway for network3
-	//  - 0 gateways for network4
-	env := environment()
-	env.Networks().Networks["network2"] = &meshconfig.Network{
-		Endpoints: []*meshconfig.Network_NetworkEndpoints{
-			{
-				Ne: &meshconfig.Network_NetworkEndpoints_FromRegistry{
-					FromRegistry: "cluster2",
+func TestEndpointsByNetworkFilter_WithConfig(t *testing.T) {
+	noCrossNetwork := []networkFilterCase{
+		{
+			name: "from_network1_cluster1a",
+			conn: xdsConnection("network1", "cluster1a"),
+			want: []LocLbEpInfo{
+				{
+					lbEps: []LbEpInfo{
+						// 2 local endpoints on network1
+						{address: "10.0.0.1", weight: 6},
+						{address: "10.0.0.2", weight: 6},
+						// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+						{address: "40.0.0.1", weight: 6},
+					},
+					weight: 18,
 				},
 			},
 		},
-		Gateways: []*meshconfig.Network_IstioNetworkGateway{
-			{
-				Gw: &meshconfig.Network_IstioNetworkGateway_RegistryServiceName{
-					RegistryServiceName: "istio-ingressgateway.istio-system.svc.cluster.local",
+		{
+			name: "from_network1_cluster1b",
+			conn: xdsConnection("network1", "cluster1b"),
+			want: []LocLbEpInfo{
+				{
+					lbEps: []LbEpInfo{
+						// 2 local endpoints on network1
+						{address: "10.0.0.1", weight: 6},
+						{address: "10.0.0.2", weight: 6},
+						// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+						{address: "40.0.0.1", weight: 6},
+					},
+					weight: 18,
 				},
-				Port: 80,
+			},
+		},
+		{
+			name: "from_network2_cluster2a",
+			conn: xdsConnection("network2", "cluster2a"),
+			want: []LocLbEpInfo{
+				{
+					lbEps: []LbEpInfo{
+						// 1 local endpoint on network2
+						{address: "20.0.0.1", weight: 6},
+						{address: "20.0.0.2", weight: 6},
+						{address: "20.0.0.3", weight: 6},
+						// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+						{address: "40.0.0.1", weight: 6},
+					},
+					weight: 24,
+				},
+			},
+		},
+		{
+			name: "from_network2_cluster2b",
+			conn: xdsConnection("network2", "cluster2b"),
+			want: []LocLbEpInfo{
+				{
+					lbEps: []LbEpInfo{
+						// 1 local endpoint on network2
+						{address: "20.0.0.1", weight: 6},
+						{address: "20.0.0.2", weight: 6},
+						{address: "20.0.0.3", weight: 6},
+						// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+						{address: "40.0.0.1", weight: 6},
+					},
+					weight: 24,
+				},
+			},
+		},
+		{
+			name: "from_network3_cluster3",
+			conn: xdsConnection("network3", "cluster3"),
+			want: []LocLbEpInfo{
+				{
+					lbEps: []LbEpInfo{
+						// 1 endpoint on network4 with no gateway (i.e. directly accessible)
+						{address: "40.0.0.1", weight: 6},
+					},
+					weight: 6,
+				},
+			},
+		},
+		{
+			name: "from_network4_cluster4",
+			conn: xdsConnection("network4", "cluster4"),
+			want: []LocLbEpInfo{
+				{
+					lbEps: []LbEpInfo{
+						// 1 local endpoint on network4
+						{address: "40.0.0.1", weight: 6},
+					},
+					weight: 6,
+				},
 			},
 		},
 	}
 
-	serviceDiscovery := memregistry.NewServiceDiscovery([]*model.Service{{
-		Hostname: "istio-ingressgateway.istio-system.svc.cluster.local",
-		Attributes: model.ServiceAttributes{
-			ClusterExternalAddresses: map[string][]string{
-				"cluster2": {"2.2.2.2"},
-			},
-		},
-	}})
-
-	env.ServiceDiscovery = serviceDiscovery
-
-	// Test endpoints creates:
-	//  - 2 endpoints in network1
-	//  - 1 endpoints in network2
-	//  - 0 endpoints in network3
-	//  - 1 endpoints in network4
-	testEndpoints := testEndpoints()
-
-	// The tests below are calling the endpoints filter from each one of the
-	// networks and examines the returned filtered endpoints
-	tests := []struct {
-		name      string
-		endpoints []*endpoint.LocalityLbEndpoints
-		conn      *Connection
-		env       *model.Environment
-		want      []LocLbEpInfo
-	}{
-		{
-			name:      "from_network1",
-			conn:      xdsConnection("network1"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 2 local endpoints
-						{address: "10.0.0.1", weight: 1},
-						{address: "10.0.0.2", weight: 1},
-						// 1 endpoint to gateway of network2 with weight 1 because it has 1 endpoint
-						{address: "2.2.2.2", weight: 1},
-						{address: "40.0.0.1", weight: 1},
-					},
-					weight: 4,
-				},
-			},
-		},
-		{
-			name:      "from_network2",
-			conn:      xdsConnection("network2"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 local endpoint
-						{address: "20.0.0.1", weight: 1},
-						// 1 endpoint to gateway of network1 with weight 2 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 2},
-						{address: "40.0.0.1", weight: 1},
-					},
-					weight: 4,
-				},
-			},
-		},
-		{
-			name:      "from_network3",
-			conn:      xdsConnection("network3"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 endpoint to gateway of network1 with weight 2 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 2},
-						// 1 endpoint to gateway of network2 with weight 1 because it has 1 endpoint
-						{address: "2.2.2.2", weight: 1},
-						{address: "40.0.0.1", weight: 1},
-					},
-					weight: 4,
-				},
-			},
-		},
-		{
-			name:      "from_network4",
-			conn:      xdsConnection("network4"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 local endpoint
-						{address: "40.0.0.1", weight: 1},
-						// 1 endpoint to gateway of network1 with weight 2 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 2},
-						// 1 endpoint to gateway of network2 with weight 1 because it has 1 endpoint
-						{address: "2.2.2.2", weight: 1},
-					},
-					weight: 4,
-				},
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			push := model.NewPushContext()
-			_ = push.InitContext(tt.env, nil, nil)
-			filtered := EndpointsByNetworkFilter(push, tt.conn.node.Metadata.Network, tt.endpoints)
-			if len(filtered) != len(tt.want) {
-				t.Errorf("Unexpected number of filtered endpoints: got %v, want %v", len(filtered), len(tt.want))
-				return
-			}
-
-			sort.Slice(filtered, func(i, j int) bool {
-				addrI := filtered[i].LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().Address
-				addrJ := filtered[j].LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().Address
-				return addrI < addrJ
-			})
-
-			for i, ep := range filtered {
-				if len(ep.LbEndpoints) != len(tt.want[i].lbEps) {
-					t.Errorf("Unexpected number of LB endpoints within endpoint %d: %v, want %v", i, len(ep.LbEndpoints), len(tt.want[i].lbEps))
-				}
-
-				if ep.LoadBalancingWeight.GetValue() != tt.want[i].weight {
-					t.Errorf("Unexpected weight for endpoint %d: got %v, want %v", i, ep.LoadBalancingWeight.GetValue(), tt.want[i].weight)
-				}
-
-				for _, lbEp := range ep.LbEndpoints {
-					if lbEp.Metadata == nil {
-						t.Errorf("Expected endpoint metadata")
+	for configType, cases := range mtlsCases {
+		t.Run(configType, func(t *testing.T) {
+			for name, pa := range cases {
+				t.Run(name, func(t *testing.T) {
+					cfgs := pa.Configs
+					if pa.Config.Name != "" {
+						cfgs = append(cfgs, pa.Config)
+					}
+					env := environment(t, cfgs...)
+					var tests []networkFilterCase
+					if pa.IsMtlsDisabled {
+						tests = noCrossNetwork
 					} else {
-						// ensure that all endpoints (direct ones and remote gateway endpoints have the tls mode label.
-						m := lbEp.Metadata.FilterMetadata[util.EnvoyTransportSocketMetadataKey]
-						if !reflect.DeepEqual(m, expectedMetadata) {
-							t.Errorf("Did not find the expected tlsMode metadata. got %v, want %v", m, expectedMetadata)
-						}
+						tests = networkFiltered
 					}
-					addr := lbEp.GetEndpoint().Address.GetSocketAddress().Address
-					found := false
-					for _, wantLbEp := range tt.want[i].lbEps {
-						if addr == wantLbEp.address {
-							found = true
-							break
-						}
-					}
-					if !found {
-						t.Errorf("Unexpected address for endpoint %d: %v", i, addr)
-					}
-				}
+					runNetworkFilterTest(t, env, tests)
+				})
 			}
 		})
 	}
@@ -388,306 +566,293 @@ func TestEndpointsByNetworkFilter_RegistryServiceName(t *testing.T) {
 
 func TestEndpointsByNetworkFilter_SkipLBWithHostname(t *testing.T) {
 	//  - 1 IP gateway for network1
-	//  - 1 DNS gateway for network2 where gateway obtained from registry service name
+	//  - 1 DNS gateway for network2
 	//  - 1 IP gateway for network3
 	//  - 0 gateways for network4
-	env := environment()
-	env.Networks().Networks["network2"] = &meshconfig.Network{
-		Endpoints: []*meshconfig.Network_NetworkEndpoints{
-			{
-				Ne: &meshconfig.Network_NetworkEndpoints_FromRegistry{
-					FromRegistry: "cluster2",
-				},
-			},
-		},
-		Gateways: []*meshconfig.Network_IstioNetworkGateway{
-			{
-				Gw: &meshconfig.Network_IstioNetworkGateway_RegistryServiceName{
-					RegistryServiceName: "istio-ingressgateway.istio-system.svc.cluster.local",
-				},
-				Port: 80,
-			},
-		},
-	}
-
-	serviceDiscovery := memregistry.NewServiceDiscovery([]*model.Service{{
+	ds := environment(t)
+	origServices := ds.Env().Services()
+	origGateways := ds.Env().NetworkGateways()
+	ds.MemRegistry.AddService(&model.Service{
 		Hostname: "istio-ingressgateway.istio-system.svc.cluster.local",
 		Attributes: model.ServiceAttributes{
-			ClusterExternalAddresses: map[string][]string{
-				"cluster2": {"aeiou.scooby.do"},
-			},
-		},
-	}})
-
-	env.ServiceDiscovery = serviceDiscovery
-
-	// Test endpoints creates:
-	//  - 2 endpoints in network1
-	//  - 1 endpoints in network2
-	//  - 0 endpoints in network3
-	//  - 1 endpoints in network4
-	testEndpoints := testEndpoints()
-
-	// The tests below are calling the endpoints filter from each one of the
-	// networks and examines the returned filtered endpoints
-	tests := []struct {
-		name      string
-		endpoints []*endpoint.LocalityLbEndpoints
-		conn      *Connection
-		env       *model.Environment
-		want      []LocLbEpInfo
-	}{
-		{
-			name:      "from_network1",
-			conn:      xdsConnection("network1"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 2 local endpoints
-						{address: "10.0.0.1", weight: 1},
-						{address: "10.0.0.2", weight: 1},
-						// 0 endpoint to gateway of network2 a its a dns name instead of IP
-						{address: "40.0.0.1", weight: 1},
-					},
-					weight: 3,
+			ClusterExternalAddresses: model.AddressMap{
+				Addresses: map[cluster.ID][]string{
+					"cluster2a": {""},
+					"cluster2b": {""},
 				},
 			},
 		},
-		{
-			name:      "from_network2",
-			conn:      xdsConnection("network2"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 local endpoint
-						{address: "20.0.0.1", weight: 1},
-						// 1 endpoint to gateway of network1 with weight 2 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 2},
-						{address: "40.0.0.1", weight: 1},
-					},
-					weight: 4,
-				},
-			},
-		},
-		{
-			name:      "from_network3",
-			conn:      xdsConnection("network3"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 endpoint to gateway of network1 with weight 2 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 2},
-						// 0 endpoint to gateway of network2 as its a DNS gateway
-						{address: "40.0.0.1", weight: 1},
-					},
-					weight: 3,
-				},
-			},
-		},
-		{
-			name:      "from_network4",
-			conn:      xdsConnection("network4"),
-			env:       env,
-			endpoints: testEndpoints,
-			want: []LocLbEpInfo{
-				{
-					lbEps: []LbEpInfo{
-						// 1 local endpoint
-						{address: "40.0.0.1", weight: 1},
-						// 1 endpoint to gateway of network1 with weight 2 because it has 2 endpoints
-						{address: "1.1.1.1", weight: 2},
-						// 0 endpoint to gateway of network2 as its a dns gateway
-					},
-					weight: 3,
-				},
-			},
-		},
+	})
+	for _, svc := range origServices {
+		ds.MemRegistry.AddService(svc)
 	}
+	ds.MemRegistry.AddGateways(origGateways...)
+	// Also add a hostname-based Gateway, which will be rejected.
+	ds.MemRegistry.AddGateways(model.NetworkGateway{
+		Network: "network2",
+		Addr:    "aeiou.scooby.do",
+		Port:    80,
+	})
+
+	// Run the tests and ensure that the new gateway is never used.
+	runNetworkFilterTest(t, ds, networkFiltered)
+}
+
+type networkFilterCase struct {
+	name string
+	conn *Connection
+	want []LocLbEpInfo
+}
+
+// runNetworkFilterTest calls the endpoints filter from each one of the
+// networks and examines the returned filtered endpoints
+func runNetworkFilterTest(t *testing.T, ds *FakeDiscoveryServer, tests []networkFilterCase) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			push := model.NewPushContext()
-			_ = push.InitContext(tt.env, nil, nil)
-			filtered := EndpointsByNetworkFilter(push, tt.conn.node.Metadata.Network, tt.endpoints)
-			if len(filtered) != len(tt.want) {
-				t.Errorf("Unexpected number of filtered endpoints: got %v, want %v", len(filtered), len(tt.want))
-				return
+			proxy := ds.SetupProxy(tt.conn.proxy)
+			b := NewEndpointBuilder("outbound|80||example.ns.svc.cluster.local", proxy, ds.PushContext())
+			testEndpoints := b.buildLocalityLbEndpointsFromShards(testShards(), &model.Port{Name: "http", Port: 80, Protocol: protocol.HTTP})
+			filtered := b.EndpointsByNetworkFilter(testEndpoints)
+			for _, e := range testEndpoints {
+				e.AssertInvarianceInTest()
 			}
+			compareEndpoints(t, filtered, tt.want)
 
-			sort.Slice(filtered, func(i, j int) bool {
-				addrI := filtered[i].LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().Address
-				addrJ := filtered[j].LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().Address
-				return addrI < addrJ
-			})
-
-			for i, ep := range filtered {
-				if len(ep.LbEndpoints) != len(tt.want[i].lbEps) {
-					t.Errorf("Unexpected number of LB endpoints within endpoint %d: %v, want %v", i, len(ep.LbEndpoints), len(tt.want[i].lbEps))
-				}
-
-				if ep.LoadBalancingWeight.GetValue() != tt.want[i].weight {
-					t.Errorf("Unexpected weight for endpoint %d: got %v, want %v", i, ep.LoadBalancingWeight.GetValue(), tt.want[i].weight)
-				}
-
-				for _, lbEp := range ep.LbEndpoints {
-					if lbEp.Metadata == nil {
-						t.Errorf("Expected endpoint metadata")
-					} else {
-						// ensure that all endpoints (direct ones and remote gateway endpoints have the tls mode label.
-						m := lbEp.Metadata.FilterMetadata[util.EnvoyTransportSocketMetadataKey]
-						if !reflect.DeepEqual(m, expectedMetadata) {
-							t.Errorf("Did not find the expected tlsMode metadata. got %v, want %v", m, expectedMetadata)
-						}
-					}
-					addr := lbEp.GetEndpoint().Address.GetSocketAddress().Address
-					found := false
-					for _, wantLbEp := range tt.want[i].lbEps {
-						if addr == wantLbEp.address {
-							found = true
-							break
-						}
-					}
-					if !found {
-						t.Errorf("Unexpected address for endpoint %d: %v", i, addr)
-					}
-				}
+			b2 := NewEndpointBuilder("outbound|80||example.ns.svc.cluster.local", proxy, ds.PushContext())
+			testEndpoints2 := b2.buildLocalityLbEndpointsFromShards(testShards(), &model.Port{Name: "http", Port: 80, Protocol: protocol.HTTP})
+			filtered2 := b2.EndpointsByNetworkFilter(testEndpoints2)
+			if !reflect.DeepEqual(filtered2, filtered) {
+				t.Fatalf("output of EndpointsByNetworkFilter is non-deterministic")
 			}
 		})
 	}
 }
 
-func xdsConnection(network string) *Connection {
-	return &Connection{
-		node: &model.Proxy{
-			Metadata: &model.NodeMetadata{Network: network},
-		},
+func compareEndpoints(t *testing.T, got []*LocalityEndpoints, want []LocLbEpInfo) {
+	if len(got) != len(want) {
+		t.Errorf("Unexpected number of filtered endpoints: got %v, want %v", len(got), len(want))
+		return
 	}
-}
 
-// environment creates an Environment object with the following MeshNetworks configurations:
-//  - 1 gateway for network1
-//  - 2 gateway for network2
-//  - 1 gateway for network3
-//  - 0 gateways for network4
-func environment() *model.Environment {
-	return &model.Environment{
-		ServiceDiscovery: memregistry.NewServiceDiscovery(nil),
-		IstioConfigStore: model.MakeIstioStore(memory.Make(collections.Pilot)),
-		Watcher:          mesh.NewFixedWatcher(&meshconfig.MeshConfig{}),
-		NetworksWatcher: mesh.NewFixedNetworksWatcher(&meshconfig.MeshNetworks{
-			Networks: map[string]*meshconfig.Network{
-				"network1": {
-					Gateways: []*meshconfig.Network_IstioNetworkGateway{
-						{
-							Gw: &meshconfig.Network_IstioNetworkGateway_Address{
-								Address: "1.1.1.1",
-							},
-							Port: 80,
-						},
-					},
-				},
-				"network2": {
-					Gateways: []*meshconfig.Network_IstioNetworkGateway{
-						{
-							Gw: &meshconfig.Network_IstioNetworkGateway_Address{
-								Address: "2.2.2.2",
-							},
-							Port: 80,
-						},
-						{
-							Gw: &meshconfig.Network_IstioNetworkGateway_Address{
-								Address: "2.2.2.20",
-							},
-							Port: 80,
-						},
-					},
-				},
-				"network3": {
-					Gateways: []*meshconfig.Network_IstioNetworkGateway{
-						{
-							Gw: &meshconfig.Network_IstioNetworkGateway_Address{
-								Address: "3.3.3.3",
-							},
-							Port: 443,
-						},
-					},
-				},
-				"network4": {
-					Gateways: []*meshconfig.Network_IstioNetworkGateway{},
-				},
-			},
-		}),
-	}
-}
+	sort.Slice(got, func(i, j int) bool {
+		addrI := got[i].llbEndpoints.LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().Address
+		addrJ := got[j].llbEndpoints.LbEndpoints[0].GetEndpoint().Address.GetSocketAddress().Address
+		return addrI < addrJ
+	})
 
-// testEndpoints creates endpoints to be handed to the filter. It creates
-// 2 endpoints on network1, 1 endpoint on network2 and 1 endpoint on network4.
-func testEndpoints() []*endpoint.LocalityLbEndpoints {
-	lbEndpoints := createLbEndpoints(
-		[]*LbEpInfo{
-			{network: "network1", address: "10.0.0.1"},
-			{network: "network1", address: "10.0.0.2"},
-			{network: "network2", address: "20.0.0.1"},
-			{network: "network4", address: "40.0.0.1"},
-		},
-	)
-
-	return []*endpoint.LocalityLbEndpoints{
-		{
-			LbEndpoints: lbEndpoints,
-			LoadBalancingWeight: &wrappers.UInt32Value{
-				Value: uint32(len(lbEndpoints)),
-			},
-		},
-	}
-}
-
-func createLbEndpoints(lbEpsInfo []*LbEpInfo) []*endpoint.LbEndpoint {
-	lbEndpoints := make([]*endpoint.LbEndpoint, len(lbEpsInfo))
-	for j, lbEpInfo := range lbEpsInfo {
-		lbEp := endpoint.LbEndpoint{
-			HostIdentifier: &endpoint.LbEndpoint_Endpoint{
-				Endpoint: &endpoint.Endpoint{
-					Address: &core.Address{
-						Address: &core.Address_SocketAddress{
-							SocketAddress: &core.SocketAddress{
-								Address: lbEpInfo.address,
-							},
-						},
-					},
-				},
-			},
-			Metadata: &core.Metadata{
-				FilterMetadata: map[string]*structpb.Struct{
-					"istio": {
-						Fields: map[string]*structpb.Value{
-							"network": {
-								Kind: &structpb.Value_StringValue{
-									StringValue: lbEpInfo.network,
-								},
-							},
-							"uid": {
-								Kind: &structpb.Value_StringValue{
-									StringValue: "kubernetes://dummy",
-								},
-							},
-						},
-					},
-					util.EnvoyTransportSocketMetadataKey: {
-						Fields: map[string]*structpb.Value{
-							model.TLSModeLabelShortname: {Kind: &structpb.Value_StringValue{StringValue: "istio"}},
-						},
-					},
-				},
-			},
+	for i, ep := range got {
+		if len(ep.llbEndpoints.LbEndpoints) != len(want[i].lbEps) {
+			t.Errorf("Unexpected number of LB endpoints within endpoint %d: %v, want %v",
+				i, getLbEndpointAddrs(&ep.llbEndpoints), want[i].getAddrs())
 		}
-		lbEndpoints[j] = &lbEp
+
+		if ep.llbEndpoints.LoadBalancingWeight.GetValue() != want[i].weight {
+			t.Errorf("Unexpected weight for endpoint %d: got %v, want %v", i, ep.llbEndpoints.LoadBalancingWeight.GetValue(), want[i].weight)
+		}
+
+		for _, lbEp := range ep.llbEndpoints.LbEndpoints {
+			addr := lbEp.GetEndpoint().Address.GetSocketAddress().Address
+			found := false
+			for _, wantLbEp := range want[i].lbEps {
+				if addr == wantLbEp.address {
+					found = true
+
+					// Now compare the weight.
+					if lbEp.GetLoadBalancingWeight().Value != wantLbEp.weight {
+						t.Errorf("Unexpected weight for endpoint %s: got %v, want %v",
+							addr, lbEp.GetLoadBalancingWeight().Value, wantLbEp.weight)
+					}
+					break
+				}
+			}
+			if !found {
+				t.Errorf("Unexpected address for endpoint %d: %v", i, addr)
+			}
+		}
+	}
+}
+
+func TestEndpointsWithMTLSFilter(t *testing.T) {
+	casesMtlsDisabled := []networkFilterCase{
+		{
+			name: "from_network1_cluster1a",
+			conn: xdsConnection("network1", "cluster1a"),
+			want: []LocLbEpInfo{
+				{
+					lbEps:  []LbEpInfo{},
+					weight: 0,
+				},
+			},
+		},
 	}
 
-	return lbEndpoints
+	for configType, cases := range mtlsCases {
+		t.Run(configType, func(t *testing.T) {
+			for name, pa := range cases {
+				t.Run(name, func(t *testing.T) {
+					cfgs := pa.Configs
+					if pa.Config.Name != "" {
+						cfgs = append(cfgs, pa.Config)
+					}
+					env := environment(t, cfgs...)
+					var tests []networkFilterCase
+					if pa.IsMtlsDisabled {
+						tests = casesMtlsDisabled
+					} else {
+						tests = networkFiltered
+					}
+					runMTLSFilterTest(t, env, tests)
+				})
+			}
+		})
+	}
+}
+
+func runMTLSFilterTest(t *testing.T, ds *FakeDiscoveryServer, tests []networkFilterCase) {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy := ds.SetupProxy(tt.conn.proxy)
+			b := NewEndpointBuilder("outbound_.80_._.example.ns.svc.cluster.local", proxy, ds.PushContext())
+			testEndpoints := b.buildLocalityLbEndpointsFromShards(testShards(), &model.Port{Name: "http", Port: 80, Protocol: protocol.HTTP})
+			filtered := b.EndpointsByNetworkFilter(testEndpoints)
+			filtered = b.EndpointsWithMTLSFilter(filtered)
+			for _, e := range testEndpoints {
+				e.AssertInvarianceInTest()
+			}
+			compareEndpoints(t, filtered, tt.want)
+
+			b2 := NewEndpointBuilder("outbound_.80_._.example.ns.svc.cluster.local", proxy, ds.PushContext())
+			testEndpoints2 := b2.buildLocalityLbEndpointsFromShards(testShards(), &model.Port{Name: "http", Port: 80, Protocol: protocol.HTTP})
+			filtered2 := b2.EndpointsByNetworkFilter(testEndpoints2)
+			filtered2 = b2.EndpointsWithMTLSFilter(filtered2)
+			if !reflect.DeepEqual(filtered2, filtered) {
+				t.Fatalf("output of EndpointsWithMTLSFilter is non-deterministic")
+			}
+		})
+	}
+}
+
+func xdsConnection(nw network.ID, c cluster.ID) *Connection {
+	return &Connection{
+		proxy: &model.Proxy{
+			Metadata: &model.NodeMetadata{
+				Network:   nw,
+				ClusterID: c,
+			},
+		},
+	}
+}
+
+// environment defines the networks with:
+//   - 1 gateway for network1
+//   - 3 gateway for network2
+//   - 1 gateway for network3
+//   - 0 gateways for network4
+func environment(t test.Failer, c ...config.Config) *FakeDiscoveryServer {
+	ds := NewFakeDiscoveryServer(t, FakeOptions{
+		Configs: c,
+		Services: []*model.Service{{
+			Hostname:   "example.ns.svc.cluster.local",
+			Attributes: model.ServiceAttributes{Name: "example", Namespace: "ns"},
+		}},
+		Gateways: []model.NetworkGateway{
+			// network1 has only 1 gateway in cluster1a, which will be used for the endpoints
+			// in both cluster1a and cluster1b.
+			{
+				Network: "network1",
+				Cluster: "cluster1a",
+				Addr:    "1.1.1.1",
+				Port:    80,
+			},
+
+			// network2 has one gateway in each cluster2a and cluster2b. When targeting a particular
+			// endpoint, only the gateway for its cluster will be selected. Since the clusters do not
+			// have the same number of endpoints, the weights for the gateways will be different.
+			{
+				Network: "network2",
+				Cluster: "cluster2a",
+				Addr:    "2.2.2.2",
+				Port:    80,
+			},
+			{
+				Network: "network2",
+				Cluster: "cluster2b",
+				Addr:    "2.2.2.20",
+				Port:    80,
+			},
+			{
+				Network: "network2",
+				Cluster: "cluster2b",
+				Addr:    "2.2.2.21",
+				Port:    80,
+			},
+
+			// network3 has a gateway in cluster3, but no endpoints.
+			{
+				Network: "network3",
+				Cluster: "cluster3",
+				Addr:    "3.3.3.3",
+				Port:    443,
+			},
+		},
+	})
+	return ds
+}
+
+// testShards creates endpoints to be handed to the filter:
+//   - 2 endpoints in network1
+//   - 1 endpoints in network2
+//   - 0 endpoints in network3
+//   - 1 endpoints in network4
+//
+// All endpoints are part of service example.ns.svc.cluster.local on port 80 (http).
+func testShards() *model.EndpointShards {
+	shards := &model.EndpointShards{Shards: map[model.ShardKey][]*model.IstioEndpoint{
+		// network1 has one endpoint in each cluster
+		{Cluster: "cluster1a"}: {
+			{Network: "network1", Address: "10.0.0.1"},
+		},
+		{Cluster: "cluster1b"}: {
+			{Network: "network1", Address: "10.0.0.2"},
+		},
+
+		// network2 has an imbalance of endpoints between its clusters
+		{Cluster: "cluster2a"}: {
+			{Network: "network2", Address: "20.0.0.1"},
+		},
+		{Cluster: "cluster2b"}: {
+			{Network: "network2", Address: "20.0.0.2"},
+			{Network: "network2", Address: "20.0.0.3"},
+		},
+
+		// network3 has no endpoints.
+
+		// network4 has a single endpoint, but not gateway so it will always
+		// be considered directly reachable.
+		{Cluster: "cluster4"}: {
+			{Network: "network4", Address: "40.0.0.1"},
+		},
+	}}
+	// apply common properties
+	for sk, shard := range shards.Shards {
+		for i, ep := range shard {
+			ep.ServicePortName = "http"
+			ep.Namespace = "ns"
+			ep.HostName = "example.ns.svc.cluster.local"
+			ep.EndpointPort = 8080
+			ep.TLSMode = "istio"
+			ep.Labels = map[string]string{"app": "example"}
+			ep.Locality.ClusterID = sk.Cluster
+			shards.Shards[sk][i] = ep
+		}
+	}
+	return shards
+}
+
+func getLbEndpointAddrs(ep *endpoint.LocalityLbEndpoints) []string {
+	addrs := make([]string, 0)
+	for _, lbEp := range ep.LbEndpoints {
+		addrs = append(addrs, lbEp.GetEndpoint().Address.GetSocketAddress().Address)
+	}
+	return addrs
 }

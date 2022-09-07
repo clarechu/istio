@@ -15,7 +15,7 @@
 package cmd
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,24 +24,21 @@ import (
 	"strings"
 	"time"
 
-	"istio.io/istio/galley/pkg/config/analysis/msg"
-	"istio.io/istio/galley/pkg/config/processing/snapshotter"
-
-	"github.com/ghodss/yaml"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"istio.io/pkg/env"
-
-	"istio.io/istio/galley/pkg/config/analysis"
-	"istio.io/istio/galley/pkg/config/analysis/analyzers"
-	"istio.io/istio/galley/pkg/config/analysis/diag"
-	"istio.io/istio/galley/pkg/config/analysis/local"
-	cfgKube "istio.io/istio/galley/pkg/config/source/kube"
+	"istio.io/istio/istioctl/pkg/util/formatting"
 	"istio.io/istio/istioctl/pkg/util/handlers"
+	"istio.io/istio/pkg/config/analysis"
+	"istio.io/istio/pkg/config/analysis/analyzers"
+	"istio.io/istio/pkg/config/analysis/diag"
+	"istio.io/istio/pkg/config/analysis/local"
+	"istio.io/istio/pkg/config/analysis/msg"
 	"istio.io/istio/pkg/config/resource"
-	"istio.io/istio/pkg/config/schema"
 	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/url"
 )
 
 // AnalyzerFoundIssuesError indicates that at least one analyzer found problems.
@@ -50,17 +47,12 @@ type AnalyzerFoundIssuesError struct{}
 // FileParseError indicates a provided file was unable to be parsed.
 type FileParseError struct{}
 
-const (
-	FileParseString = "Some files couldn't be parsed."
-	LogOutput       = "log"
-	JSONOutput      = "json"
-	YamlOutput      = "yaml"
-)
+const FileParseString = "Some files couldn't be parsed."
 
 func (f AnalyzerFoundIssuesError) Error() string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Analyzers found issues when analyzing %s.\n", analyzeTargetAsString()))
-	sb.WriteString(fmt.Sprintf("See %s for more information about causes and resolutions.", diag.DocPrefix))
+	sb.WriteString(fmt.Sprintf("See %s for more information about causes and resolutions.", url.ConfigAnalysis))
 	return sb.String()
 }
 
@@ -71,8 +63,8 @@ func (f FileParseError) Error() string {
 var (
 	listAnalyzers     bool
 	useKube           bool
-	failureLevel      = messageThreshold{diag.Warning} // messages at least this level will generate an error exit code
-	outputLevel       = messageThreshold{diag.Info}    // messages at least this level will be included in the output
+	failureThreshold  = formatting.MessageThreshold{Level: diag.Error} // messages at least this level will generate an error exit code
+	outputThreshold   = formatting.MessageThreshold{Level: diag.Info}  // messages at least this level will be included in the output
 	colorize          bool
 	msgOutputFormat   string
 	meshCfgFile       string
@@ -81,58 +73,40 @@ var (
 	suppress          []string
 	analysisTimeout   time.Duration
 	recursive         bool
-
-	termEnvVar = env.RegisterStringVar("TERM", "", "Specifies terminal type.  Use 'dumb' to suppress color output")
-
-	colorPrefixes = map[diag.Level]string{
-		diag.Info:    "",           // no special color for info messages
-		diag.Warning: "\033[33m",   // yellow
-		diag.Error:   "\033[1;31m", // bold red
-	}
+	ignoreUnknown     bool
 
 	fileExtensions = []string{".json", ".yaml", ".yml"}
 )
 
 // Analyze command
 func Analyze() *cobra.Command {
-	// Validate the output format before doing potentially expensive work to fail earlier
-	msgOutputFormats := map[string]bool{LogOutput: true, JSONOutput: true, YamlOutput: true}
-	var msgOutputFormatKeys []string
-
-	for k := range msgOutputFormats {
-		msgOutputFormatKeys = append(msgOutputFormatKeys, k)
-	}
-	sort.Strings(msgOutputFormatKeys)
-
 	analysisCmd := &cobra.Command{
 		Use:   "analyze <file>...",
 		Short: "Analyze Istio configuration and print validation messages",
-		Example: `
-# Analyze the current live cluster
-istioctl analyze
+		Example: `  # Analyze the current live cluster
+  istioctl analyze
 
-# Analyze the current live cluster, simulating the effect of applying additional yaml files
-istioctl analyze a.yaml b.yaml my-app-config/
+  # Analyze the current live cluster, simulating the effect of applying additional yaml files
+  istioctl analyze a.yaml b.yaml my-app-config/
 
-# Analyze the current live cluster, simulating the effect of applying a directory of config recursively
-istioctl analyze --recursive my-istio-config/
+  # Analyze the current live cluster, simulating the effect of applying a directory of config recursively
+  istioctl analyze --recursive my-istio-config/
 
-# Analyze yaml files without connecting to a live cluster
-istioctl analyze --use-kube=false a.yaml b.yaml my-app-config/
+  # Analyze yaml files without connecting to a live cluster
+  istioctl analyze --use-kube=false a.yaml b.yaml my-app-config/
 
-# Analyze the current live cluster and suppress PodMissingProxy for pod mypod in namespace 'testing'.
-istioctl analyze -S "IST0103=Pod mypod.testing"
+  # Analyze the current live cluster and suppress PodMissingProxy for pod mypod in namespace 'testing'.
+  istioctl analyze -S "IST0103=Pod mypod.testing"
 
-# Analyze the current live cluster and suppress PodMissingProxy for all pods in namespace 'testing',
-# and suppress MisplacedAnnotation on deployment foobar in namespace default.
-istioctl analyze -S "IST0103=Pod *.testing" -S "IST0107=Deployment foobar.default"
+  # Analyze the current live cluster and suppress PodMissingProxy for all pods in namespace 'testing',
+  # and suppress MisplacedAnnotation on deployment foobar in namespace default.
+  istioctl analyze -S "IST0103=Pod *.testing" -S "IST0107=Deployment foobar.default"
 
-# List available analyzers
-istioctl analyze -L
-`,
+  # List available analyzers
+  istioctl analyze -L`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			msgOutputFormat = strings.ToLower(msgOutputFormat)
-			_, ok := msgOutputFormats[msgOutputFormat]
+			_, ok := formatting.MsgOutputFormats[msgOutputFormat]
 			if !ok {
 				return CommandParseError{
 					fmt.Errorf("%s not a valid option for format. See istioctl analyze --help", msgOutputFormat),
@@ -154,16 +128,30 @@ istioctl analyze -L
 			// for file resources that don't have one specified.
 			selectedNamespace = handlers.HandleNamespace(namespace, defaultNamespace)
 
+			// check whether selected namespace exists.
+			if namespace != "" && useKube {
+				client, err := kube.NewClient(kube.BuildClientCmd(kubeconfig, configContext))
+				if err != nil {
+					return err
+				}
+				_, err = client.Kube().CoreV1().Namespaces().Get(context.TODO(), namespace, v1.GetOptions{})
+				if errors.IsNotFound(err) {
+					fmt.Fprintf(cmd.ErrOrStderr(), "namespace %q not found\n", namespace)
+					return nil
+				}
+			}
+
 			// If we've explicitly asked for all namespaces, blank the selectedNamespace var out
 			if allNamespaces {
 				selectedNamespace = ""
 			}
 
-			sa := local.NewSourceAnalyzer(schema.MustGet(), analyzers.AllCombined(),
-				resource.Namespace(selectedNamespace), resource.Namespace(istioNamespace), nil, true, analysisTimeout)
+			sa := local.NewIstiodAnalyzer(analyzers.AllCombined(),
+				resource.Namespace(selectedNamespace),
+				resource.Namespace(istioNamespace), nil, true)
 
 			// Check for suppressions and add them to our SourceAnalyzer
-			var suppressions []snapshotter.AnalysisSuppression
+			suppressions := make([]local.AnalysisSuppression, 0, len(suppress))
 			for _, s := range suppress {
 				parts := strings.Split(s, "=")
 				if len(parts) != 2 {
@@ -182,7 +170,7 @@ istioctl analyze -L
 				if !codeIsValid {
 					fmt.Fprintf(cmd.ErrOrStderr(), "Warning: Supplied message code '%s' is an unknown message code and will not have any effect.\n", parts[0])
 				}
-				suppressions = append(suppressions, snapshotter.AnalysisSuppression{
+				suppressions = append(suppressions, local.AnalysisSuppression{
 					Code:         parts[0],
 					ResourceName: parts[1],
 				})
@@ -192,12 +180,14 @@ istioctl analyze -L
 			// If we're using kube, use that as a base source.
 			if useKube {
 				// Set up the kube client
-				config := kube.BuildClientCmd(kubeconfig, configContext)
-				restConfig, err := config.ClientConfig()
+				restConfig, err := kube.DefaultRestConfig(kubeconfig, configContext)
 				if err != nil {
 					return err
 				}
-				k := cfgKube.NewInterfaces(restConfig)
+				k, err := kube.NewClient(kube.NewClientConfigForRestConfig(restConfig))
+				if err != nil {
+					return err
+				}
 				sa.AddRunningKubeSource(k)
 			}
 
@@ -226,7 +216,6 @@ istioctl analyze -L
 
 			// Do the analysis
 			result, err := sa.Analyze(cancel)
-
 			if err != nil {
 				return err
 			}
@@ -250,63 +239,51 @@ istioctl analyze -L
 				fmt.Fprintln(cmd.ErrOrStderr())
 			}
 
-			// Filter outputMessages by specified level, and append a ref arg to the doc URL
-			var outputMessages diag.Messages
-			for _, m := range result.Messages {
-				if m.Type.Level().IsWorseThanOrEqualTo(outputLevel.Level) {
-					m.DocRef = "istioctl-analyze"
-					outputMessages = append(outputMessages, m)
-				}
-			}
+			// Get messages for output
+			outputMessages := result.Messages.SetDocRef("istioctl-analyze").FilterOutLowerThan(outputThreshold.Level)
 
-			var returnError error
-			switch msgOutputFormat {
-			case LogOutput:
-				// Print validation message output, or a line indicating that none were found
-				if len(outputMessages) == 0 {
-					if parseErrors == 0 {
-						fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing %s.\n", analyzeTargetAsString())
-					} else {
-						fileOrFiles := "files"
-						if parseErrors == 1 {
-							fileOrFiles = "file"
+			// Print all the messages to stdout in the specified format
+			output, err := formatting.Print(outputMessages, msgOutputFormat, colorize)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), output)
+
+			// An extra message on success
+			if len(outputMessages) == 0 {
+				if parseErrors == 0 {
+					if len(readers) > 0 {
+						var files []string
+						for _, r := range readers {
+							files = append(files, r.Name)
 						}
-						fmt.Fprintf(cmd.ErrOrStderr(),
-							"No validation issues found when analyzing %s (but %d %s could not be parsed).\n",
-							analyzeTargetAsString(),
-							parseErrors,
-							fileOrFiles,
-						)
+						fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing %s.\n", strings.Join(files, "\n"))
+					} else {
+						fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing %s.\n", analyzeTargetAsString())
 					}
 				} else {
-					for _, m := range outputMessages {
-						fmt.Fprintln(cmd.OutOrStdout(), renderMessage(m))
+					fileOrFiles := "files"
+					if parseErrors == 1 {
+						fileOrFiles = "file"
 					}
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"No validation issues found when analyzing %s (but %d %s could not be parsed).\n",
+						analyzeTargetAsString(),
+						parseErrors,
+						fileOrFiles,
+					)
 				}
-
-				// Return code is based on the unfiltered validation message list/parse errors
-				// We're intentionally keeping failure threshold and output threshold decoupled for now
-				returnError = errorIfMessagesExceedThreshold(result.Messages)
-				if returnError == nil && parseErrors > 0 {
-					returnError = FileParseError{}
-				}
-
-			case JSONOutput:
-				jsonOutput, err := json.MarshalIndent(outputMessages, "", "\t")
-				if err != nil {
-					return err
-				}
-				fmt.Fprintln(cmd.OutOrStdout(), string(jsonOutput))
-			case YamlOutput:
-				yamlOutput, err := yaml.Marshal(outputMessages)
-				if err != nil {
-					return err
-				}
-				fmt.Fprintln(cmd.OutOrStdout(), string(yamlOutput))
-			default: // This should never happen since we validate this already
-				panic(fmt.Sprintf("%q not found in output format switch statement post validate?", msgOutputFormat))
 			}
 
+			// Return code is based on the unfiltered validation message list/parse errors
+			// We're intentionally keeping failure threshold and output threshold decoupled for now
+			var returnError error
+			if msgOutputFormat == formatting.LogFormat {
+				returnError = errorIfMessagesExceedThreshold(result.Messages)
+				if returnError == nil && parseErrors > 0 && !ignoreUnknown {
+					returnError = FileParseError{}
+				}
+			}
 			return returnError
 		},
 	}
@@ -315,16 +292,16 @@ istioctl analyze -L
 		"List the analyzers available to run. Suppresses normal execution.")
 	analysisCmd.PersistentFlags().BoolVarP(&useKube, "use-kube", "k", true,
 		"Use live Kubernetes cluster for analysis. Set --use-kube=false to analyze files only.")
-	analysisCmd.PersistentFlags().BoolVar(&colorize, "color", istioctlColorDefault(analysisCmd),
+	analysisCmd.PersistentFlags().BoolVar(&colorize, "color", formatting.IstioctlColorDefault(analysisCmd.OutOrStdout()),
 		"Default true.  Disable with '=false' or set $TERM to dumb")
 	analysisCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false,
 		"Enable verbose output")
-	analysisCmd.PersistentFlags().Var(&failureLevel, "failure-threshold",
+	analysisCmd.PersistentFlags().Var(&failureThreshold, "failure-threshold",
 		fmt.Sprintf("The severity level of analysis at which to set a non-zero exit code. Valid values: %v", diag.GetAllLevelStrings()))
-	analysisCmd.PersistentFlags().Var(&outputLevel, "output-threshold",
+	analysisCmd.PersistentFlags().Var(&outputThreshold, "output-threshold",
 		fmt.Sprintf("The severity level of analysis at which to display messages. Valid values: %v", diag.GetAllLevelStrings()))
-	analysisCmd.PersistentFlags().StringVarP(&msgOutputFormat, "output", "o", LogOutput,
-		fmt.Sprintf("Output format: one of %v", msgOutputFormatKeys))
+	analysisCmd.PersistentFlags().StringVarP(&msgOutputFormat, "output", "o", formatting.LogFormat,
+		fmt.Sprintf("Output format: one of %v", formatting.MsgOutputFormatKeys))
 	analysisCmd.PersistentFlags().StringVar(&meshCfgFile, "meshConfigFile", "",
 		"Overrides the mesh config values to use for analysis.")
 	analysisCmd.PersistentFlags().BoolVarP(&allNamespaces, "all-namespaces", "A", false,
@@ -334,9 +311,11 @@ istioctl analyze -L
 			`<code>=<resource> (e.g. '--suppress "IST0102=DestinationRule primary-dr.default"'). Can be repeated. `+
 			`You can include the wildcard character '*' to support a partial match (e.g. '--suppress "IST0102=DestinationRule *.default" ).`)
 	analysisCmd.PersistentFlags().DurationVar(&analysisTimeout, "timeout", 30*time.Second,
-		"the duration to wait before failing")
+		"The duration to wait before failing")
 	analysisCmd.PersistentFlags().BoolVarP(&recursive, "recursive", "R", false,
 		"Process directory arguments recursively. Useful when you want to analyze related manifests organized within the same directory.")
+	analysisCmd.PersistentFlags().BoolVar(&ignoreUnknown, "ignore-unknown", false,
+		"Don't complain about un-parseable input documents, for cases where analyze should run only on k8s compliant inputs.")
 	return analysisCmd
 }
 
@@ -397,7 +376,7 @@ func gatherFilesInDirectory(cmd *cobra.Command, dir string) ([]local.ReaderSourc
 		if err != nil {
 			return err
 		}
-		// If we encounter a directory, recurse only if the --recursve option
+		// If we encounter a directory, recurse only if the --recursive option
 		// was provided and the directory is not the same as dir.
 		if info.IsDir() {
 			if !recursive && dir != path {
@@ -422,59 +401,10 @@ func gatherFilesInDirectory(cmd *cobra.Command, dir string) ([]local.ReaderSourc
 	return readers, err
 }
 
-func colorPrefix(m diag.Message) string {
-	if !colorize {
-		return ""
-	}
-
-	prefix, ok := colorPrefixes[m.Type.Level()]
-	if !ok {
-		return ""
-	}
-
-	return prefix
-}
-
-func colorSuffix() string {
-	if !colorize {
-		return ""
-	}
-
-	return "\033[0m"
-}
-
-func renderMessage(m diag.Message) string {
-	origin := ""
-	if m.Resource != nil {
-		loc := ""
-		if m.Resource.Origin.Reference() != nil {
-			loc = " " + m.Resource.Origin.Reference().String()
-		}
-		origin = " (" + m.Resource.Origin.FriendlyName() + loc + ")"
-	}
-	return fmt.Sprintf(
-		"%s%v%s [%v]%s %s", colorPrefix(m), m.Type.Level(), colorSuffix(), m.Type.Code(), origin, fmt.Sprintf(m.Type.Template(), m.Parameters...))
-}
-
-func istioctlColorDefault(cmd *cobra.Command) bool {
-	if strings.EqualFold(termEnvVar.Get(), "dumb") {
-		return false
-	}
-
-	file, ok := cmd.OutOrStdout().(*os.File)
-	if ok {
-		if !isatty.IsTerminal(file.Fd()) {
-			return false
-		}
-	}
-
-	return true
-}
-
 func errorIfMessagesExceedThreshold(messages []diag.Message) error {
 	foundIssues := false
 	for _, m := range messages {
-		if m.Type.Level().IsWorseThanOrEqualTo(failureLevel.Level) {
+		if m.Type.Level().IsWorseThanOrEqualTo(failureThreshold.Level) {
 			foundIssues = true
 		}
 	}
@@ -494,39 +424,6 @@ func isValidFile(f string) bool {
 		}
 	}
 	return false
-}
-
-type messageThreshold struct {
-	diag.Level
-}
-
-// String satisfies interface pflag.Value
-func (m *messageThreshold) String() string {
-	return m.Level.String()
-}
-
-// Type satisfies interface pflag.Value
-func (m *messageThreshold) Type() string {
-	return "Level"
-}
-
-// Set satisfies interface pflag.Value
-func (m *messageThreshold) Set(s string) error {
-	l, err := LevelFromString(s)
-	if err != nil {
-		return err
-	}
-	m.Level = l
-	return nil
-}
-
-func LevelFromString(s string) (diag.Level, error) {
-	val, ok := diag.GetUppercaseStringToLevelMap()[strings.ToUpper(s)]
-	if !ok {
-		return diag.Level{}, fmt.Errorf("%q not a valid option, please choose from: %v", s, diag.GetAllLevelStrings())
-	}
-
-	return val, nil
 }
 
 func AnalyzersAsString(analyzers []analysis.Analyzer) string {
@@ -558,5 +455,5 @@ func analyzeTargetAsString() string {
 
 // TODO: Refactor output writer so that it is smart enough to know when to output what.
 func isJSONorYAMLOutputFormat() bool {
-	return msgOutputFormat == JSONOutput || msgOutputFormat == YamlOutput
+	return msgOutputFormat == formatting.JSONFormat || msgOutputFormat == formatting.YAMLFormat
 }

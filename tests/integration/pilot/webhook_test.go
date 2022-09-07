@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,25 +27,28 @@ import (
 	kubeApiMeta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"istio.io/api/label"
+	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/client-go/pkg/apis/networking/v1alpha3"
 	"istio.io/istio/pkg/test/framework"
-	"istio.io/istio/pkg/test/framework/components/environment/kube"
 	"istio.io/istio/pkg/test/util/retry"
 )
 
-const (
-	vwcName = "istiod-istio-system"
-)
-
 func TestWebhook(t *testing.T) {
+	// nolint: staticcheck
 	framework.NewTest(t).
 		RequiresSingleCluster().
-		Run(func(ctx framework.TestContext) {
-			env := ctx.Environment().(*kube.Environment)
+		Run(func(t framework.TestContext) {
+			vwcName := "istio-validator"
+			if t.Settings().Revisions.Default() != "" {
+				vwcName = fmt.Sprintf("%s-%s", vwcName, t.Settings().Revisions.Default())
+			}
+			vwcName += "-istio-system"
 
 			// clear the updated fields and verify istiod updates them
-
+			cluster := t.Clusters().Default()
 			retry.UntilSuccessOrFail(t, func() error {
-				got, err := getValidatingWebhookConfiguration(env.KubeClusters[0], vwcName)
+				got, err := getValidatingWebhookConfiguration(cluster.Kube(), vwcName)
 				if err != nil {
 					return fmt.Errorf("error getting initial webhook: %v", err)
 				}
@@ -55,15 +61,15 @@ func TestWebhook(t *testing.T) {
 				ignore := kubeApiAdmission.Ignore // can't take the address of a constant
 				updated.Webhooks[0].FailurePolicy = &ignore
 
-				if _, err := env.KubeClusters[0].AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(context.TODO(),
+				if _, err := cluster.Kube().AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(context.TODO(),
 					updated, kubeApiMeta.UpdateOptions{}); err != nil {
-					return fmt.Errorf("could not update validating webhook config: %s", updated.Name)
+					return fmt.Errorf("could not update validating webhook config %q: %v", updated.Name, err)
 				}
 				return nil
 			})
 
 			retry.UntilSuccessOrFail(t, func() error {
-				got, err := getValidatingWebhookConfiguration(env.KubeClusters[0], vwcName)
+				got, err := getValidatingWebhookConfiguration(cluster.Kube(), vwcName)
 				if err != nil {
 					t.Fatalf("error getting initial webhook: %v", err)
 				}
@@ -72,6 +78,13 @@ func TestWebhook(t *testing.T) {
 				}
 				return nil
 			})
+
+			revision := "default"
+			if t.Settings().Revisions.Default() != "" {
+				revision = t.Settings().Revisions.Default()
+			}
+			verifyRejectsInvalidConfig(t, revision, true)
+			verifyRejectsInvalidConfig(t, "", true)
 		})
 }
 
@@ -79,7 +92,7 @@ func getValidatingWebhookConfiguration(client kubernetes.Interface, name string)
 	whc, err := client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(),
 		name, kubeApiMeta.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("could not get validating webhook config: %s", name)
+		return nil, fmt.Errorf("could not get validating webhook config %q: %v", name, err)
 	}
 	return whc, nil
 }
@@ -94,8 +107,33 @@ func verifyValidatingWebhookConfiguration(c *kubeApiAdmission.ValidatingWebhookC
 				i, *wh.FailurePolicy, kubeApiAdmission.Fail)
 		}
 		if len(wh.ClientConfig.CABundle) == 0 {
-			return fmt.Errorf("webhook #%v: caBundle not matched", i)
+			return fmt.Errorf("webhook #%v: caBundle not patched", i)
 		}
 	}
 	return nil
+}
+
+func verifyRejectsInvalidConfig(t framework.TestContext, configRevision string, shouldReject bool) {
+	t.Helper()
+	const istioNamespace = "istio-system"
+	revLabel := map[string]string{}
+	if configRevision != "" {
+		revLabel[label.IoIstioRev.Name] = configRevision
+	}
+	invalidGateway := &v1alpha3.Gateway{
+		ObjectMeta: kubeApiMeta.ObjectMeta{
+			Name:      "invalid-istio-gateway",
+			Namespace: istioNamespace,
+			Labels:    revLabel,
+		},
+		Spec: networking.Gateway{},
+	}
+
+	createOptions := kubeApiMeta.CreateOptions{DryRun: []string{kubeApiMeta.DryRunAll}}
+	istioClient := t.Clusters().Default().Istio().NetworkingV1alpha3()
+	_, err := istioClient.Gateways(istioNamespace).Create(context.TODO(), invalidGateway, createOptions)
+	rejected := err != nil
+	if rejected != shouldReject {
+		t.Errorf("Config rejected: %t, expected config rejected: %t", rejected, shouldReject)
+	}
 }

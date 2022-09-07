@@ -18,18 +18,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"strings"
 	"testing"
 
-	"istio.io/istio/pkg/config/constants"
-	"istio.io/istio/pkg/config/schema/collections"
-	"istio.io/istio/pkg/config/schema/gvk"
+	"github.com/golang/protobuf/ptypes/wrappers"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
-
+	"istio.io/api/type/v1beta1"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/config/visibility"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 var (
@@ -37,6 +41,14 @@ var (
 		{
 			Name:     "uds",
 			Port:     9999,
+			Protocol: "HTTP",
+		},
+	}
+
+	port7000 = []*Port{
+		{
+			Name:     "uds",
+			Port:     7000,
 			Protocol: "HTTP",
 		},
 	}
@@ -115,8 +127,8 @@ var (
 		},
 	}
 
-	configs1 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs1 = &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
@@ -137,17 +149,16 @@ var (
 			},
 		},
 	}
-
-	configs2 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs2 = &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
 		Spec: &networking.Sidecar{},
 	}
 
-	configs3 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs3 = &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
@@ -160,8 +171,8 @@ var (
 		},
 	}
 
-	configs4 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs4 = &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
@@ -179,8 +190,8 @@ var (
 		},
 	}
 
-	configs5 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs5 = &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
@@ -198,8 +209,8 @@ var (
 		},
 	}
 
-	configs6 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs6 = &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
@@ -225,8 +236,8 @@ var (
 		},
 	}
 
-	configs7 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs7 = &config.Config{
+		Meta: config.Meta{
 			Name: "sidecar-scope-ns1-ns2",
 		},
 		Spec: &networking.Sidecar{
@@ -238,12 +249,14 @@ var (
 						Name:     "outbound-tcp",
 					},
 					Bind: "7.7.7.7",
-					Hosts: []string{"*/bookinginfo.com",
+					Hosts: []string{
+						"*/bookinginfo.com",
 						"*/private.com",
 					},
 				},
 				{
-					Hosts: []string{"ns1/*",
+					Hosts: []string{
+						"ns1/*",
 						"*/*.tcp.com",
 					},
 				},
@@ -251,8 +264,8 @@ var (
 		},
 	}
 
-	configs8 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs8 = &config.Config{
+		Meta: config.Meta{
 			Name: "different-port-name",
 		},
 		Spec: &networking.Sidecar{
@@ -269,8 +282,8 @@ var (
 		},
 	}
 
-	configs9 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs9 = &config.Config{
+		Meta: config.Meta{
 			Name: "sidecar-scope-wildcards",
 		},
 		Spec: &networking.Sidecar{
@@ -295,8 +308,8 @@ var (
 		},
 	}
 
-	configs10 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs10 = &config.Config{
+		Meta: config.Meta{
 			Name: "sidecar-scope-with-http-proxy",
 		},
 		Spec: &networking.Sidecar{
@@ -313,8 +326,8 @@ var (
 		},
 	}
 
-	configs11 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs11 = &config.Config{
+		Meta: config.Meta{
 			Name: "sidecar-scope-with-http-proxy-match-virtual-service",
 		},
 		Spec: &networking.Sidecar{
@@ -331,8 +344,8 @@ var (
 		},
 	}
 
-	configs12 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs12 = &config.Config{
+		Meta: config.Meta{
 			Name: "sidecar-scope-with-http-proxy-match-virtual-service-and-service",
 		},
 		Spec: &networking.Sidecar{
@@ -349,8 +362,8 @@ var (
 		},
 	}
 
-	configs13 = &Config{
-		ConfigMeta: ConfigMeta{
+	configs13 = &config.Config{
+		Meta: config.Meta{
 			Name: "sidecar-scope-with-illegal-host",
 		},
 		Spec: &networking.Sidecar{
@@ -366,8 +379,126 @@ var (
 			},
 		},
 	}
+
+	configs14 = &config.Config{
+		Meta: config.Meta{
+			Name: "sidecar-scope-wildcards",
+		},
+		Spec: &networking.Sidecar{
+			Egress: []*networking.IstioEgressListener{
+				{
+					Port: &networking.Port{
+						Number:   7443,
+						Protocol: "GRPC",
+						Name:     "grpc-tls",
+					},
+					Hosts: []string{"*/*"},
+				},
+				{
+					Port: &networking.Port{
+						Number:   7442,
+						Protocol: "HTTP",
+						Name:     "http-tls",
+					},
+					Hosts: []string{"ns2/*"},
+				},
+				{
+					Hosts: []string{"*/*"},
+				},
+			},
+		},
+	}
+
+	configs15 = &config.Config{
+		Meta: config.Meta{
+			Name: "sidecar-scope-with-virtual-service",
+		},
+		Spec: &networking.Sidecar{
+			Egress: []*networking.IstioEgressListener{
+				{
+					Port: &networking.Port{
+						Number:   7443,
+						Protocol: "http",
+						Name:     "grpc-tls",
+					},
+					Hosts: []string{"*/*"},
+				},
+			},
+		},
+	}
+
+	configs16 = &config.Config{
+		Meta: config.Meta{
+			Name:      "sidecar-scope-with-specific-host",
+			Namespace: "ns1",
+		},
+		Spec: &networking.Sidecar{
+			Egress: []*networking.IstioEgressListener{
+				{
+					Hosts: []string{"*/en.wikipedia.org"},
+				},
+			},
+		},
+	}
+
+	configs17 = &config.Config{
+		Meta: config.Meta{
+			Name:      "sidecar-scope-with-wildcard-host",
+			Namespace: "ns1",
+		},
+		Spec: &networking.Sidecar{
+			Egress: []*networking.IstioEgressListener{
+				{
+					Hosts: []string{"*/*.wikipedia.org"},
+				},
+			},
+		},
+	}
+
+	configs18 = &config.Config{
+		Meta: config.Meta{
+			Name:      "sidecar-scope-with-workloadselector-specific-dr-match",
+			Namespace: "mynamespace",
+			Labels:    map[string]string{"app": "app2"},
+		},
+		Spec: &networking.Sidecar{},
+	}
+
+	configs19 = &config.Config{
+		Meta: config.Meta{
+			Name:      "sidecar-scope-with-workloadselector-specific-dr-no-match",
+			Namespace: "mynamespace",
+			Labels:    map[string]string{"app": "app5"},
+		},
+		Spec: &networking.Sidecar{},
+	}
+
+	configs20 = &config.Config{
+		Meta: config.Meta{
+			Name:      "sidecar-scope-with-same-workloadselector-label-drs-merged",
+			Namespace: "mynamespace",
+			Labels:    map[string]string{"app": "app1"},
+		},
+		Spec: &networking.Sidecar{},
+	}
+
+	configs21 = &config.Config{
+		Meta: config.Meta{
+			Name: "virtual-service-destinations-matching-http-virtual-service-ports",
+		},
+		Spec: &networking.Sidecar{
+			Egress: []*networking.IstioEgressListener{
+				{
+					Hosts: []string{"foo/virtualbar"},
+				},
+			},
+		},
+	}
+
 	services1 = []*Service{
-		{Hostname: "bar"},
+		{
+			Hostname: "bar",
+		},
 	}
 
 	services2 = []*Service{
@@ -375,7 +506,9 @@ var (
 			Hostname: "bar",
 			Ports:    port8000,
 		},
-		{Hostname: "barprime"},
+		{
+			Hostname: "barprime",
+		},
 	}
 
 	services3 = []*Service{
@@ -383,12 +516,18 @@ var (
 			Hostname: "bar",
 			Ports:    port9000,
 		},
-		{Hostname: "barprime"},
+		{
+			Hostname: "barprime",
+		},
 	}
 
 	services4 = []*Service{
-		{Hostname: "bar"},
-		{Hostname: "barprime"},
+		{
+			Hostname: "bar",
+		},
+		{
+			Hostname: "barprime",
+		},
 	}
 
 	services5 = []*Service{
@@ -611,9 +750,182 @@ var (
 		},
 	}
 
-	virtualServices1 = []Config{
+	services15 = []*Service{
 		{
-			ConfigMeta: ConfigMeta{
+			Hostname: "foo.svc.cluster.local",
+			Ports:    port7443,
+			Attributes: ServiceAttributes{
+				Name:      "foo",
+				Namespace: "ns1",
+				ExportTo:  map[visibility.Instance]bool{visibility.Private: true},
+			},
+		},
+		{
+			Hostname: "foo.svc.cluster.local",
+			Ports:    port8000,
+			Attributes: ServiceAttributes{
+				Name:      "foo",
+				Namespace: "ns2",
+			},
+		},
+		{
+			Hostname: "baz.svc.cluster.local",
+			Ports:    port7443,
+			Attributes: ServiceAttributes{
+				Name:      "baz",
+				Namespace: "ns3",
+			},
+		},
+	}
+
+	services16 = []*Service{
+		{
+			Hostname: "foo.svc.cluster.local",
+			Ports:    port7443,
+			Attributes: ServiceAttributes{
+				Name:      "foo",
+				Namespace: "ns1",
+			},
+		},
+		{
+			Hostname: "baz.svc.cluster.local",
+			Ports:    port7443,
+			Attributes: ServiceAttributes{
+				Name:      "baz",
+				Namespace: "ns3",
+			},
+		},
+		{
+			Hostname: "bar.svc.cluster.local",
+			Ports:    port7442,
+			Attributes: ServiceAttributes{
+				Name:      "bar",
+				Namespace: "ns2",
+			},
+		},
+		{
+			Hostname: "barprime.svc.cluster.local",
+			Ports:    port7442,
+			Attributes: ServiceAttributes{
+				Name:      "barprime",
+				Namespace: "ns3",
+			},
+		},
+		{
+			Hostname: "barprime.svc.cluster.local",
+			Ports:    port7442,
+			Attributes: ServiceAttributes{
+				Name:      "barprime",
+				Namespace: "ns3",
+			},
+		},
+		{
+			Hostname: "random.svc.cluster.local",
+			Ports:    port9999,
+			Attributes: ServiceAttributes{
+				Name:      "random",
+				Namespace: "randomns", // nolint
+			},
+		},
+	}
+
+	services17 = []*Service{
+		{
+			Hostname: "foo.svc.cluster.local",
+			Ports:    port7443,
+			Attributes: ServiceAttributes{
+				Name:      "foo",
+				Namespace: "ns1",
+			},
+		},
+		{
+			Hostname: "baz.svc.cluster.local",
+			Ports:    port7442,
+			Attributes: ServiceAttributes{
+				Name:      "baz",
+				Namespace: "ns3",
+			},
+		},
+	}
+
+	services18 = []*Service{
+		{
+			Hostname: "foo.svc.cluster.local",
+			Ports:    port7443,
+			Attributes: ServiceAttributes{
+				Name:      "foo",
+				Namespace: "*",
+			},
+		},
+		{
+			Hostname: "baz.svc.cluster.local",
+			Ports:    port7443,
+			Attributes: ServiceAttributes{
+				Name:      "baz",
+				Namespace: "*",
+			},
+		},
+	}
+
+	services19 = []*Service{
+		{
+			Hostname: "en.wikipedia.org",
+			Attributes: ServiceAttributes{
+				Name:      "en.wikipedia.org",
+				Namespace: "ns1",
+			},
+		},
+		{
+			Hostname: "*.wikipedia.org",
+			Attributes: ServiceAttributes{
+				Name:      "*.wikipedia.org",
+				Namespace: "ns1",
+			},
+		},
+	}
+
+	services20 = []*Service{
+		{
+			Hostname: "httpbin.org",
+			Attributes: ServiceAttributes{
+				Namespace: "mynamespace",
+			},
+		},
+	}
+
+	services21 = []*Service{
+		{
+			Hostname: "foo.svc.cluster.local",
+			Ports:    twoPorts,
+			Attributes: ServiceAttributes{
+				Name:      "foo",
+				Namespace: "ns1",
+			},
+		},
+		{
+			Hostname: "baz.svc.cluster.local",
+			Ports:    twoPorts,
+			Attributes: ServiceAttributes{
+				Name:      "baz",
+				Namespace: "ns3",
+			},
+		},
+	}
+
+	services22 = []*Service{
+		{
+			Hostname: "baz.svc.cluster.local",
+			Ports:    port7443,
+			Attributes: ServiceAttributes{
+				Name:      "baz",
+				Namespace: "ns3",
+			},
+		},
+	}
+
+	virtualServices1 = []config.Config{
+		{
+			Meta: config.Meta{
 				GroupVersionKind: collections.IstioNetworkingV1Alpha3Virtualservices.Resource().GroupVersionKind(),
 				Name:             "virtualbar",
 				Namespace:        "foo",
@@ -629,20 +941,230 @@ var (
 			},
 		},
 	}
+
+	virtualServices2 = []config.Config{
+		{
+			Meta: config.Meta{
+				GroupVersionKind: collections.IstioNetworkingV1Alpha3Virtualservices.Resource().GroupVersionKind(),
+				Name:             "virtualbar",
+				Namespace:        "foo",
+			},
+			Spec: &networking.VirtualService{
+				Hosts: []string{"virtualbar", "*"},
+				Http: []*networking.HTTPRoute{
+					{
+						Mirror: &networking.Destination{Host: "foo.svc.cluster.local"},
+						Route:  []*networking.HTTPRouteDestination{{Destination: &networking.Destination{Host: "baz.svc.cluster.local"}}},
+					},
+				},
+			},
+		},
+	}
+
+	virtualServices3 = []config.Config{
+		{
+			Meta: config.Meta{
+				GroupVersionKind: collections.IstioNetworkingV1Alpha3Virtualservices.Resource().GroupVersionKind(),
+				Name:             "virtualbar",
+				Namespace:        "foo",
+			},
+			Spec: &networking.VirtualService{
+				Hosts: []string{"virtualbar"},
+				Http: []*networking.HTTPRoute{
+					{
+						Route: []*networking.HTTPRouteDestination{
+							{
+								Destination: &networking.Destination{
+									Host: "baz.svc.cluster.local", Port: &networking.PortSelector{Number: 7000},
+								},
+							},
+						},
+						Mirror: &networking.Destination{Host: "foo.svc.cluster.local", Port: &networking.PortSelector{Number: 7000}},
+					},
+				},
+			},
+		},
+	}
+
+	virtualServices4 = []config.Config{
+		{
+			Meta: config.Meta{
+				GroupVersionKind: collections.IstioNetworkingV1Alpha3Virtualservices.Resource().GroupVersionKind(),
+				Name:             "virtualbar",
+				Namespace:        "foo",
+			},
+			Spec: &networking.VirtualService{
+				Hosts: []string{"virtualbar"},
+				Tcp: []*networking.TCPRoute{
+					{
+						Route: []*networking.RouteDestination{
+							{
+								Destination: &networking.Destination{
+									Host: "baz.svc.cluster.local", Port: &networking.PortSelector{Number: 7000},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	virtualServices5 = []config.Config{
+		{
+			Meta: config.Meta{
+				GroupVersionKind: collections.IstioNetworkingV1Alpha3Virtualservices.Resource().GroupVersionKind(),
+				Name:             "virtualbar",
+				Namespace:        "foo",
+			},
+			Spec: &networking.VirtualService{
+				Hosts: []string{"virtualbar"},
+				Tls: []*networking.TLSRoute{
+					{
+						Route: []*networking.RouteDestination{
+							{
+								Destination: &networking.Destination{
+									Host: "baz.svc.cluster.local", Port: &networking.PortSelector{Number: 7000},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	destinationRule1 = config.Config{
+		Meta: config.Meta{
+			Name:      "drRule1",
+			Namespace: "mynamespace",
+		},
+		Spec: &networking.DestinationRule{
+			Host: "httpbin.org",
+			WorkloadSelector: &v1beta1.WorkloadSelector{
+				MatchLabels: map[string]string{"app": "app1"},
+			},
+			TrafficPolicy: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 33,
+					},
+					Tcp: &networking.ConnectionPoolSettings_TCPSettings{
+						ConnectTimeout: &durationpb.Duration{Seconds: 33},
+					},
+				},
+			},
+		},
+	}
+	destinationRule2 = config.Config{
+		Meta: config.Meta{
+			Name:      "drRule2",
+			Namespace: "mynamespace",
+		},
+		Spec: &networking.DestinationRule{
+			Host: "httpbin.org",
+			WorkloadSelector: &v1beta1.WorkloadSelector{
+				MatchLabels: map[string]string{"app": "app2"},
+			},
+			TrafficPolicy: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 33,
+					},
+					Tcp: &networking.ConnectionPoolSettings_TCPSettings{
+						ConnectTimeout: &durationpb.Duration{Seconds: 33},
+					},
+				},
+				OutlierDetection: &networking.OutlierDetection{
+					Consecutive_5XxErrors: &wrappers.UInt32Value{Value: 3},
+				},
+			},
+		},
+	}
+	mergedDr1and3 = config.Config{
+		Meta: config.Meta{
+			Name:      "drRule1",
+			Namespace: "mynamespace",
+		},
+		Spec: &networking.DestinationRule{
+			Host: "httpbin.org",
+			WorkloadSelector: &v1beta1.WorkloadSelector{
+				MatchLabels: map[string]string{"app": "app1"},
+			},
+			TrafficPolicy: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 33,
+					},
+					Tcp: &networking.ConnectionPoolSettings_TCPSettings{
+						ConnectTimeout: &durationpb.Duration{Seconds: 33},
+					},
+				},
+			},
+			Subsets: []*networking.Subset{
+				{
+					Name: "subset1",
+				},
+				{
+					Name: "subset2",
+				},
+			},
+		},
+	}
+	destinationRule3 = config.Config{
+		Meta: config.Meta{
+			Name:      "drRule3",
+			Namespace: "mynamespace",
+		},
+		Spec: &networking.DestinationRule{
+			Host: "httpbin.org",
+			WorkloadSelector: &v1beta1.WorkloadSelector{
+				MatchLabels: map[string]string{"app": "app1"},
+			},
+			Subsets: []*networking.Subset{
+				{
+					Name: "subset1",
+				},
+				{
+					Name: "subset2",
+				},
+			},
+		},
+	}
+	nonWorkloadSelectorDr = config.Config{
+		Meta: config.Meta{
+			Name:      "drRule3",
+			Namespace: "mynamespace",
+		},
+		Spec: &networking.DestinationRule{
+			Host: "httpbin.org",
+			TrafficPolicy: &networking.TrafficPolicy{
+				ConnectionPool: &networking.ConnectionPoolSettings{
+					Http: &networking.ConnectionPoolSettings_HTTPSettings{
+						MaxRetries: 33,
+					},
+					Tcp: &networking.ConnectionPoolSettings_TCPSettings{
+						ConnectTimeout: &durationpb.Duration{Seconds: 33},
+					},
+				},
+			},
+		},
+	}
 )
 
 func TestCreateSidecarScope(t *testing.T) {
 	tests := []struct {
 		name          string
-		sidecarConfig *Config
+		sidecarConfig *config.Config
 		// list of available service for a given proxy
 		services        []*Service
-		virtualServices []Config
+		virtualServices []config.Config
 		// list of services expected to be in the listener
 		excpectedServices []*Service
+		expectedDr        *config.Config
 	}{
 		{
 			"no-sidecar-config",
+			nil,
 			nil,
 			nil,
 			nil,
@@ -658,10 +1180,12 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "bar",
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-multiple-egress",
 			configs1,
+			nil,
 			nil,
 			nil,
 			nil,
@@ -677,6 +1201,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "bar",
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-multiple-egress-with-service-on-same-port",
@@ -691,6 +1216,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "barprime",
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-multiple-egress-with-multiple-service",
@@ -705,10 +1231,12 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "barprime",
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-zero-egress",
 			configs2,
+			nil,
 			nil,
 			nil,
 			nil,
@@ -718,11 +1246,20 @@ func TestCreateSidecarScope(t *testing.T) {
 			configs2,
 			services4,
 			nil,
+			[]*Service{
+				{
+					Hostname: "bar",
+				},
+				{
+					Hostname: "barprime",
+				},
+			},
 			nil,
 		},
 		{
 			"sidecar-with-multiple-egress-noport",
 			configs3,
+			nil,
 			nil,
 			nil,
 			nil,
@@ -740,6 +1277,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "barprime",
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-multiple-egress-noport-with-services",
@@ -754,6 +1292,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "barprime",
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-egress-port-match-with-services-with-and-without-port",
@@ -765,6 +1304,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "bar",
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-egress-port-trims-service-non-matching-ports",
@@ -777,6 +1317,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    port8000,
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-egress-port-merges-service-ports",
@@ -789,6 +1330,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    twoPorts,
 				},
 			},
+			nil,
 		},
 		{
 			"sidecar-with-egress-port-trims-and-merges-service-ports",
@@ -809,6 +1351,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    twoPorts,
 				},
 			},
+			nil,
 		},
 		{
 			"two-egresslisteners-one-with-port-and-without-port",
@@ -824,6 +1367,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "private.com",
 				},
 			},
+			nil,
 		},
 		// Validates when service is scoped to Sidecar, it uses service port rather than listener port.
 		{
@@ -837,6 +1381,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    port7443,
 				},
 			},
+			nil,
 		},
 		{
 			"wild-card-egress-listener-match",
@@ -861,6 +1406,48 @@ func TestCreateSidecarScope(t *testing.T) {
 					},
 				},
 			},
+			nil,
+		},
+		{
+			"wild-card-egress-listener-match-and-all-hosts",
+			configs14,
+			services16,
+			nil,
+			[]*Service{
+				{
+					Hostname: "foo.svc.cluster.local",
+					Ports:    port7443,
+				},
+				{
+					Hostname: "baz.svc.cluster.local",
+					Ports:    port7443,
+				},
+				{
+					Hostname: "bar.svc.cluster.local",
+					Ports:    port7442,
+					Attributes: ServiceAttributes{
+						Name:      "bar",
+						Namespace: "ns2",
+					},
+				},
+				{
+					Hostname: "barprime.svc.cluster.local",
+					Ports:    port7442,
+					Attributes: ServiceAttributes{
+						Name:      "barprime",
+						Namespace: "ns3",
+					},
+				},
+				{
+					Hostname: "random.svc.cluster.local",
+					Ports:    port9999,
+					Attributes: ServiceAttributes{
+						Name:      "random",
+						Namespace: "randomns", // nolint
+					},
+				},
+			},
+			nil,
 		},
 		{
 			"wild-card-egress-listener-match-with-two-ports",
@@ -885,6 +1472,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					},
 				},
 			},
+			nil,
 		},
 		{
 			"http-proxy-protocol-matches-any-port",
@@ -896,11 +1484,13 @@ func TestCreateSidecarScope(t *testing.T) {
 					Hostname: "bar",
 				},
 				{
-					Hostname: "barprime"},
+					Hostname: "barprime",
+				},
 				{
 					Hostname: "foo",
 				},
 			},
+			nil,
 		},
 		{
 			"virtual-service",
@@ -917,6 +1507,63 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    port7443,
 				},
 			},
+			nil,
+		},
+		{
+			"virtual-service-destinations-matching-ports",
+			configs15,
+			services17,
+			virtualServices1,
+			[]*Service{
+				{
+					Hostname: "foo.svc.cluster.local",
+					Ports:    port7443,
+				},
+			},
+			nil,
+		},
+		{
+			"virtual-service-destinations-matching-http-virtual-service-ports",
+			configs21,
+			services21,
+			virtualServices3,
+			[]*Service{
+				{
+					Hostname: "baz.svc.cluster.local",
+					Ports:    port7000,
+				},
+				{
+					Hostname: "foo.svc.cluster.local",
+					Ports:    port7000,
+				},
+			},
+			nil,
+		},
+		{
+			"virtual-service-destinations-matching-tcp-virtual-service-ports",
+			configs21,
+			services21,
+			virtualServices4,
+			[]*Service{
+				{
+					Hostname: "baz.svc.cluster.local",
+					Ports:    port7000,
+				},
+			},
+			nil,
+		},
+		{
+			"virtual-service-destinations-matching-tls-virtual-service-ports",
+			configs21,
+			services21,
+			virtualServices5,
+			[]*Service{
+				{
+					Hostname: "baz.svc.cluster.local",
+					Ports:    port7000,
+				},
+			},
+			nil,
 		},
 		{
 			"virtual-service-prefer-required",
@@ -935,6 +1582,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    port7443,
 				},
 			},
+			nil,
 		},
 		{
 			"virtual-service-prefer-config-namespace",
@@ -951,6 +1599,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    port7443,
 				},
 			},
+			nil,
 		},
 		{
 			"virtual-service-pick-alphabetical",
@@ -969,6 +1618,26 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    port7443,
 				},
 			},
+			nil,
+		},
+		{
+			"virtual-service-pick-public",
+			configs11,
+			// Ambiguous; same hostname in ns1 and ns2, neither is config namespace
+			// ns1 should always win
+			services15,
+			virtualServices1,
+			[]*Service{
+				{
+					Hostname: "foo.svc.cluster.local",
+					Ports:    port8000,
+				},
+				{
+					Hostname: "baz.svc.cluster.local",
+					Ports:    port7443,
+				},
+			},
+			nil,
 		},
 		{
 			"virtual-service-bad-host",
@@ -981,6 +1650,66 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    port7443,
 				},
 			},
+			nil,
+		},
+		{
+			"virtual-service-destination-port-missing-from-service",
+			configs21,
+			services22,
+			virtualServices3,
+			[]*Service{},
+			nil,
+		},
+		{
+			"virtual-service-2-match-service",
+			configs11,
+			services18,
+			virtualServices2,
+			[]*Service{
+				{
+					Hostname: "foo.svc.cluster.local",
+					Ports:    port7443,
+				},
+				{
+					Hostname: "baz.svc.cluster.local",
+					Ports:    port7443,
+				},
+			},
+			nil,
+		},
+		{
+			"virtual-service-2-match-service-and-domain",
+			configs12,
+			services18,
+			virtualServices2,
+			[]*Service{
+				{
+					Hostname: "foo.svc.cluster.local",
+					Ports:    port7443,
+				},
+				{
+					Hostname: "baz.svc.cluster.local",
+					Ports:    port7443,
+				},
+			},
+			nil,
+		},
+		{
+			"virtual-service-2-match-all-services",
+			configs15,
+			services18,
+			virtualServices2,
+			[]*Service{
+				{
+					Hostname: "foo.svc.cluster.local",
+					Ports:    port7443,
+				},
+				{
+					Hostname: "baz.svc.cluster.local",
+					Ports:    port7443,
+				},
+			},
+			nil,
 		},
 		{
 			"sidecar-scope-with-illegal-host",
@@ -993,6 +1722,125 @@ func TestCreateSidecarScope(t *testing.T) {
 					Ports:    port7443,
 				},
 			},
+			nil,
+		},
+		{
+			"sidecar-scope-with-specific-host",
+			configs16,
+			services19,
+			nil,
+			[]*Service{
+				{
+					Hostname: "en.wikipedia.org",
+				},
+			},
+			nil,
+		},
+		{
+			"sidecar-scope-with-wildcard-host",
+			configs17,
+			services19,
+			nil,
+			[]*Service{
+				{
+					Hostname: "en.wikipedia.org",
+				},
+				{
+					Hostname: "*.wikipedia.org",
+				},
+			},
+			nil,
+		},
+		{
+			"sidecar-scope-with-matching-workloadselector-dr",
+			configs18,
+			services20,
+			nil,
+			[]*Service{
+				{
+					Hostname: "httpbin.org",
+					Attributes: ServiceAttributes{
+						Namespace: "mynamespace",
+					},
+				},
+			},
+			&destinationRule2,
+		},
+		{
+			"sidecar-scope-with-non-matching-workloadselector-dr",
+			configs19,
+			services20,
+			nil,
+			[]*Service{
+				{
+					Hostname: "httpbin.org",
+					Attributes: ServiceAttributes{
+						Namespace: "mynamespace",
+					},
+				},
+			},
+			&nonWorkloadSelectorDr,
+		},
+		{
+			"sidecar-scope-same-workloadselector-labels-drs-should-be-merged",
+			configs20,
+			services20,
+			nil,
+			[]*Service{
+				{
+					Hostname: "httpbin.org",
+					Attributes: ServiceAttributes{
+						Namespace: "mynamespace",
+					},
+				},
+			},
+			&mergedDr1and3,
+		},
+		{
+			name: "multi-service-merge",
+			sidecarConfig: &config.Config{
+				Meta: config.Meta{
+					Name:      "default",
+					Namespace: "default",
+				},
+				Spec: &networking.Sidecar{},
+			},
+			services: []*Service{
+				{
+					Hostname: "proxy",
+					Ports:    port7000,
+					Attributes: ServiceAttributes{
+						Name:      "s1",
+						Namespace: "default",
+					},
+				},
+				{
+					Hostname: "proxy",
+					Ports:    port7443,
+					Attributes: ServiceAttributes{
+						Name:      "s2",
+						Namespace: "default",
+					},
+				},
+				{
+					Hostname: "proxy",
+					Ports:    port7442,
+					Attributes: ServiceAttributes{
+						Name:      "s3",
+						Namespace: "default",
+					},
+				},
+			},
+			excpectedServices: []*Service{
+				{
+					Hostname: "proxy",
+					Ports:    PortList{port7000[0], port7443[0], port7442[0]},
+					Attributes: ServiceAttributes{
+						Name:      "s1",
+						Namespace: "default",
+					},
+				},
+			},
 		},
 	}
 
@@ -1001,19 +1849,27 @@ func TestCreateSidecarScope(t *testing.T) {
 			var found bool
 			ps := NewPushContext()
 			meshConfig := mesh.DefaultMeshConfig()
-			ps.Mesh = &meshConfig
+			ps.Mesh = meshConfig
+			ps.setDestinationRules([]config.Config{destinationRule1, destinationRule2, destinationRule3, nonWorkloadSelectorDr})
 			if tt.services != nil {
-				ps.publicServices = append(ps.publicServices, tt.services...)
+				ps.ServiceIndex.public = append(ps.ServiceIndex.public, tt.services...)
 
 				for _, s := range tt.services {
-					if _, f := ps.ServiceByHostnameAndNamespace[s.Hostname]; !f {
-						ps.ServiceByHostnameAndNamespace[s.Hostname] = map[string]*Service{}
+					if _, f := ps.ServiceIndex.HostnameAndNamespace[s.Hostname]; !f {
+						ps.ServiceIndex.HostnameAndNamespace[s.Hostname] = map[string]*Service{}
 					}
-					ps.ServiceByHostnameAndNamespace[s.Hostname][s.Attributes.Namespace] = s
+					ps.ServiceIndex.HostnameAndNamespace[s.Hostname][s.Attributes.Namespace] = s
 				}
 			}
 			if tt.virtualServices != nil {
-				ps.publicVirtualServicesByGateway[constants.IstioMeshGateway] = append(ps.publicVirtualServicesByGateway[constants.IstioMeshGateway], tt.virtualServices...)
+				// nolint lll
+				ps.virtualServiceIndex.publicByGateway[constants.IstioMeshGateway] = append(ps.virtualServiceIndex.publicByGateway[constants.IstioMeshGateway], tt.virtualServices...)
+			}
+
+			ps.exportToDefaults = exportToDefaults{
+				virtualService:  map[visibility.Instance]bool{visibility.Public: true},
+				service:         map[visibility.Instance]bool{visibility.Public: true},
+				destinationRule: map[visibility.Instance]bool{visibility.Public: true},
 			}
 
 			sidecarConfig := tt.sidecarConfig
@@ -1021,42 +1877,14 @@ func TestCreateSidecarScope(t *testing.T) {
 			configuredListeneres := 1
 			if sidecarConfig != nil {
 				r := sidecarConfig.Spec.(*networking.Sidecar)
-				configuredListeneres = len(r.Egress)
+				if len(r.Egress) > 0 {
+					configuredListeneres = len(r.Egress)
+				}
 			}
 
 			numberListeners := len(sidecarScope.EgressListeners)
 			if numberListeners != configuredListeneres {
 				t.Errorf("Expected %d listeners, Got: %d", configuredListeneres, numberListeners)
-			}
-
-			if sidecarConfig != nil {
-				a := sidecarConfig.Spec.(*networking.Sidecar)
-				for _, egress := range a.Egress {
-					for _, egressHost := range egress.Hosts {
-						parts := strings.SplitN(egressHost, "/", 2)
-						if len(parts) < 2 {
-							continue
-						}
-						found = false
-						for _, listeners := range sidecarScope.EgressListeners {
-							if sidecarScopeHosts, ok := listeners.listenerHosts[parts[0]]; ok {
-								for _, sidecarScopeHost := range sidecarScopeHosts {
-									if sidecarScopeHost == host.Name(parts[1]) &&
-										listeners.IstioListener.Port == egress.Port {
-										found = true
-										break
-									}
-								}
-							}
-							if found {
-								break
-							}
-						}
-						if !found {
-							t.Errorf("Did not find %v entry in any listener", egressHost)
-						}
-					}
-				}
 			}
 
 			for _, s1 := range sidecarScope.services {
@@ -1075,7 +1903,7 @@ func TestCreateSidecarScope(t *testing.T) {
 					}
 				}
 				if !found {
-					t.Errorf("Unexpected service %v found in SidecarScope", s1.Hostname)
+					t.Errorf("Expected service %v in SidecarScope but not found", s1.Hostname)
 				}
 			}
 
@@ -1088,10 +1916,19 @@ func TestCreateSidecarScope(t *testing.T) {
 					}
 				}
 				if !found {
-					t.Errorf("Expected service %v in SidecarScope, but did not find it", s1)
+					t.Errorf("UnExpected service %v in SidecarScope", s1.Hostname)
 				}
 			}
-			// TODO destination rule
+
+			if tt.sidecarConfig != nil {
+				dr := sidecarScope.DestinationRule(TrafficDirectionOutbound,
+					&Proxy{
+						Labels:          tt.sidecarConfig.Labels,
+						Metadata:        &NodeMetadata{Labels: tt.sidecarConfig.Labels},
+						ConfigNamespace: tt.sidecarConfig.Namespace,
+					}, host.Name("httpbin.org")).GetRule()
+				assert.Equal(t, dr, tt.expectedDr)
+			}
 		})
 	}
 }
@@ -1186,14 +2023,26 @@ func TestIstioEgressListenerWrapper(t *testing.T) {
 			expected:      []*Service{},
 			namespace:     "a",
 		},
+		{
+			name:          "multiple hosts selected same service",
+			listenerHosts: map[string][]host.Name{"a": {wildcardService}, "*": {wildcardService}},
+			services:      []*Service{serviceA8000},
+			expected:      []*Service{serviceA8000},
+			namespace:     "a",
+		},
+		{
+			name:          "fall back to wildcard namespace",
+			listenerHosts: map[string][]host.Name{wildcardNamespace: {"host"}, "a": {"alt"}},
+			services:      allServices,
+			expected:      []*Service{serviceA8000, serviceA9000, serviceAalt},
+			namespace:     "a",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ilw := &IstioEgressListenerWrapper{
-				listenerHosts: tt.listenerHosts,
-			}
-			got := ilw.selectServices(tt.services, tt.namespace)
+			ilw := &IstioEgressListenerWrapper{}
+			got := ilw.selectServices(tt.services, tt.namespace, tt.listenerHosts)
 			if !reflect.DeepEqual(got, tt.expected) {
 				gots, _ := json.MarshalIndent(got, "", "  ")
 				expecteds, _ := json.MarshalIndent(tt.expected, "", "  ")
@@ -1213,9 +2062,9 @@ func TestContainsEgressDependencies(t *testing.T) {
 
 	allContains := func(ns string, contains bool) map[ConfigKey]bool {
 		return map[ConfigKey]bool{
-			{gvk.ServiceEntry, svcName, ns}:   contains,
-			{gvk.VirtualService, vsName, ns}:  contains,
-			{gvk.DestinationRule, drName, ns}: contains,
+			{kind.ServiceEntry, svcName, ns}:   contains,
+			{kind.VirtualService, vsName, ns}:  contains,
+			{kind.DestinationRule, drName, ns}: contains,
 		}
 	}
 
@@ -1231,11 +2080,14 @@ func TestContainsEgressDependencies(t *testing.T) {
 		{"Wrong Namespace", []string{"ns/*"}, allContains("other-ns", false)},
 		{"No Sidecar", nil, allContains("ns", true)},
 		{"No Sidecar Other Namespace", nil, allContains("other-ns", false)},
+		{"clusterScope resource", []string{"*/*"}, map[ConfigKey]bool{
+			{kind.AuthorizationPolicy, "authz", "default"}: true,
+		}},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{
-				ConfigMeta: ConfigMeta{
+			cfg := &config.Config{
+				Meta: config.Meta{
 					Name:      "foo",
 					Namespace: "default",
 				},
@@ -1249,15 +2101,21 @@ func TestContainsEgressDependencies(t *testing.T) {
 			}
 			ps := NewPushContext()
 			meshConfig := mesh.DefaultMeshConfig()
-			ps.Mesh = &meshConfig
+			ps.Mesh = meshConfig
 
 			services := []*Service{
-				{Hostname: "nomatch", Attributes: ServiceAttributes{Namespace: "nomatch"}},
-				{Hostname: svcName, Attributes: ServiceAttributes{Namespace: nsName}},
-			}
-			virtualServices := []Config{
 				{
-					ConfigMeta: ConfigMeta{
+					Hostname:   "nomatch",
+					Attributes: ServiceAttributes{Namespace: "nomatch"},
+				},
+				{
+					Hostname:   svcName,
+					Attributes: ServiceAttributes{Namespace: nsName},
+				},
+			}
+			virtualServices := []config.Config{
+				{
+					Meta: config.Meta{
 						Name:      vsName,
 						Namespace: nsName,
 					},
@@ -1266,9 +2124,9 @@ func TestContainsEgressDependencies(t *testing.T) {
 					},
 				},
 			}
-			destinationRules := []Config{
+			destinationRules := []config.Config{
 				{
-					ConfigMeta: ConfigMeta{
+					Meta: config.Meta{
 						Name:      drName,
 						Namespace: nsName,
 					},
@@ -1278,9 +2136,57 @@ func TestContainsEgressDependencies(t *testing.T) {
 					},
 				},
 			}
-			ps.publicServices = append(ps.publicServices, services...)
-			ps.publicVirtualServicesByGateway[constants.IstioMeshGateway] = append(ps.publicVirtualServicesByGateway[constants.IstioMeshGateway], virtualServices...)
-			ps.SetDestinationRules(destinationRules)
+			ps.ServiceIndex.public = append(ps.ServiceIndex.public, services...)
+			// nolint lll
+			ps.virtualServiceIndex.publicByGateway[constants.IstioMeshGateway] = append(ps.virtualServiceIndex.publicByGateway[constants.IstioMeshGateway], virtualServices...)
+			ps.setDestinationRules(destinationRules)
+			sidecarScope := ConvertToSidecarScope(ps, cfg, "default")
+			if len(tt.egress) == 0 {
+				sidecarScope = DefaultSidecarScopeForNamespace(ps, "default")
+			}
+
+			for k, v := range tt.contains {
+				if ok := sidecarScope.DependsOnConfig(k); ok != v {
+					t.Fatalf("Expected contains %v-%v, but no match", k, v)
+				}
+			}
+		})
+	}
+}
+
+func TestRootNsSidecarDependencies(t *testing.T) {
+	cases := []struct {
+		name   string
+		egress []string
+
+		contains map[ConfigKey]bool
+	}{
+		{"authorizationPolicy in same ns with workload", []string{"*/*"}, map[ConfigKey]bool{
+			{kind.AuthorizationPolicy, "authz", "default"}: true,
+		}},
+		{"authorizationPolicy in different ns with workload", []string{"*/*"}, map[ConfigKey]bool{
+			{kind.AuthorizationPolicy, "authz", "ns1"}: false,
+		}},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				Meta: config.Meta{
+					Name:      "foo",
+					Namespace: constants.IstioSystemNamespace,
+				},
+				Spec: &networking.Sidecar{
+					Egress: []*networking.IstioEgressListener{
+						{
+							Hosts: tt.egress,
+						},
+					},
+				},
+			}
+			ps := NewPushContext()
+			meshConfig := mesh.DefaultMeshConfig()
+			ps.Mesh = meshConfig
 			sidecarScope := ConvertToSidecarScope(ps, cfg, "default")
 			if len(tt.egress) == 0 {
 				sidecarScope = DefaultSidecarScopeForNamespace(ps, "default")
@@ -1296,16 +2202,15 @@ func TestContainsEgressDependencies(t *testing.T) {
 }
 
 func TestSidecarOutboundTrafficPolicy(t *testing.T) {
-
-	configWithoutOutboundTrafficPolicy := &Config{
-		ConfigMeta: ConfigMeta{
+	configWithoutOutboundTrafficPolicy := &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
 		Spec: &networking.Sidecar{},
 	}
-	configRegistryOnly := &Config{
-		ConfigMeta: ConfigMeta{
+	configRegistryOnly := &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
@@ -1315,8 +2220,8 @@ func TestSidecarOutboundTrafficPolicy(t *testing.T) {
 			},
 		},
 	}
-	configAllowAny := &Config{
-		ConfigMeta: ConfigMeta{
+	configAllowAny := &config.Config{
+		Meta: config.Meta{
 			Name:      "foo",
 			Namespace: "not-default",
 		},
@@ -1337,8 +2242,8 @@ outboundTrafficPolicy:
 
 	tests := []struct {
 		name                  string
-		meshConfig            v1alpha1.MeshConfig
-		sidecar               *Config
+		meshConfig            *v1alpha1.MeshConfig
+		sidecar               *config.Config
 		outboundTrafficPolicy *networking.OutboundTrafficPolicy
 	}{
 		{
@@ -1375,7 +2280,7 @@ outboundTrafficPolicy:
 		},
 		{
 			name:       "MeshConfig registry only, no Sidecar",
-			meshConfig: *meshConfigWithRegistryOnly,
+			meshConfig: meshConfigWithRegistryOnly,
 			sidecar:    nil,
 			outboundTrafficPolicy: &networking.OutboundTrafficPolicy{
 				Mode: networking.OutboundTrafficPolicy_REGISTRY_ONLY,
@@ -1383,7 +2288,7 @@ outboundTrafficPolicy:
 		},
 		{
 			name:       "MeshConfig registry only, sidecar without OutboundTrafficPolicy",
-			meshConfig: *meshConfigWithRegistryOnly,
+			meshConfig: meshConfigWithRegistryOnly,
 			sidecar:    configWithoutOutboundTrafficPolicy,
 			outboundTrafficPolicy: &networking.OutboundTrafficPolicy{
 				Mode: networking.OutboundTrafficPolicy_REGISTRY_ONLY,
@@ -1391,7 +2296,7 @@ outboundTrafficPolicy:
 		},
 		{
 			name:       "MeshConfig registry only, Sidecar with registry only",
-			meshConfig: *meshConfigWithRegistryOnly,
+			meshConfig: meshConfigWithRegistryOnly,
 			sidecar:    configRegistryOnly,
 			outboundTrafficPolicy: &networking.OutboundTrafficPolicy{
 				Mode: networking.OutboundTrafficPolicy_REGISTRY_ONLY,
@@ -1399,7 +2304,7 @@ outboundTrafficPolicy:
 		},
 		{
 			name:       "MeshConfig registry only, Sidecar with allow any",
-			meshConfig: *meshConfigWithRegistryOnly,
+			meshConfig: meshConfigWithRegistryOnly,
 			sidecar:    configAllowAny,
 			outboundTrafficPolicy: &networking.OutboundTrafficPolicy{
 				Mode: networking.OutboundTrafficPolicy_ALLOW_ANY,
@@ -1410,7 +2315,7 @@ outboundTrafficPolicy:
 	for i, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ps := NewPushContext()
-			ps.Mesh = &tests[i].meshConfig
+			ps.Mesh = tests[i].meshConfig
 
 			var sidecarScope *SidecarScope
 			if test.sidecar == nil {
@@ -1423,7 +2328,6 @@ outboundTrafficPolicy:
 				t.Errorf("Unexpected sidecar outbound traffic, want %v, found %v",
 					test.outboundTrafficPolicy, sidecarScope.OutboundTrafficPolicy)
 			}
-
 		})
 	}
 }

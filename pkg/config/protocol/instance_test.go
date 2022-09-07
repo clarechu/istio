@@ -30,7 +30,7 @@ func TestIsHTTP(t *testing.T) {
 }
 
 func TestParse(t *testing.T) {
-	var testPairs = []struct {
+	testPairs := []struct {
 		name string
 		out  protocol.Instance
 	}{
@@ -60,6 +60,7 @@ func TestParse(t *testing.T) {
 		{"MySQL", protocol.MySQL},
 		{"", protocol.Unsupported},
 		{"SMTP", protocol.Unsupported},
+		{"HBONE", protocol.Unsupported},
 	}
 
 	for _, testPair := range testPairs {

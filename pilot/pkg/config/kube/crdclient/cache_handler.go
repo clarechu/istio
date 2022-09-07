@@ -15,19 +15,16 @@
 package crdclient
 
 import (
-	"reflect"
-
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
-	"k8s.io/client-go/tools/cache"
-
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"  // import GKE cluster authentication plugin
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc" // import OIDC cluster authentication plugin, e.g. for Tectonic
-
-	"istio.io/pkg/log"
+	"k8s.io/client-go/tools/cache"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/pkg/log"
 )
 
 // cacheHandler abstracts the logic of an informer with a set of handlers. Handlers can be added at runtime
@@ -35,41 +32,53 @@ import (
 type cacheHandler struct {
 	client   *Client
 	informer cache.SharedIndexInformer
-	handlers []func(model.Config, model.Config, model.Event)
 	schema   collection.Schema
 	lister   func(namespace string) cache.GenericNamespaceLister
 }
 
-func (h *cacheHandler) onEvent(old interface{}, curr interface{}, event model.Event) error {
+func (h *cacheHandler) onEvent(old any, curr any, event model.Event) error {
 	if err := h.client.checkReadyForEvents(curr); err != nil {
 		return err
 	}
 
 	currItem, ok := curr.(runtime.Object)
-	if !ok {
-		scope.Warnf("New Object can not be converted to runtime Object %v, is type %T", curr, curr)
+	if !ok && event == model.EventDelete {
+		tombstone, ok := curr.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			scope.Warnf("Couldn't get object from tombstone %v, type %T", curr, curr)
+			return nil
+		}
+		currItem, ok = tombstone.Obj.(runtime.Object)
+		if !ok {
+			scope.Warnf("Tombstone's Object is not runtime Object %v, type %T", tombstone.Obj, tombstone.Obj)
+			return nil
+		}
+	} else if !ok {
+		scope.Warnf("Object can not be converted to runtime Object %v, is type %T", curr, curr)
 		return nil
 	}
-	currConfig := *TranslateObject(currItem, h.schema.Resource().GroupVersionKind(), h.client.domainSuffix)
 
-	var oldConfig model.Config
+	currConfig := TranslateObject(currItem, h.schema.Resource().GroupVersionKind(), h.client.domainSuffix)
+
+	var oldConfig config.Config
 	if old != nil {
 		oldItem, ok := old.(runtime.Object)
 		if !ok {
 			log.Warnf("Old Object can not be converted to runtime Object %v, is type %T", old, old)
 			return nil
 		}
-		oldConfig = *TranslateObject(oldItem, h.schema.Resource().GroupVersionKind(), h.client.domainSuffix)
+		oldConfig = TranslateObject(oldItem, h.schema.Resource().GroupVersionKind(), h.client.domainSuffix)
 	}
 
 	// TODO we may consider passing a pointer to handlers instead of the value. While spec is a pointer, the meta will be copied
-	for _, f := range h.handlers {
+	for _, f := range h.client.handlers[h.schema.Resource().GroupVersionKind()] {
 		f(oldConfig, currConfig, event)
 	}
 	return nil
 }
 
 func createCacheHandler(cl *Client, schema collection.Schema, i informers.GenericInformer) *cacheHandler {
+	scope.Debugf("registered CRD %v", schema.Resource().GroupVersionKind())
 	h := &cacheHandler{
 		client:   cl,
 		schema:   schema,
@@ -83,27 +92,29 @@ func createCacheHandler(cl *Client, schema collection.Schema, i informers.Generi
 	}
 	kind := schema.Resource().Kind()
 	i.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			incrementEvent(kind, "add")
-			cl.tryLedgerPut(obj, kind)
+			if !cl.beginSync.Load() {
+				return
+			}
 			cl.queue.Push(func() error {
 				return h.onEvent(nil, obj, model.EventAdd)
 			})
 		},
-		UpdateFunc: func(old, cur interface{}) {
-			cl.tryLedgerPut(cur, kind)
-			if !reflect.DeepEqual(old, cur) {
-				incrementEvent(kind, "update")
-				cl.queue.Push(func() error {
-					return h.onEvent(old, cur, model.EventUpdate)
-				})
-			} else {
-				incrementEvent(kind, "updatesame")
+		UpdateFunc: func(old, cur any) {
+			incrementEvent(kind, "update")
+			if !cl.beginSync.Load() {
+				return
 			}
+			cl.queue.Push(func() error {
+				return h.onEvent(old, cur, model.EventUpdate)
+			})
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			incrementEvent(kind, "delete")
-			cl.tryLedgerDelete(obj, kind)
+			if !cl.beginSync.Load() {
+				return
+			}
 			cl.queue.Push(func() error {
 				return h.onEvent(nil, obj, model.EventDelete)
 			})

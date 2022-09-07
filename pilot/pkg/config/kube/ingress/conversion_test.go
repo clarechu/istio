@@ -17,33 +17,31 @@ package ingress
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/ghodss/yaml"
+	"github.com/google/go-cmp/cmp"
+	coreV1 "k8s.io/api/core/v1"
+	"k8s.io/api/networking/v1beta1"
+	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 	listerv1 "k8s.io/client-go/listers/core/v1"
-	"k8s.io/client-go/tools/cache"
-
-	coreV1 "k8s.io/api/core/v1"
-	"k8s.io/api/networking/v1beta1"
-	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-
-	"istio.io/istio/pilot/pkg/config/kube/crd"
-	"istio.io/istio/pilot/test/util"
+	"sigs.k8s.io/yaml"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
-
-	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/config/kube/crd"
+	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/kube"
 )
 
 func TestGoldenConversion(t *testing.T) {
@@ -58,19 +56,19 @@ func TestGoldenConversion(t *testing.T) {
 				t.Fatal(err)
 			}
 			serviceLister := createFakeLister(ctx)
-			cfgs := map[string]*model.Config{}
+			cfgs := map[string]*config.Config{}
 			for _, obj := range input {
 				ingress := obj.(*v1beta1.Ingress)
 				ConvertIngressVirtualService(*ingress, "mydomain", cfgs, serviceLister)
 			}
-			ordered := []model.Config{}
+			ordered := []config.Config{}
 			for _, v := range cfgs {
 				ordered = append(ordered, *v)
 			}
 			for _, obj := range input {
 				ingress := obj.(*v1beta1.Ingress)
 				m := mesh.DefaultMeshConfig()
-				gws := ConvertIngressV1alpha3(*ingress, &m, "mydomain")
+				gws := ConvertIngressV1alpha3(*ingress, m, "mydomain")
 				ordered = append(ordered, gws)
 			}
 
@@ -80,23 +78,23 @@ func TestGoldenConversion(t *testing.T) {
 			output := marshalYaml(t, ordered)
 			goldenFile := fmt.Sprintf("testdata/%s.yaml.golden", tt)
 			if util.Refresh() {
-				if err := ioutil.WriteFile(goldenFile, output, 0644); err != nil {
+				if err := os.WriteFile(goldenFile, output, 0o644); err != nil {
 					t.Fatal(err)
 				}
 			}
-			expected, err := ioutil.ReadFile(goldenFile)
+			expected, err := os.ReadFile(goldenFile)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(output) != string(expected) {
-				t.Fatalf("expected %v, got %v", string(expected), string(output))
+			if diff := cmp.Diff(expected, output); diff != "" {
+				t.Fatalf("Diff:\n%s", diff)
 			}
 		})
 	}
 }
 
 // Print as YAML
-func marshalYaml(t *testing.T, cl []model.Config) []byte {
+func marshalYaml(t *testing.T, cl []config.Config) []byte {
 	t.Helper()
 	result := []byte{}
 	separator := []byte("---\n")
@@ -118,7 +116,7 @@ func marshalYaml(t *testing.T, cl []model.Config) []byte {
 func readConfig(t *testing.T, filename string) ([]runtime.Object, error) {
 	t.Helper()
 
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatalf("failed to read input yaml file: %v", err)
 	}
@@ -137,6 +135,10 @@ func readConfig(t *testing.T, filename string) ([]runtime.Object, error) {
 func TestConversion(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	prefix := v1beta1.PathTypePrefix
+	exact := v1beta1.PathTypeExact
+
 	ingress := v1beta1.Ingress{
 		ObjectMeta: metaV1.ObjectMeta{
 			Namespace: "mock", // goes into backend full name
@@ -150,6 +152,14 @@ func TestConversion(t *testing.T) {
 							Paths: []v1beta1.HTTPIngressPath{
 								{
 									Path: "/test",
+									Backend: v1beta1.IngressBackend{
+										ServiceName: "foo",
+										ServicePort: intstr.IntOrString{IntVal: 8000},
+									},
+								},
+								{
+									Path:     "/test/foo",
+									PathType: &prefix,
 									Backend: v1beta1.IngressBackend{
 										ServiceName: "foo",
 										ServicePort: intstr.IntOrString{IntVal: 8000},
@@ -212,6 +222,22 @@ func TestConversion(t *testing.T) {
 										ServicePort: intstr.IntOrString{IntVal: 8000},
 									},
 								},
+								{
+									Path:     "/test/foo/bar",
+									PathType: &prefix,
+									Backend: v1beta1.IngressBackend{
+										ServiceName: "foo",
+										ServicePort: intstr.IntOrString{IntVal: 8000},
+									},
+								},
+								{
+									Path:     "/test/foo/bar",
+									PathType: &exact,
+									Backend: v1beta1.IngressBackend{
+										ServiceName: "foo",
+										ServicePort: intstr.IntOrString{IntVal: 8000},
+									},
+								},
 							},
 						},
 					},
@@ -220,13 +246,16 @@ func TestConversion(t *testing.T) {
 		},
 	}
 	serviceLister := createFakeLister(ctx)
-	cfgs := map[string]*model.Config{}
+	cfgs := map[string]*config.Config{}
 	ConvertIngressVirtualService(ingress, "mydomain", cfgs, serviceLister)
 	ConvertIngressVirtualService(ingress2, "mydomain", cfgs, serviceLister)
 
 	if len(cfgs) != 3 {
 		t.Error("VirtualServices, expected 3 got ", len(cfgs))
 	}
+
+	expectedLength := [5]int{13, 13, 9, 6, 5}
+	expectedExact := [5]bool{true, false, false, true, true}
 
 	for n, cfg := range cfgs {
 		vs := cfg.Spec.(*networking.VirtualService)
@@ -235,8 +264,15 @@ func TestConversion(t *testing.T) {
 			if vs.Hosts[0] != "my.host.com" {
 				t.Error("Unexpected host", vs)
 			}
-			if len(vs.Http) != 2 {
+			if len(vs.Http) != 5 {
 				t.Error("Unexpected rules", vs.Http)
+			}
+			for i, route := range vs.Http {
+				length, exact := getMatchURILength(route.Match[0])
+				if length != expectedLength[i] || exact != expectedExact[i] {
+					t.Errorf("Unexpected rule at idx:%d, want {length:%d, exact:%v}, got {length:%d, exact: %v}",
+						i, expectedLength[i], expectedExact[i], length, exact)
+				}
 			}
 		}
 	}
@@ -329,6 +365,8 @@ func TestIngressClass(t *testing.T) {
 		{ingressMode: meshconfig.MeshConfig_STRICT, ingressClass: nil, shouldProcess: false},
 
 		// IngressClass and Annotation
+		// note: k8s rejects Ingress resources configured with kubernetes.io/ingress.class annotation *and* ingressClassName field so this shouldn't happen
+		// see https://github.com/kubernetes/kubernetes/blob/ededd08ba131b727e60f663bd7217fffaaccd448/pkg/apis/networking/validation/validation.go#L226
 		{ingressMode: meshconfig.MeshConfig_STRICT, ingressClass: ingressClassIstio, annotation: "nginx", shouldProcess: false},
 		{ingressMode: meshconfig.MeshConfig_STRICT, ingressClass: ingressClassOther, annotation: istio, shouldProcess: true},
 		{ingressMode: -1, shouldProcess: false},
@@ -361,7 +399,7 @@ func TestIngressClass(t *testing.T) {
 				ing.Annotations["kubernetes.io/ingress.class"] = c.annotation
 			}
 
-			if c.shouldProcess != shouldProcessIngressWithClass(&mesh, &ing, c.ingressClass) {
+			if c.shouldProcess != shouldProcessIngressWithClass(mesh, &ing, c.ingressClass) {
 				t.Errorf("got %v, want %v",
 					!c.shouldProcess, c.shouldProcess)
 			}
@@ -421,7 +459,7 @@ func TestNamedPortIngressConversion(t *testing.T) {
 		},
 	}
 	serviceLister := createFakeLister(ctx, service)
-	cfgs := map[string]*model.Config{}
+	cfgs := map[string]*config.Config{}
 	ConvertIngressVirtualService(ingress, "mydomain", cfgs, serviceLister)
 	if len(cfgs) != 1 {
 		t.Error("VirtualServices, expected 1 got ", len(cfgs))
@@ -448,6 +486,6 @@ func createFakeLister(ctx context.Context, objects ...runtime.Object) listerv1.S
 	informerFactory := informers.NewSharedInformerFactory(client, time.Hour)
 	svcInformer := informerFactory.Core().V1().Services().Informer()
 	go svcInformer.Run(ctx.Done())
-	cache.WaitForCacheSync(ctx.Done(), svcInformer.HasSynced)
+	kube.WaitForCacheSync(ctx.Done(), svcInformer.HasSynced)
 	return informerFactory.Core().V1().Services().Lister()
 }

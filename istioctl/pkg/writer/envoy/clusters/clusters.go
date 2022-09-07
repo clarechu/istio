@@ -25,9 +25,10 @@ import (
 
 	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/istioctl/pkg/util/clusters"
-	protio "istio.io/istio/istioctl/pkg/util/proto"
+	"istio.io/istio/istioctl/pkg/util/proto"
 )
 
 // EndpointFilter is used to pass filter information into route based config writer print functions
@@ -69,7 +70,17 @@ func retrieveEndpointAddress(host *adminapi.HostStatus) string {
 	if addr != nil {
 		return addr.Address
 	}
-	return "unix://" + host.Address.GetPipe().Path
+	if pipe := host.Address.GetPipe(); pipe != nil {
+		return "unix://" + pipe.Path
+	}
+	if internal := host.Address.GetEnvoyInternalAddress(); internal != nil {
+		switch an := internal.GetAddressNameSpecifier().(type) {
+		case *core.EnvoyInternalAddress_ServerListenerName:
+			// TODO: fmt.Sprintf("envoy://%s/%s", an.ServerListenerName, internal.EndpointId) once go-control-plane updates
+			return fmt.Sprintf("envoy://%s", an.ServerListenerName)
+		}
+	}
+	return "unknown"
 }
 
 func retrieveEndpointPort(l *adminapi.HostStatus) uint32 {
@@ -146,12 +157,12 @@ func (c *ConfigWriter) PrintEndpointsSummary(filter EndpointFilter) error {
 }
 
 // PrintEndpoints prints the endpoints config to the ConfigWriter stdout
-func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter) error {
+func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter, outputFormat string) error {
 	if c.clusters == nil {
 		return fmt.Errorf("config writer has not been primed")
 	}
 
-	filteredClusters := protio.MessageSlice{}
+	filteredClusters := proto.MessageSlice{}
 	for _, cluster := range c.clusters.ClusterStatuses {
 		for _, host := range cluster.HostStatuses {
 			if filter.Verify(host, cluster.Name) {
@@ -159,11 +170,15 @@ func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter) error {
 				break
 			}
 		}
-
 	}
 	out, err := json.MarshalIndent(filteredClusters, "", "    ")
 	if err != nil {
 		return err
+	}
+	if outputFormat == "yaml" {
+		if out, err = yaml.JSONToYAML(out); err != nil {
+			return err
+		}
 	}
 	fmt.Fprintln(c.Stdout, string(out))
 	return nil

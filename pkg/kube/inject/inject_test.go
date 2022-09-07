@@ -16,39 +16,50 @@ package inject
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/types"
 	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
+	"istio.io/api/annotation"
 	meshapi "istio.io/api/mesh/v1alpha1"
+	proxyConfig "istio.io/api/networking/v1beta1"
+	opconfig "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/util/sets"
 )
 
-var (
-	nullWarningHandler = func(_ string) {}
-)
-
-func TestIntoResourceFile(t *testing.T) {
-	cases := []struct {
-		in         string
-		want       string
-		setFlags   []string
-		inFilePath string
-		mesh       func(m *meshapi.MeshConfig)
-	}{
-		// "testdata/hello.yaml" is tested in http_test.go (with debug)
-		{
-			in:   "hello.yaml",
-			want: "hello.yaml.injected",
-		},
+// TestInjection tests both the mutating webhook and kube-inject. It does this by sharing the same input and output
+// test files and running through the two different code paths.
+func TestInjection(t *testing.T) {
+	type testCase struct {
+		in            string
+		want          string
+		setFlags      []string
+		inFilePath    string
+		mesh          func(m *meshapi.MeshConfig)
+		skipWebhook   bool
+		expectedError string
+		expectedLog   string
+		setup         func(t test.Failer)
+	}
+	cases := []testCase{
 		// verify cni
 		{
 			in:   "hello.yaml",
@@ -56,19 +67,15 @@ func TestIntoResourceFile(t *testing.T) {
 			setFlags: []string{
 				"components.cni.enabled=true",
 				"values.istio_cni.chained=true",
+				"values.global.network=network1",
 			},
 		},
 		{
-			in:   "hello-mtls-not-ready.yaml",
-			want: "hello-mtls-not-ready.yaml.injected",
-		},
-		{
-			in:   "hello-namespace.yaml",
-			want: "hello-namespace.yaml.injected",
-		},
-		{
-			in:   "hello-proxy-override.yaml",
-			want: "hello-proxy-override.yaml.injected",
+			in:   "hello.yaml",
+			want: "hello.yaml.proxyImageName.injected",
+			setFlags: []string{
+				"values.global.proxy.image=proxyTest",
+			},
 		},
 		{
 			in:   "hello.yaml",
@@ -76,22 +83,6 @@ func TestIntoResourceFile(t *testing.T) {
 			mesh: func(m *meshapi.MeshConfig) {
 				m.DefaultConfig.InterceptionMode = meshapi.ProxyConfig_TPROXY
 			},
-		},
-		{
-			in:   "hello.yaml",
-			want: "hello-config-map-name.yaml.injected",
-		},
-		{
-			in:   "frontend.yaml",
-			want: "frontend.yaml.injected",
-		},
-		{
-			in:   "hello-service.yaml",
-			want: "hello-service.yaml.injected",
-		},
-		{
-			in:   "hello-multi.yaml",
-			want: "hello-multi.yaml.injected",
 		},
 		{
 			in:       "hello.yaml",
@@ -104,88 +95,16 @@ func TestIntoResourceFile(t *testing.T) {
 			setFlags: []string{"values.global.imagePullPolicy=Never"},
 		},
 		{
-			in:   "hello-ignore.yaml",
-			want: "hello-ignore.yaml.injected",
-		},
-		{
-			in:   "multi-init.yaml",
-			want: "multi-init.yaml.injected",
-		},
-		{
-			in:   "statefulset.yaml",
-			want: "statefulset.yaml.injected",
-		},
-		{
 			in:       "enable-core-dump.yaml",
 			want:     "enable-core-dump.yaml.injected",
 			setFlags: []string{"values.global.proxy.enableCoreDump=true"},
 		},
 		{
-			in:   "enable-core-dump-annotation.yaml",
-			want: "enable-core-dump-annotation.yaml.injected",
-		},
-		{
-			in:   "auth.yaml",
-			want: "auth.yaml.injected",
-		},
-		{
-			in:   "auth.non-default-service-account.yaml",
-			want: "auth.non-default-service-account.yaml.injected",
-		},
-		{
-			in:   "auth.yaml",
-			want: "auth.cert-dir.yaml.injected",
-		},
-		{
-			in:   "daemonset.yaml",
-			want: "daemonset.yaml.injected",
-		},
-		{
-			in:   "job.yaml",
-			want: "job.yaml.injected",
-		},
-		{
-			in:   "replicaset.yaml",
-			want: "replicaset.yaml.injected",
-		},
-		{
-			in:   "replicationcontroller.yaml",
-			want: "replicationcontroller.yaml.injected",
-		},
-		{
-			in:   "cronjob.yaml",
-			want: "cronjob.yaml.injected",
-		},
-		{
-			in:   "pod.yaml",
-			want: "pod.yaml.injected",
-		},
-		{
-			in:   "hello-host-network.yaml",
-			want: "hello-host-network.yaml.injected",
-		},
-		{
-			in:   "list.yaml",
-			want: "list.yaml.injected",
-		},
-		{
-			in:   "list-frontend.yaml",
-			want: "list-frontend.yaml.injected",
-		},
-		{
-			in:   "deploymentconfig.yaml",
-			want: "deploymentconfig.yaml.injected",
-		},
-		{
-			in:   "deploymentconfig-multi.yaml",
-			want: "deploymentconfig-multi.yaml.injected",
-		},
-		{
 			in:   "format-duration.yaml",
 			want: "format-duration.yaml.injected",
 			mesh: func(m *meshapi.MeshConfig) {
-				m.DefaultConfig.DrainDuration = types.DurationProto(time.Second * 23)
-				m.DefaultConfig.ParentShutdownDuration = types.DurationProto(time.Second * 42)
+				m.DefaultConfig.DrainDuration = durationpb.New(time.Second * 23)
+				m.DefaultConfig.ParentShutdownDuration = durationpb.New(time.Second * 42)
 			},
 		},
 		{
@@ -200,32 +119,6 @@ func TestIntoResourceFile(t *testing.T) {
 			},
 		},
 		{
-			// Verifies that empty include lists are applied properly from parameters.
-			in:   "traffic-params-empty-includes.yaml",
-			want: "traffic-params-empty-includes.yaml.injected",
-		},
-		{
-			// Verifies that annotation values are applied properly. This also tests that annotation values
-			// override params when specified.
-			in:   "traffic-annotations.yaml",
-			want: "traffic-annotations.yaml.injected",
-		},
-		{
-			// Verifies that the wildcard character "*" behaves properly when used in annotations.
-			in:   "traffic-annotations-wildcards.yaml",
-			want: "traffic-annotations-wildcards.yaml.injected",
-		},
-		{
-			// Verifies that the wildcard character "*" behaves properly when used in annotations.
-			in:   "traffic-annotations-empty-includes.yaml",
-			want: "traffic-annotations-empty-includes.yaml.injected",
-		},
-		{
-			// Verifies that pods can have multiple containers
-			in:   "multi-container.yaml",
-			want: "multi-container.yaml.injected",
-		},
-		{
 			// Verifies that the status params behave properly.
 			in:   "status_params.yaml",
 			want: "status_params.yaml.injected",
@@ -235,16 +128,6 @@ func TestIntoResourceFile(t *testing.T) {
 				`values.global.proxy.readinessPeriodSeconds=200`,
 				`values.global.proxy.readinessFailureThreshold=300`,
 			},
-		},
-		{
-			// Verifies that the status annotations override the params.
-			in:   "status_annotations.yaml",
-			want: "status_annotations.yaml.injected",
-		},
-		{
-			// Verifies that the status annotations override the params.
-			in:   "status_annotations_zeroport.yaml",
-			want: "status_annotations_zeroport.yaml.injected",
 		},
 		{
 			// Verifies that the kubevirtInterfaces list are applied properly from parameters..
@@ -258,27 +141,22 @@ func TestIntoResourceFile(t *testing.T) {
 			},
 		},
 		{
-			// Verifies that the kubevirtInterfaces list are applied properly from parameters..
-			in:   "kubevirtInterfaces_list.yaml",
-			want: "kubevirtInterfaces_list.yaml.injected",
-		},
-		{
 			// Verifies that global.imagePullSecrets are applied properly
 			in:         "hello.yaml",
 			want:       "hello-image-secrets-in-values.yaml.injected",
-			inFilePath: "hello-image-secrets-in-values-iop.yaml",
+			inFilePath: "hello-image-secrets-in-values.iop.yaml",
 		},
 		{
 			// Verifies that global.imagePullSecrets are appended properly
 			in:         "hello-image-pull-secret.yaml",
 			want:       "hello-multiple-image-secrets.yaml.injected",
-			inFilePath: "hello-image-secrets-in-values-iop.yaml",
+			inFilePath: "hello-image-secrets-in-values.iop.yaml",
 		},
 		{
 			// Verifies that global.podDNSSearchNamespaces are applied properly
 			in:         "hello.yaml",
 			want:       "hello-template-in-values.yaml.injected",
-			inFilePath: "hello-template-in-values-iop.yaml",
+			inFilePath: "hello-template-in-values.iop.yaml",
 		},
 		{
 			// Verifies that global.mountMtlsCerts is applied properly
@@ -321,190 +199,484 @@ func TestIntoResourceFile(t *testing.T) {
 				`values.global.proxy.holdApplicationUntilProxyStarts=true`,
 			},
 		},
+		{
+			// Verifies that HoldApplicationUntilProxyStarts in MeshConfig puts sidecar in front
+			in:   "hello-probes.yaml",
+			want: "hello-probes.proxyHoldsApplication.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.holdApplicationUntilProxyStarts=true`,
+			},
+		},
+		{
+			// Verifies that HoldApplicationUntilProxyStarts in proxyconfig sets lifecycle hook
+			in:   "hello-probes-proxyHoldApplication-ProxyConfig.yaml",
+			want: "hello-probes-proxyHoldApplication-ProxyConfig.yaml.injected",
+		},
+		{
+			// Verifies that HoldApplicationUntilProxyStarts=false in proxyconfig 'OR's with MeshConfig setting
+			in:   "hello-probes-noProxyHoldApplication-ProxyConfig.yaml",
+			want: "hello-probes-noProxyHoldApplication-ProxyConfig.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.holdApplicationUntilProxyStarts=true`,
+			},
+		},
+		{
+			// A test with no pods is not relevant for webhook
+			in:          "hello-service.yaml",
+			want:        "hello-service.yaml.injected",
+			skipWebhook: true,
+		},
+		{
+			// Cronjob is tricky for webhook test since the spec is different. Since the real code will
+			// get a pod anyways, the test isn't too useful for webhook anyways.
+			in:          "cronjob.yaml",
+			want:        "cronjob.yaml.injected",
+			skipWebhook: true,
+		},
+		{
+			in:            "traffic-annotations-bad-includeipranges.yaml",
+			expectedError: "includeipranges",
+		},
+		{
+			in:            "traffic-annotations-bad-excludeipranges.yaml",
+			expectedError: "excludeipranges",
+		},
+		{
+			in:            "traffic-annotations-bad-includeinboundports.yaml",
+			expectedError: "includeinboundports",
+		},
+		{
+			in:            "traffic-annotations-bad-excludeinboundports.yaml",
+			expectedError: "excludeinboundports",
+		},
+		{
+			in:            "traffic-annotations-bad-excludeoutboundports.yaml",
+			expectedError: "excludeoutboundports",
+		},
+		{
+			in:   "hello.yaml",
+			want: "hello-no-seccontext.yaml.injected",
+			setup: func(t test.Failer) {
+				test.SetForTest(t, &features.EnableLegacyFSGroupInjection, false)
+				test.SetEnvForTest(t, "ENABLE_LEGACY_FSGROUP_INJECTION", "false")
+			},
+		},
+		{
+			in:   "traffic-annotations.yaml",
+			want: "traffic-annotations.yaml.injected",
+			mesh: func(m *meshapi.MeshConfig) {
+				if m.DefaultConfig.ProxyMetadata == nil {
+					m.DefaultConfig.ProxyMetadata = map[string]string{}
+				}
+				m.DefaultConfig.ProxyMetadata["ISTIO_META_TLS_CLIENT_KEY"] = "/etc/identity/client/keys/client-key.pem"
+			},
+		},
+		{
+			in:   "proxy-override.yaml",
+			want: "proxy-override.yaml.injected",
+		},
+		{
+			in:   "explicit-security-context.yaml",
+			want: "explicit-security-context.yaml.injected",
+		},
+		{
+			in:   "only-proxy-container.yaml",
+			want: "only-proxy-container.yaml.injected",
+		},
+		{
+			in:   "proxy-override-args.yaml",
+			want: "proxy-override-args.yaml.injected",
+		},
+		{
+			in:         "custom-template.yaml",
+			want:       "custom-template.yaml.injected",
+			inFilePath: "custom-template.iop.yaml",
+		},
+		{
+			in:   "tcp-probes.yaml",
+			want: "tcp-probes.yaml.injected",
+		},
+		{
+			in:   "tcp-probes.yaml",
+			want: "tcp-probes-disabled.yaml.injected",
+			setup: func(t test.Failer) {
+				test.SetForTest(t, &features.RewriteTCPProbes, false)
+			},
+		},
+		{
+			in:          "hello-host-network-with-ns.yaml",
+			want:        "hello-host-network-with-ns.yaml.injected",
+			expectedLog: "Skipping injection because Deployment \"sample/hello-host-network\" has host networking enabled",
+		},
+	}
+	// Keep track of tests we add options above
+	// We will search for all test files and skip these ones
+	alreadyTested := sets.New()
+	for _, t := range cases {
+		if t.want != "" {
+			alreadyTested.Insert(t.want)
+		} else {
+			alreadyTested.Insert(t.in + ".injected")
+		}
+	}
+	files, err := os.ReadDir("testdata/inject")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) < 3 {
+		t.Fatalf("Didn't find test files - something must have gone wrong")
+	}
+	// Automatically add any other test files in the folder. This ensures we don't
+	// forget to add to this list, that we don't have duplicates, etc
+	// Keep track of all golden files so we can ensure we don't have unused ones later
+	allOutputFiles := sets.New()
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".injected") {
+			allOutputFiles.Insert(f.Name())
+		}
+		if strings.HasSuffix(f.Name(), ".iop.yaml") {
+			continue
+		}
+		if !strings.HasSuffix(f.Name(), ".yaml") {
+			continue
+		}
+		want := f.Name() + ".injected"
+		if alreadyTested.Contains(want) {
+			continue
+		}
+		cases = append(cases, testCase{in: f.Name(), want: want})
 	}
 
-	for i, c := range cases {
-		c := c
-		testName := fmt.Sprintf("[%02d] %s", i, c.want)
-		t.Run(testName, func(t *testing.T) {
-			t.Parallel()
-			sidecarTemplate, valuesConfig, m := loadInjectionSettings(t, c.setFlags, c.inFilePath)
-			if c.mesh != nil {
-				c.mesh(m)
+	// Precompute injection settings. This may seem like a premature optimization, but due to the size of
+	// YAMLs, with -race this was taking >10min in some cases to generate!
+	if util.Refresh() {
+		writeInjectionSettings(t, "default", nil, "")
+		for i, c := range cases {
+			if c.setFlags != nil || c.inFilePath != "" {
+				writeInjectionSettings(t, fmt.Sprintf("%s.%d", c.in, i), c.setFlags, c.inFilePath)
 			}
+		}
+	}
+	// Preload default settings. Computation here is expensive, so this speeds the tests up substantially
+	defaultTemplate, defaultValues, defaultMesh := readInjectionSettings(t, "default")
+	for i, c := range cases {
+		i, c := i, c
+		testName := fmt.Sprintf("[%02d] %s", i, c.want)
+		if c.expectedError != "" {
+			testName = fmt.Sprintf("[%02d] %s", i, c.in)
+		}
+		t.Run(testName, func(t *testing.T) {
+			if c.setup != nil {
+				c.setup(t)
+			} else {
+				// Tests with custom setup modify global state and cannot run in parallel
+				t.Parallel()
+			}
+
+			mc, err := mesh.DeepCopyMeshConfig(defaultMesh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sidecarTemplate, valuesConfig := defaultTemplate, defaultValues
+			if c.setFlags != nil || c.inFilePath != "" {
+				sidecarTemplate, valuesConfig, mc = readInjectionSettings(t, fmt.Sprintf("%s.%d", c.in, i))
+			}
+			if c.mesh != nil {
+				c.mesh(mc)
+			}
+
 			inputFilePath := "testdata/inject/" + c.in
 			wantFilePath := "testdata/inject/" + c.want
 			in, err := os.Open(inputFilePath)
 			if err != nil {
 				t.Fatalf("Failed to open %q: %v", inputFilePath, err)
 			}
-			defer func() { _ = in.Close() }()
-			var got bytes.Buffer
-			if err = IntoResourceFile(sidecarTemplate.Template, valuesConfig, "", m, in, &got, nullWarningHandler); err != nil {
-				t.Fatalf("IntoResourceFile(%v) returned an error: %v", inputFilePath, err)
+			t.Cleanup(func() {
+				_ = in.Close()
+			})
+
+			// First we test kube-inject. This will run exactly what kube-inject does, and write output to the golden files
+			t.Run("kube-inject", func(t *testing.T) {
+				var got bytes.Buffer
+				logs := make([]string, 0)
+				warn := func(s string) {
+					logs = append(logs, s)
+					t.Log(s)
+				}
+				if err = IntoResourceFile(nil, sidecarTemplate.Templates, valuesConfig, "", mc, in, &got, warn); err != nil {
+					if c.expectedError != "" {
+						if !strings.Contains(strings.ToLower(err.Error()), c.expectedError) {
+							t.Fatalf("expected error %q got %q", c.expectedError, err)
+						}
+						return
+					}
+					t.Fatalf("IntoResourceFile(%v) returned an error: %v", inputFilePath, err)
+				}
+				if c.expectedError != "" {
+					t.Fatalf("expected error but got none")
+				}
+				if c.expectedLog != "" {
+					hasExpectedLog := false
+					for _, log := range logs {
+						if strings.Contains(log, c.expectedLog) {
+							hasExpectedLog = true
+							break
+						}
+					}
+					if !hasExpectedLog {
+						t.Fatal("expected log but got none")
+					}
+				}
+
+				// The version string is a maintenance pain for this test. Strip the version string before comparing.
+				gotBytes := util.StripVersion(got.Bytes())
+				wantBytes := util.ReadGoldenFile(t, gotBytes, wantFilePath)
+
+				util.CompareBytes(t, gotBytes, wantBytes, wantFilePath)
+			})
+
+			// Exit early if we don't need to test webhook. We can skip errors since its redundant
+			// and painful to test here.
+			if c.expectedError != "" || c.skipWebhook {
+				return
 			}
-
-			// The version string is a maintenance pain for this test. Strip the version string before comparing.
-			gotBytes := got.Bytes()
-			wantedBytes := util.ReadGoldenFile(gotBytes, wantFilePath, t)
-
-			wantBytes := util.StripVersion(wantedBytes)
-			gotBytes = util.StripVersion(gotBytes)
-
-			util.CompareBytes(gotBytes, wantBytes, wantFilePath, t)
-
-			if util.Refresh() {
-				util.RefreshGoldenFile(gotBytes, wantFilePath, t)
-			}
+			// Next run the webhook test. This one is a bit trickier as the webhook operates
+			// on Pods, but the inputs are Deployments/StatefulSets/etc. As a result, we need
+			// to convert these to pods, then run the injection This test will *not*
+			// overwrite golden files, as we do not have identical textual output as
+			// kube-inject. Instead, we just compare the desired/actual pod specs.
+			t.Run("webhook", func(t *testing.T) {
+				webhook := &Webhook{
+					Config:     sidecarTemplate,
+					meshConfig: mc,
+					env: &model.Environment{
+						PushContext: &model.PushContext{
+							ProxyConfigs: &model.ProxyConfigs{},
+						},
+					},
+					valuesConfig: valuesConfig,
+					revision:     "default",
+				}
+				// Split multi-part yaml documents. Input and output will have the same number of parts.
+				inputYAMLs := splitYamlFile(inputFilePath, t)
+				wantYAMLs := splitYamlFile(wantFilePath, t)
+				for i := 0; i < len(inputYAMLs); i++ {
+					t.Run(fmt.Sprintf("yamlPart[%d]", i), func(t *testing.T) {
+						runWebhook(t, webhook, inputYAMLs[i], wantYAMLs[i], true)
+					})
+				}
+			})
 		})
 	}
-}
 
-// TestRewriteAppProbe tests the feature for pilot agent to take over app health check traffic.
-func TestRewriteAppProbe(t *testing.T) {
-	cases := []struct {
-		in                  string
-		rewriteAppHTTPProbe bool
-		want                string
-	}{
-		{
-			in:                  "hello-probes.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "hello-probes.yaml.injected",
-		},
-		{
-			in:                  "hello-readiness.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "hello-readiness.yaml.injected",
-		},
-		{
-			in:                  "named_port.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "named_port.yaml.injected",
-		},
-		{
-			in:                  "one_container.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "one_container.yaml.injected",
-		},
-		{
-			in:                  "two_container.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "two_container.yaml.injected",
-		},
-		{
-			in:                  "ready_only.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "ready_only.yaml.injected",
-		},
-		{
-			in:                  "https-probes.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "https-probes.yaml.injected",
-		},
-		{
-			in:                  "hello-probes-with-flag-set-in-annotation.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "hello-probes-with-flag-set-in-annotation.yaml.injected",
-		},
-		{
-			in:                  "hello-probes-with-flag-unset-in-annotation.yaml",
-			rewriteAppHTTPProbe: false,
-			want:                "hello-probes-with-flag-unset-in-annotation.yaml.injected",
-		},
-		{
-			in:                  "ready_live.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "ready_live.yaml.injected",
-		},
-		{
-			in:                  "startup_only.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "startup_only.yaml.injected",
-		},
-		{
-			in:                  "startup_live.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "startup_live.yaml.injected",
-		},
-		{
-			in:                  "startup_ready_live.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "startup_ready_live.yaml.injected",
-		},
-		// TODO(incfly): add more test case covering different -statusPort=123, --statusPort=123
-		// No statusport, --statusPort 123.
-	}
-
-	for i, c := range cases {
-		testName := fmt.Sprintf("[%02d] %s", i, c.want)
-		t.Run(testName, func(t *testing.T) {
-			sidecarTemplate, valuesConfig, m := loadInjectionSettings(t, nil, "")
-			inputFilePath := "testdata/inject/app_probe/" + c.in
-			wantFilePath := "testdata/inject/app_probe/" + c.want
-			in, err := os.Open(inputFilePath)
-			if err != nil {
-				t.Fatalf("Failed to open %q: %v", inputFilePath, err)
-			}
-			defer func() { _ = in.Close() }()
-			var got bytes.Buffer
-			if err = IntoResourceFile(sidecarTemplate.Template, valuesConfig, "", m, in, &got, nullWarningHandler); err != nil {
-				t.Fatalf("IntoResourceFile(%v) returned an error: %v", inputFilePath, err)
-			}
-
-			// The version string is a maintenance pain for this test. Strip the version string before comparing.
-			gotBytes := got.Bytes()
-			gotBytes = util.StripVersion(gotBytes)
-
-			wantedBytes := util.ReadGoldenFile(gotBytes, wantFilePath, t)
-			wantBytes := util.StripVersion(wantedBytes)
-
-			util.CompareBytes(gotBytes, wantBytes, wantFilePath, t)
-		})
-	}
-}
-
-func TestInvalidAnnotations(t *testing.T) {
-	cases := []struct {
-		annotation string
-		in         string
-	}{
-		{
-			annotation: "includeipranges",
-			in:         "traffic-annotations-bad-includeipranges.yaml",
-		},
-		{
-			annotation: "excludeipranges",
-			in:         "traffic-annotations-bad-excludeipranges.yaml",
-		},
-		{
-			annotation: "includeinboundports",
-			in:         "traffic-annotations-bad-includeinboundports.yaml",
-		},
-		{
-			annotation: "excludeinboundports",
-			in:         "traffic-annotations-bad-excludeinboundports.yaml",
-		},
-		{
-			annotation: "excludeoutboundports",
-			in:         "traffic-annotations-bad-excludeoutboundports.yaml",
-		},
-	}
-	m := mesh.DefaultMeshConfig()
+	// Make sure we don't have any stale test data leftover, as it can cause confusion.
 	for _, c := range cases {
-		t.Run(c.annotation, func(t *testing.T) {
-			sidecarTemplate, valuesConfig, _ := loadInjectionSettings(t, nil, "")
-			inputFilePath := "testdata/inject/" + c.in
-			in, err := os.Open(inputFilePath)
-			if err != nil {
-				t.Fatalf("Failed to open %q: %v", inputFilePath, err)
-			}
-			defer func() { _ = in.Close() }()
-			var got bytes.Buffer
-			if err = IntoResourceFile(sidecarTemplate.Template, valuesConfig, "", &m, in, &got, nullWarningHandler); err == nil {
-				t.Fatalf("expected error")
-			} else if !strings.Contains(strings.ToLower(err.Error()), c.annotation) {
-				t.Fatalf("unexpected error: %v", err)
+		delete(allOutputFiles, c.want)
+	}
+	if len(allOutputFiles) != 0 {
+		t.Fatalf("stale golden files found: %v", allOutputFiles.UnsortedList())
+	}
+}
+
+func testInjectionTemplate(t *testing.T, template, input, expected string) {
+	t.Helper()
+	tmpl, err := ParseTemplates(map[string]string{SidecarTemplateName: template})
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhook := &Webhook{
+		Config: &Config{
+			Templates:        tmpl,
+			Policy:           InjectionPolicyEnabled,
+			DefaultTemplates: []string{SidecarTemplateName},
+		},
+		env: &model.Environment{
+			PushContext: &model.PushContext{
+				ProxyConfigs: &model.ProxyConfigs{},
+			},
+		},
+	}
+	runWebhook(t, webhook, []byte(input), []byte(expected), false)
+}
+
+func TestMultipleInjectionTemplates(t *testing.T) {
+	p, err := ParseTemplates(map[string]string{
+		"sidecar": `
+spec:
+  containers:
+  - name: istio-proxy
+    image: proxy
+`,
+		"init": `
+spec:
+ initContainers:
+ - name: istio-init
+   image: proxy
+`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhook := &Webhook{
+		Config: &Config{
+			Templates: p,
+			Aliases:   map[string][]string{"both": {"sidecar", "init"}},
+			Policy:    InjectionPolicyEnabled,
+		},
+		env: &model.Environment{
+			PushContext: &model.PushContext{
+				ProxyConfigs: &model.ProxyConfigs{},
+			},
+		},
+	}
+
+	input := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  annotations:
+    inject.istio.io/templates: sidecar,init
+spec:
+  containers:
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`
+	inputAlias := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  annotations:
+    inject.istio.io/templates: both
+spec:
+  containers:
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`
+	// nolint: lll
+	expected := `
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    inject.istio.io/templates: %s
+    prometheus.io/path: /stats/prometheus
+    prometheus.io/port: "0"
+    prometheus.io/scrape: "true"
+    sidecar.istio.io/status: '{"version":"","initContainers":["istio-init"],"containers":["istio-proxy"],"volumes":["istio-envoy","istio-data","istio-podinfo","istio-token","istiod-ca-cert"],"imagePullSecrets":null}'
+  name: hello
+spec:
+  initContainers:
+  - name: istio-init
+    image: proxy
+  containers:
+    - name: hello
+      image: fake.docker.io/google-samples/hello-go-gke:1.0
+    - name: istio-proxy
+      image: proxy
+`
+	runWebhook(t, webhook, []byte(input), []byte(fmt.Sprintf(expected, "sidecar,init")), false)
+	runWebhook(t, webhook, []byte(inputAlias), []byte(fmt.Sprintf(expected, "both")), false)
+}
+
+// TestStrategicMerge ensures we can use https://github.com/kubernetes/community/blob/master/contributors/devel/sig-api-machinery/strategic-merge-patch.md
+// directives in the injection template
+func TestStrategicMerge(t *testing.T) {
+	testInjectionTemplate(t,
+		`
+metadata:
+  labels:
+    $patch: replace
+    foo: bar
+spec:
+  containers:
+  - name: injected
+    image: "fake.docker.io/google-samples/hello-go-gke:1.1"
+`,
+		`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  labels:
+    key: value
+spec:
+  containers:
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`,
+
+		// We expect resources to only have limits, since we had the "replace" directive.
+		// nolint: lll
+		`
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    prometheus.io/path: /stats/prometheus
+    prometheus.io/port: "0"
+    prometheus.io/scrape: "true"
+  labels:
+    foo: bar
+  name: hello
+spec:
+  containers:
+  - name: injected
+    image: "fake.docker.io/google-samples/hello-go-gke:1.1"
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`)
+}
+
+func runWebhook(t *testing.T, webhook *Webhook, inputYAML []byte, wantYAML []byte, idempotencyCheck bool) {
+	// Convert the input YAML to a deployment.
+	inputRaw, err := FromRawToObject(inputYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputPod := objectToPod(t, inputRaw)
+
+	// Convert the wanted YAML to a deployment.
+	wantRaw, err := FromRawToObject(wantYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPod := objectToPod(t, wantRaw)
+
+	// Generate the patch.  At runtime, the webhook would actually generate the patch against the
+	// pod configuration. But since our input files are deployments, rather than actual pod instances,
+	// we have to apply the patch to the template portion of the deployment only.
+	templateJSON := convertToJSON(inputPod, t)
+	got := webhook.inject(&kube.AdmissionReview{
+		Request: &kube.AdmissionRequest{
+			Object: runtime.RawExtension{
+				Raw: templateJSON,
+			},
+			Namespace: jsonToUnstructured(inputYAML, t).GetNamespace(),
+		},
+	}, "")
+	var gotPod *corev1.Pod
+	// Apply the generated patch to the template.
+	if got.Patch != nil {
+		patchedPod := &corev1.Pod{}
+		patch := prettyJSON(got.Patch, t)
+		patchedTemplateJSON := applyJSONPatch(templateJSON, patch, t)
+		if err := json.Unmarshal(patchedTemplateJSON, patchedPod); err != nil {
+			t.Fatal(err)
+		}
+		gotPod = patchedPod
+	} else {
+		gotPod = inputPod
+	}
+
+	if err := normalizeAndCompareDeployments(gotPod, wantPod, false, t); err != nil {
+		t.Fatal(err)
+	}
+	if idempotencyCheck {
+		t.Run("idempotency", func(t *testing.T) {
+			if err := normalizeAndCompareDeployments(gotPod, wantPod, true, t); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
@@ -580,11 +752,11 @@ func TestSkipUDPPorts(t *testing.T) {
 		expectPorts := cases[i].ports
 		ports := getPortsForContainer(cases[i].c)
 		if len(ports) != len(expectPorts) {
-			t.Fatalf("unexpect ports result for case %d", i)
+			t.Fatalf("unexpected ports result for case %d", i)
 		}
 		for j := 0; j < len(ports); j++ {
 			if ports[j] != expectPorts[j] {
-				t.Fatalf("unexpect ports result for case %d: expect %v, got %v", i, expectPorts, ports)
+				t.Fatalf("unexpected ports result for case %d: expect %v, got %v", i, expectPorts, ports)
 			}
 		}
 	}
@@ -593,16 +765,16 @@ func TestSkipUDPPorts(t *testing.T) {
 func TestCleanProxyConfig(t *testing.T) {
 	overrides := mesh.DefaultProxyConfig()
 	overrides.ConfigPath = "/foo/bar"
-	overrides.DrainDuration = types.DurationProto(7 * time.Second)
+	overrides.DrainDuration = durationpb.New(7 * time.Second)
 	overrides.ProxyMetadata = map[string]string{
 		"foo": "barr",
 	}
 	explicit := mesh.DefaultProxyConfig()
 	explicit.ConfigPath = constants.ConfigPathDir
-	explicit.DrainDuration = types.DurationProto(45 * time.Second)
+	explicit.DrainDuration = durationpb.New(45 * time.Second)
 	cases := []struct {
 		name   string
-		proxy  meshapi.ProxyConfig
+		proxy  *meshapi.ProxyConfig
 		expect string
 	}{
 		{
@@ -623,7 +795,7 @@ func TestCleanProxyConfig(t *testing.T) {
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			got := protoToJSON(&tt.proxy)
+			got := protoToJSON(tt.proxy)
 			if got != tt.expect {
 				t.Fatalf("incorrect output: got %v, expected %v", got, tt.expect)
 			}
@@ -631,7 +803,7 @@ func TestCleanProxyConfig(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !cmp.Equal(*roundTrip.GetDefaultConfig(), tt.proxy) {
+			if !cmp.Equal(roundTrip.GetDefaultConfig(), tt.proxy, protocmp.Transform()) {
 				t.Fatalf("round trip is not identical: got \n%+v, expected \n%+v", *roundTrip.GetDefaultConfig(), tt.proxy)
 			}
 		})
@@ -680,6 +852,30 @@ func TestAppendMultusNetwork(t *testing.T) {
                    {"name": "macvlan-conf-2"}
                    , {"name": "istio-cni"}]`,
 		},
+		{
+			name: "json-multiline-additional-fields",
+			in: `[
+                   {"name": "macvlan-conf-1", "another-field": "another-value"},
+                   {"name": "macvlan-conf-2"}
+                   ]`,
+			want: `[
+                   {"name": "macvlan-conf-1", "another-field": "another-value"},
+                   {"name": "macvlan-conf-2"}
+                   , {"name": "istio-cni"}]`,
+		},
+		{
+			name: "json-preconfigured-istio-cni",
+			in: `[
+                   {"name": "macvlan-conf-1"},
+                   {"name": "macvlan-conf-2"},
+                   {"name": "istio-cni", "config": "additional-config"},
+                   ]`,
+			want: `[
+                   {"name": "macvlan-conf-1"},
+                   {"name": "macvlan-conf-2"},
+                   {"name": "istio-cni", "config": "additional-config"},
+                   ]`,
+		},
 	}
 
 	for _, tc := range cases {
@@ -688,6 +884,199 @@ func TestAppendMultusNetwork(t *testing.T) {
 			actual := appendMultusNetwork(tc.in, "istio-cni")
 			if actual != tc.want {
 				t.Fatalf("Unexpected result.\nExpected:\n%v\nActual:\n%v", tc.want, actual)
+			}
+			t.Run("idempotency", func(t *testing.T) {
+				actual := appendMultusNetwork(actual, "istio-cni")
+				if actual != tc.want {
+					t.Fatalf("Function is not idempotent.\nExpected:\n%v\nActual:\n%v", tc.want, actual)
+				}
+			})
+		})
+	}
+}
+
+func Test_updateClusterEnvs(t *testing.T) {
+	type args struct {
+		container *corev1.Container
+		newKVs    map[string]string
+	}
+	tests := []struct {
+		name string
+		args args
+		want *corev1.Container
+	}{
+		{
+			args: args{
+				container: &corev1.Container{},
+				newKVs:    parseInjectEnvs("/inject/net/network1/cluster/cluster1"),
+			},
+			want: &corev1.Container{
+				Env: []corev1.EnvVar{
+					{
+						Name:  "ISTIO_META_CLUSTER_ID",
+						Value: "cluster1",
+					},
+					{
+						Name:  "ISTIO_META_NETWORK",
+						Value: "network1",
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			updateClusterEnvs(tt.args.container, tt.args.newKVs)
+			if !cmp.Equal(tt.args.container.Env, tt.want.Env) {
+				t.Fatalf("updateClusterEnvs got \n%+v, expected \n%+v", tt.args.container.Env, tt.want.Env)
+			}
+		})
+	}
+}
+
+func TestQuantityConversion(t *testing.T) {
+	for _, tt := range []struct {
+		in  string
+		out int
+		err error
+	}{
+		{
+			in:  "4000m",
+			out: 4,
+		},
+		{
+			in:  "6500m",
+			out: 7,
+		},
+		{
+			in:  "200mi",
+			err: errors.New("unable to parse"),
+		},
+	} {
+		t.Run(tt.in, func(t *testing.T) {
+			got, err := quantityToConcurrency(tt.in)
+			if err != nil {
+				if tt.err == nil {
+					t.Errorf("expected no error, got %v", err)
+				}
+			} else {
+				if tt.out != got {
+					t.Errorf("got %v, want %v", got, tt.out)
+				}
+			}
+		})
+	}
+}
+
+func TestProxyImage(t *testing.T) {
+	val := func(hub string, tag any) *opconfig.Values {
+		t, _ := structpb.NewValue(tag)
+		return &opconfig.Values{
+			Global: &opconfig.GlobalConfig{
+				Hub: hub,
+				Tag: t,
+			},
+		}
+	}
+	pc := func(imageType string) *proxyConfig.ProxyImage {
+		return &proxyConfig.ProxyImage{
+			ImageType: imageType,
+		}
+	}
+
+	ann := func(imageType string) map[string]string {
+		if imageType == "" {
+			return nil
+		}
+		return map[string]string{
+			annotation.SidecarProxyImageType.Name: imageType,
+		}
+	}
+
+	for _, tt := range []struct {
+		desc string
+		v    *opconfig.Values
+		pc   *proxyConfig.ProxyImage
+		ann  map[string]string
+		want string
+	}{
+		{
+			desc: "vals-only-int-tag",
+			v:    val("docker.io/istio", 11),
+			want: "docker.io/istio/proxyv2:11",
+		},
+		{
+			desc: "pc overrides imageType - float tag",
+			v:    val("docker.io/istio", 1.12),
+			pc:   pc("distroless"),
+			want: "docker.io/istio/proxyv2:1.12-distroless",
+		},
+		{
+			desc: "annotation overrides imageType",
+			v:    val("gcr.io/gke-release/asm", "1.11.2-asm.17"),
+			ann:  ann("distroless"),
+			want: "gcr.io/gke-release/asm/proxyv2:1.11.2-asm.17-distroless",
+		},
+		{
+			desc: "pc and annotation overrides imageType",
+			v:    val("gcr.io/gke-release/asm", "1.11.2-asm.17"),
+			pc:   pc("distroless"),
+			ann:  ann("debug"),
+			want: "gcr.io/gke-release/asm/proxyv2:1.11.2-asm.17-debug",
+		},
+		{
+			desc: "pc and annotation overrides imageType, ann is default",
+			v:    val("gcr.io/gke-release/asm", "1.11.2-asm.17"),
+			pc:   pc("debug"),
+			ann:  ann("default"),
+			want: "gcr.io/gke-release/asm/proxyv2:1.11.2-asm.17",
+		},
+		{
+			desc: "pc overrides imageType with default, tag also has image type",
+			v:    val("gcr.io/gke-release/asm", "1.11.2-asm.17-distroless"),
+			pc:   pc("default"),
+			want: "gcr.io/gke-release/asm/proxyv2:1.11.2-asm.17",
+		},
+		{
+			desc: "ann overrides imageType with default, tag also has image type",
+			v:    val("gcr.io/gke-release/asm", "1.11.2-asm.17-distroless"),
+			ann:  ann("default"),
+			want: "gcr.io/gke-release/asm/proxyv2:1.11.2-asm.17",
+		},
+		{
+			desc: "pc overrides imageType, tag also has image type",
+			v:    val("docker.io/istio", "1.12-debug"),
+			pc:   pc("distroless"),
+			want: "docker.io/istio/proxyv2:1.12-distroless",
+		},
+		{
+			desc: "annotation overrides imageType, tag also has the same image type",
+			v:    val("docker.io/istio", "1.12-distroless"),
+			ann:  ann("distroless"),
+			want: "docker.io/istio/proxyv2:1.12-distroless",
+		},
+		{
+			desc: "unusual tag should work",
+			v:    val("private-repo/istio", "1.12-this-is-unusual-tag"),
+			want: "private-repo/istio/proxyv2:1.12-this-is-unusual-tag",
+		},
+		{
+			desc: "unusual tag should work, default override",
+			v:    val("private-repo/istio", "1.12-this-is-unusual-tag-distroless"),
+			pc:   pc("default"),
+			want: "private-repo/istio/proxyv2:1.12-this-is-unusual-tag",
+		},
+		{
+			desc: "annotation overrides imageType with unusual tag",
+			v:    val("private-repo/istio", "1.12-this-is-unusual-tag"),
+			ann:  ann("distroless"),
+			want: "private-repo/istio/proxyv2:1.12-this-is-unusual-tag-distroless",
+		},
+	} {
+		t.Run(tt.desc, func(t *testing.T) {
+			got := ProxyImage(tt.v, tt.pc, tt.ann)
+			if got != tt.want {
+				t.Errorf("got: <%s>, want <%s> <== value(%v) proxyConfig(%v) ann(%v)", got, tt.want, tt.v, tt.pc, tt.ann)
 			}
 		})
 	}

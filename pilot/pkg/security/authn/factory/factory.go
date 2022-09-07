@@ -23,9 +23,9 @@ import (
 
 // NewPolicyApplier returns the appropriate (policy) applier, depends on the versions of the policy exists
 // for the given service instance.
-func NewPolicyApplier(push *model.PushContext, namespace string, labels labels.Collection) authn.PolicyApplier {
+func NewPolicyApplier(push *model.PushContext, namespace string, labels labels.Instance) authn.PolicyApplier {
 	return v1beta1.NewPolicyApplier(
-		push.AuthnBetaPolicies.GetRootNamespace(),
-		push.AuthnBetaPolicies.GetJwtPoliciesForWorkload(namespace, labels),
-		push.AuthnBetaPolicies.GetPeerAuthenticationsForWorkload(namespace, labels))
+		push.AuthnPolicies.GetRootNamespace(),
+		push.AuthnPolicies.GetJwtPoliciesForWorkload(namespace, labels),
+		push.AuthnPolicies.GetPeerAuthenticationsForWorkload(namespace, labels), push)
 }

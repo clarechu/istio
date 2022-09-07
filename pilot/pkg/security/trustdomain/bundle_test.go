@@ -66,8 +66,10 @@ func TestReplaceTrustDomainAliases(t *testing.T) {
 			name:              "Two trust domain aliases, two principals",
 			trustDomainBundle: NewBundle("td2", []string{"td1", "cluster.local"}),
 			principals:        []string{"cluster.local/ns/foo/sa/bar", "td1/ns/yyy/sa/zzz"},
-			expect: []string{"td2/ns/foo/sa/bar", "td1/ns/foo/sa/bar", "cluster.local/ns/foo/sa/bar",
-				"td2/ns/yyy/sa/zzz", "td1/ns/yyy/sa/zzz", "cluster.local/ns/yyy/sa/zzz"},
+			expect: []string{
+				"td2/ns/foo/sa/bar", "td1/ns/foo/sa/bar", "cluster.local/ns/foo/sa/bar",
+				"td2/ns/yyy/sa/zzz", "td1/ns/yyy/sa/zzz", "cluster.local/ns/yyy/sa/zzz",
+			},
 		},
 		{
 			name:              "Two trust domain aliases with * prefix in trust domain",
@@ -91,8 +93,10 @@ func TestReplaceTrustDomainAliases(t *testing.T) {
 			name:              "One principal match one alias",
 			trustDomainBundle: NewBundle("new-td", []string{"td2", "td3"}),
 			principals:        []string{"td1/ns/some-ns/sa/some-sa", "td2/ns/foo/sa/bar"},
-			expect: []string{"td1/ns/some-ns/sa/some-sa", "new-td/ns/foo/sa/bar",
-				"td2/ns/foo/sa/bar", "td3/ns/foo/sa/bar"},
+			expect: []string{
+				"td1/ns/some-ns/sa/some-sa", "new-td/ns/foo/sa/bar",
+				"td2/ns/foo/sa/bar", "td3/ns/foo/sa/bar",
+			},
 		},
 		{
 			name:              "Trust domain is empty string",
@@ -119,20 +123,57 @@ func TestReplaceTrustDomainAliases(t *testing.T) {
 
 func TestReplaceTrustDomainInPrincipal(t *testing.T) {
 	cases := []struct {
+		name          string
 		trustDomainIn string
 		principal     string
 		out           string
+		expectedError string
 	}{
-		{principal: "spiffe://cluster.local/ns/foo/sa/bar", out: ""},
-		{principal: "sa/test-sa/ns/default", out: ""},
-		{trustDomainIn: "td", principal: "cluster.local/ns/foo/sa/bar", out: "td/ns/foo/sa/bar"},
-		{trustDomainIn: "abc", principal: "xyz/ns/foo/sa/bar", out: "abc/ns/foo/sa/bar"},
+		{
+			name:          "Principal in wrong format with SPIFFE:// prefix",
+			principal:     "spiffe://cluster.local/ns/foo/sa/bar",
+			out:           "",
+			expectedError: "wrong SPIFFE format: spiffe://cluster.local/ns/foo/sa/bar",
+		},
+		{
+			name:          "Principal in wrong format with less components",
+			principal:     "sa/test-sa/ns/default",
+			out:           "",
+			expectedError: "wrong SPIFFE format: sa/test-sa/ns/default",
+		},
+		{
+			name:          "Replace td with domain name in principal",
+			trustDomainIn: "td",
+			principal:     "cluster.local/ns/foo/sa/bar",
+			out:           "td/ns/foo/sa/bar",
+			expectedError: "",
+		},
+		{
+			name:          "Replace td without domain name in principal",
+			trustDomainIn: "abc",
+			principal:     "xyz/ns/foo/sa/bar",
+			out:           "abc/ns/foo/sa/bar",
+			expectedError: "",
+		},
 	}
 
 	for _, c := range cases {
-		got := replaceTrustDomainInPrincipal(c.trustDomainIn, c.principal)
+		got, err := replaceTrustDomainInPrincipal(c.trustDomainIn, c.principal)
+		if err != nil {
+			if c.expectedError == "" {
+				t.Errorf("%s: replace trust domain in principal error: %v", c.name, err)
+			}
+			if got != "" {
+				t.Errorf("%s: Expected empty SPIFFE ID but obtained a non-empty one: %s.", c.name, got)
+			}
+			if err.Error() != c.expectedError {
+				t.Errorf("%s: Expected error: %s but got error: %s.", c.name, c.expectedError, err.Error())
+			}
+			continue
+		}
+
 		if got != c.out {
-			t.Errorf("expect %s, but got %s", c.out, got)
+			t.Errorf("%s failed. Expect %s, but got %s", c.name, c.out, got)
 		}
 	}
 }

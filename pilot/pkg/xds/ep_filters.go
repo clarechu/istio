@@ -15,14 +15,18 @@
 package xds
 
 import (
-	"net"
+	"math"
 
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes/wrappers"
+	"google.golang.org/protobuf/proto"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
+	labelutil "istio.io/istio/pilot/pkg/serviceregistry/util/label"
+	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/network"
 )
 
 // EndpointsByNetworkFilter is a network filter function to support Split Horizon EDS - filter the endpoints based on the network
@@ -30,127 +34,199 @@ import (
 // sidecar network and add a gateway endpoint to remote networks that have endpoints
 // (if gateway exists and its IP is an IP and not a dns name).
 // Information for the mesh networks is provided as a MeshNetwork config map.
-func EndpointsByNetworkFilter(push *model.PushContext, proxyNetwork string, endpoints []*endpoint.LocalityLbEndpoints) []*endpoint.LocalityLbEndpoints {
-	// calculate the multiples of weight.
-	// It is needed to normalize the LB Weight across different networks.
-	multiples := 1
-	for _, gateways := range push.NetworkGateways() {
-		if num := len(gateways); num > 0 {
-			multiples *= num
-		}
+func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoints) []*LocalityEndpoints {
+	if !b.push.NetworkManager().IsMultiNetworkEnabled() {
+		// Multi-network is not configured (this is the case by default). Just access all endpoints directly.
+		return endpoints
 	}
 
 	// A new array of endpoints to be returned that will have both local and
 	// remote gateways (if any)
-	filtered := make([]*endpoint.LocalityLbEndpoints, 0)
+	filtered := make([]*LocalityEndpoints, 0)
+
+	// Scale all weights by the lcm of gateways per network and gateways per cluster.
+	// This will allow us to more easily spread traffic to the endpoint across multiple
+	// network gateways, increasing reliability of the endpoint.
+	scaleFactor := b.push.NetworkManager().GetLBWeightScaleFactor()
 
 	// Go through all cluster endpoints and add those with the same network as the sidecar
 	// to the result. Also count the number of endpoints per each remote network while
 	// iterating so that it can be used as the weight for the gateway endpoint
 	for _, ep := range endpoints {
-		lbEndpoints := make([]*endpoint.LbEndpoint, 0)
-
-		// Weight (number of endpoints) for the EDS cluster for each remote networks
-		remoteEps := map[string]uint32{}
-		// calculate remote network endpoints
-		for _, lbEp := range ep.LbEndpoints {
-			epNetwork := istioMetadata(lbEp, "network")
-			// This is a local endpoint or remote network endpoint
-			// but can be accessed directly from local network.
-			if epNetwork == proxyNetwork ||
-				len(push.NetworkGatewaysByNetwork(epNetwork)) == 0 {
-				// Clone the endpoint so subsequent updates to the shared cache of
-				// service endpoints doesn't overwrite endpoints already in-flight.
-				clonedLbEp := proto.Clone(lbEp).(*endpoint.LbEndpoint)
-				clonedLbEp.LoadBalancingWeight = &wrappers.UInt32Value{
-					Value: uint32(multiples),
-				}
-				lbEndpoints = append(lbEndpoints, clonedLbEp)
-			} else {
-				// Remote network endpoint which can not be accessed directly from local network.
-				// Increase the weight counter
-				remoteEps[epNetwork]++
-			}
+		lbEndpoints := &LocalityEndpoints{
+			llbEndpoints: endpoint.LocalityLbEndpoints{
+				Locality: ep.llbEndpoints.Locality,
+				Priority: ep.llbEndpoints.Priority,
+				// Endpoints and weight will be reset below.
+			},
 		}
 
-		// Add remote networks' gateways to endpoints if the gateway is a valid IP
-		// If its a dns name (like AWS ELB), skip adding all endpoints from this network.
+		// Create a map to keep track of the gateways used and their aggregate weights.
+		gatewayWeights := make(map[model.NetworkGateway]uint32)
 
-		// Iterate over all networks that have the cluster endpoint (weight>0) and
-		// for each one of those add a new endpoint that points to the network's
-		// gateway with the relevant weight. For each gateway endpoint, set the tlsMode metadata so that
-		// we initiate mTLS automatically to this remote gateway. Split horizon to remote gateway cannot
-		// work with plaintext
-		for network, w := range remoteEps {
-			gateways := push.NetworkGatewaysByNetwork(network)
+		// Process all of the endpoints.
+		for i, lbEp := range ep.llbEndpoints.LbEndpoints {
+			istioEndpoint := ep.istioEndpoints[i]
 
-			gatewayNum := len(gateways)
-			weight := w * uint32(multiples/gatewayNum)
-
-			// There may be multiples gateways for one network. Add each gateway as an endpoint.
-			for _, gw := range gateways {
-				if net.ParseIP(gw.Addr) == nil {
-					// this is a gateway with hostname in it. skip this gateway as EDS can't take hostnames
-					continue
-				}
-				epAddr := util.BuildAddress(gw.Addr, gw.Port)
-				gwEp := &endpoint.LbEndpoint{
-					HostIdentifier: &endpoint.LbEndpoint_Endpoint{
-						Endpoint: &endpoint.Endpoint{
-							Address: epAddr,
-						},
-					},
-					LoadBalancingWeight: &wrappers.UInt32Value{
-						Value: weight,
-					},
-				}
-				// TODO: figure out a way to extract locality data from the gateway public endpoints in meshNetworks
-				gwEp.Metadata = util.BuildLbEndpointMetadata(network, model.IstioMutualTLSModeLabel, push)
-				lbEndpoints = append(lbEndpoints, gwEp)
+			// If the proxy can't view the network for this endpoint, exclude it entirely.
+			if !b.proxyView.IsVisible(istioEndpoint) {
+				continue
 			}
+
+			// Copy the endpoint in order to expand the load balancing weight.
+			// When multiplying, be careful to avoid overflow - clipping the
+			// result at the maximum value for uint32.
+			weight := b.scaleEndpointLBWeight(lbEp, scaleFactor)
+			if lbEp.GetLoadBalancingWeight().GetValue() != weight {
+				lbEp = proto.Clone(lbEp).(*endpoint.LbEndpoint)
+				lbEp.LoadBalancingWeight = &wrappers.UInt32Value{
+					Value: weight,
+				}
+			}
+
+			epNetwork := istioEndpoint.Network
+			epCluster := istioEndpoint.Locality.ClusterID
+			gateways := b.selectNetworkGateways(epNetwork, epCluster)
+
+			// Check if the endpoint is directly reachable. It's considered directly reachable if
+			// the endpoint is either on the local network or on a remote network that can be reached
+			// directly from the local network.
+			if b.proxy.InNetwork(epNetwork) || len(gateways) == 0 {
+				// The endpoint is directly reachable - just add it.
+				lbEndpoints.append(ep.istioEndpoints[i], lbEp)
+				continue
+			}
+
+			// Cross-network traffic relies on mTLS to be enabled for SNI routing
+			// TODO BTS may allow us to work around this
+			if b.mtlsChecker.isMtlsDisabled(lbEp) {
+				continue
+			}
+
+			// Apply the weight for this endpoint to the network gateways.
+			splitWeightAmongGateways(weight, gateways, gatewayWeights)
 		}
 
-		// Found endpoint(s) that can be accessed from local network
-		// and then build a new LocalityLbEndpoints with them.
-		newEp := createLocalityLbEndpoints(ep, lbEndpoints)
-		filtered = append(filtered, newEp)
+		// Sort the gateways into an ordered list so that the generated endpoints are deterministic.
+		gateways := make([]model.NetworkGateway, 0, len(gatewayWeights))
+		for gw := range gatewayWeights {
+			gateways = append(gateways, gw)
+		}
+		gateways = model.SortGateways(gateways)
+
+		// Create endpoints for the gateways.
+		for _, gw := range gateways {
+			epWeight := gatewayWeights[gw]
+			if epWeight == 0 {
+				log.Warnf("gateway weight must be greater than 0, scaleFactor is %d", scaleFactor)
+				epWeight = 1
+			}
+			epAddr := util.BuildAddress(gw.Addr, gw.Port)
+
+			// Generate a fake IstioEndpoint to carry network and cluster information.
+			gwIstioEp := &model.IstioEndpoint{
+				Network: gw.Network,
+				Locality: model.Locality{
+					ClusterID: gw.Cluster,
+				},
+				Labels: labelutil.AugmentLabels(nil, gw.Cluster, "", gw.Network),
+			}
+
+			// Generate the EDS endpoint for this gateway.
+			gwEp := &endpoint.LbEndpoint{
+				HostIdentifier: &endpoint.LbEndpoint_Endpoint{
+					Endpoint: &endpoint.Endpoint{
+						Address: epAddr,
+					},
+				},
+				LoadBalancingWeight: &wrappers.UInt32Value{
+					Value: epWeight,
+				},
+			}
+			// TODO: figure out a way to extract locality data from the gateway public endpoints in meshNetworks
+			gwEp.Metadata = util.BuildLbEndpointMetadata(gw.Network, model.IstioMutualTLSModeLabel,
+				"", "", b.clusterID, labels.Instance{})
+			// Currently gateway endpoint does not support tunnel.
+			lbEndpoints.append(gwIstioEp, gwEp)
+		}
+
+		// Endpoint members could be stripped or aggregated by network. Adjust weight value here.
+		lbEndpoints.refreshWeight()
+		filtered = append(filtered, lbEndpoints)
 	}
 
 	return filtered
 }
 
-// TODO: remove this, filtering should be done before generating the config, and
-// network metadata should not be included in output. A node only receives endpoints
-// in the same network as itself - so passing an network meta, with exactly
-// same value that the node itself had, on each endpoint is a bit absurd.
-
-// Checks whether there is an istio metadata string value for the provided key
-// within the endpoint metadata. If exists, it will return the value.
-func istioMetadata(ep *endpoint.LbEndpoint, key string) string {
-	if ep.Metadata != nil &&
-		ep.Metadata.FilterMetadata[util.IstioMetadataKey] != nil &&
-		ep.Metadata.FilterMetadata[util.IstioMetadataKey].Fields != nil &&
-		ep.Metadata.FilterMetadata[util.IstioMetadataKey].Fields[key] != nil {
-		return ep.Metadata.FilterMetadata[util.IstioMetadataKey].Fields[key].GetStringValue()
+// selectNetworkGateways chooses the gateways that best match the network and cluster. If there is
+// no match for the network+cluster, then all gateways matching the network are returned. Preferring
+// gateways that match against cluster has the following advantages:
+//
+//  1. Potentially reducing extra latency incurred when the gateway and endpoint reside in different
+//     clusters.
+//
+//  2. Enables Kubernetes MCS use cases, where endpoints for a service might be exported in one
+//     cluster but not another within the same network. By targeting the gateway for the cluster
+//     where the exported endpoints reside, we ensure that we only send traffic to exported endpoints.
+func (b *EndpointBuilder) selectNetworkGateways(nw network.ID, c cluster.ID) []model.NetworkGateway {
+	// Get the gateways for this network+cluster combination.
+	gws := b.push.NetworkManager().GatewaysForNetworkAndCluster(nw, c)
+	if len(gws) == 0 {
+		// No match for network+cluster, just match the network.
+		gws = b.push.NetworkManager().GatewaysForNetwork(nw)
 	}
-	return ""
+	return gws
 }
 
-func createLocalityLbEndpoints(base *endpoint.LocalityLbEndpoints, lbEndpoints []*endpoint.LbEndpoint) *endpoint.LocalityLbEndpoints {
-	var weight *wrappers.UInt32Value
-	if len(lbEndpoints) == 0 {
-		weight = nil
-	} else {
-		weight = &wrappers.UInt32Value{}
-		for _, lbEp := range lbEndpoints {
-			weight.Value += lbEp.GetLoadBalancingWeight().Value
+func (b *EndpointBuilder) scaleEndpointLBWeight(ep *endpoint.LbEndpoint, scaleFactor uint32) uint32 {
+	if ep.GetLoadBalancingWeight() == nil || ep.GetLoadBalancingWeight().Value == 0 {
+		return scaleFactor
+	}
+	weight := uint32(math.MaxUint32)
+	if ep.GetLoadBalancingWeight().Value < math.MaxUint32/scaleFactor {
+		weight = ep.GetLoadBalancingWeight().Value * scaleFactor
+	}
+	return weight
+}
+
+// Apply the weight for this endpoint to the network gateways.
+func splitWeightAmongGateways(weight uint32, gateways []model.NetworkGateway, gatewayWeights map[model.NetworkGateway]uint32) {
+	// Spread the weight across the gateways.
+	weightPerGateway := weight / uint32(len(gateways))
+	for _, gateway := range gateways {
+		gatewayWeights[gateway] += weightPerGateway
+	}
+}
+
+// EndpointsWithMTLSFilter removes all endpoints that do not handle mTLS. This is determined by looking at
+// auto-mTLS, DestinationRule, and PeerAuthentication to determine if we would send mTLS to these endpoints.
+// Note there is no guarantee these destinations *actually* handle mTLS; just that we are configured to send mTLS to them.
+func (b *EndpointBuilder) EndpointsWithMTLSFilter(endpoints []*LocalityEndpoints) []*LocalityEndpoints {
+	// A new array of endpoints to be returned that will have both local and
+	// remote gateways (if any)
+	filtered := make([]*LocalityEndpoints, 0)
+
+	// Go through all cluster endpoints and add those with mTLS enabled
+	for _, ep := range endpoints {
+		lbEndpoints := &LocalityEndpoints{
+			llbEndpoints: endpoint.LocalityLbEndpoints{
+				Locality: ep.llbEndpoints.Locality,
+				Priority: ep.llbEndpoints.Priority,
+				// Endpoints and will be reset below.
+			},
 		}
+
+		for i, lbEp := range ep.llbEndpoints.LbEndpoints {
+			if b.mtlsChecker.isMtlsDisabled(lbEp) {
+				// no mTLS, skip it
+				continue
+			}
+			lbEndpoints.append(ep.istioEndpoints[i], lbEp)
+		}
+
+		lbEndpoints.refreshWeight()
+		filtered = append(filtered, lbEndpoints)
 	}
-	ep := &endpoint.LocalityLbEndpoints{
-		Locality:            base.Locality,
-		LbEndpoints:         lbEndpoints,
-		LoadBalancingWeight: weight,
-		Priority:            base.Priority,
-	}
-	return ep
+
+	return filtered
 }

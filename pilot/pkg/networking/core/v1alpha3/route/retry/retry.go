@@ -20,17 +20,15 @@ import (
 	"strings"
 
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-	"github.com/golang/protobuf/ptypes/wrappers"
-
-	previouspriorities "github.com/envoyproxy/go-control-plane/envoy/config/retry/previous_priorities"
+	previouspriorities "github.com/envoyproxy/go-control-plane/envoy/extensions/retry/priority/previous_priorities/v3"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
 	networking "istio.io/api/networking/v1alpha3"
-	"istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/istio/pilot/pkg/util/protoconv"
+	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 )
 
-var (
-	defaultRetryPriorityTypedConfig = util.MessageToAny(buildPreviousPrioritiesConfig())
-)
+var defaultRetryPriorityTypedConfig = protoconv.MessageToAny(buildPreviousPrioritiesConfig())
 
 // DefaultPolicy gets a copy of the default retry policy.
 func DefaultPolicy() *route.RetryPolicy {
@@ -39,11 +37,9 @@ func DefaultPolicy() *route.RetryPolicy {
 		RetryOn:              "connect-failure,refused-stream,unavailable,cancelled,retriable-status-codes",
 		RetriableStatusCodes: []uint32{http.StatusServiceUnavailable},
 		RetryHostPredicate: []*route.RetryPolicy_RetryHostPredicate{
-			{
-				// to configure retries to prefer hosts that haven’t been attempted already,
-				// the builtin `envoy.retry_host_predicates.previous_hosts` predicate can be used.
-				Name: "envoy.retry_host_predicates.previous_hosts",
-			},
+			// to configure retries to prefer hosts that haven’t been attempted already,
+			// the builtin `envoy.retry_host_predicates.previous_hosts` predicate can be used.
+			xdsfilters.RetryPreviousHosts,
 		},
 		// TODO: allow this to be configured via API.
 		HostSelectionRetryMaxAttempts: 5,
@@ -78,16 +74,20 @@ func ConvertPolicy(in *networking.HTTPRetry) *route.RetryPolicy {
 
 	// A policy was specified. Start with the default and override with user-provided fields where appropriate.
 	out := DefaultPolicy()
-	out.NumRetries = &wrappers.UInt32Value{Value: uint32(in.GetAttempts())}
+	out.NumRetries = &wrappers.UInt32Value{Value: uint32(in.Attempts)}
 
 	if in.RetryOn != "" {
 		// Allow the incoming configuration to specify both Envoy RetryOn and RetriableStatusCodes. Any integers are
 		// assumed to be status codes.
 		out.RetryOn, out.RetriableStatusCodes = parseRetryOn(in.RetryOn)
+		// If user has just specified HTTP status codes in retryOn but have not specified "retriable-status-codes", let us add it.
+		if len(out.RetriableStatusCodes) > 0 && !strings.Contains(out.RetryOn, "retriable-status-codes") {
+			out.RetryOn += ",retriable-status-codes"
+		}
 	}
 
 	if in.PerTryTimeout != nil {
-		out.PerTryTimeout = util.GogoDurationToDuration(in.PerTryTimeout)
+		out.PerTryTimeout = in.PerTryTimeout
 	}
 
 	if in.RetryRemoteLocalities != nil && in.RetryRemoteLocalities.GetValue() {
@@ -114,9 +114,9 @@ func parseRetryOn(retryOn string) (string, []uint32) {
 		}
 
 		// Try converting it to an integer to see if it's a valid HTTP status code.
-		i, _ := strconv.Atoi(part)
+		i, err := strconv.Atoi(part)
 
-		if http.StatusText(i) != "" {
+		if err == nil && http.StatusText(i) != "" {
 			codes = append(codes, uint32(i))
 		} else {
 			tojoin = append(tojoin, part)

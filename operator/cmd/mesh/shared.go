@@ -16,24 +16,18 @@
 package mesh
 
 import (
-	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	v12 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"istio.io/istio/istioctl/pkg/install/k8sversion"
 	"istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/cache"
 	"istio.io/istio/operator/pkg/helmreconciler"
@@ -41,6 +35,7 @@ import (
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/object"
 	"istio.io/istio/operator/pkg/util/clog"
+	"istio.io/istio/pkg/kube"
 	"istio.io/pkg/log"
 )
 
@@ -53,14 +48,39 @@ var (
 	testRestConfig  *rest.Config
 )
 
-func initLogsOrExit(_ *rootArgs) {
+type Printer interface {
+	Printf(format string, a ...any)
+	Println(string)
+}
+
+func NewPrinterForWriter(w io.Writer) Printer {
+	return &writerPrinter{writer: w}
+}
+
+type writerPrinter struct {
+	writer io.Writer
+}
+
+func (w *writerPrinter) Printf(format string, a ...any) {
+	_, _ = fmt.Fprintf(w.writer, format, a...)
+}
+
+func (w *writerPrinter) Println(str string) {
+	_, _ = fmt.Fprintln(w.writer, str)
+}
+
+func initLogsOrExit(_ *RootArgs) {
 	if err := configLogs(log.DefaultOptions()); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Could not configure logs: %s", err)
 		os.Exit(1)
 	}
 }
 
+var logMutex = sync.Mutex{}
+
 func configLogs(opt *log.Options) error {
+	logMutex.Lock()
+	defer logMutex.Unlock()
 	op := []string{"stderr"}
 	opt2 := *opt
 	opt2.OutputPaths = op
@@ -81,98 +101,44 @@ func kubeBuilderInstalled() bool {
 
 // confirm waits for a user to confirm with the supplied message.
 func confirm(msg string, writer io.Writer) bool {
-	fmt.Fprintf(writer, "%s ", msg)
-
-	var response string
-	_, err := fmt.Scanln(&response)
-	if err != nil {
-		return false
-	}
-	response = strings.ToUpper(response)
-	if response == "Y" || response == "YES" {
-		return true
-	}
-
-	return false
-}
-
-// K8sConfig creates a rest.Config, Clientset and controller runtime Client from the given kubeconfig path and context.
-func K8sConfig(kubeConfigPath string, context string) (*rest.Config, *kubernetes.Clientset, client.Client, error) {
-	restConfig, clientset, err := InitK8SRestClient(kubeConfigPath, context)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// We are running a one-off command locally, so we don't need to worry too much about rate limitting
-	// Bumping this up greatly decreases install time
-	restConfig.QPS = 50
-	restConfig.Burst = 100
-	client, err := client.New(restConfig, client.Options{Scheme: scheme.Scheme})
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return restConfig, clientset, client, nil
-}
-
-// InitK8SRestClient creates a rest.Config qne Clientset from the given kubeconfig path and context.
-func InitK8SRestClient(kubeconfig, kubeContext string) (*rest.Config, *kubernetes.Clientset, error) {
-	if testRestConfig != nil || testK8Interface != nil {
-		if !(testRestConfig != nil && testK8Interface != nil) {
-			return nil, nil, fmt.Errorf("testRestConfig and testK8Interface must both be either nil or set")
+	for {
+		_, _ = fmt.Fprintf(writer, "%s ", msg)
+		var response string
+		_, err := fmt.Scanln(&response)
+		if err != nil {
+			return false
 		}
-		return testRestConfig, testK8Interface, nil
+		switch strings.ToUpper(response) {
+		case "Y", "YES":
+			return true
+		case "N", "NO":
+			return false
+		}
 	}
-	restConfig, err := defaultRestConfig(kubeconfig, kubeContext)
+}
+
+func KubernetesClients(kubeConfigPath, context string, l clog.Logger) (kube.CLIClient, client.Client, error) {
+	rc, err := kube.DefaultRestConfig(kubeConfigPath, context, func(config *rest.Config) {
+		// We are running a one-off command locally, so we don't need to worry too much about rate limitting
+		// Bumping this up greatly decreases install time
+		config.QPS = 50
+		config.Burst = 100
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	clientset, err := kubernetes.NewForConfig(restConfig)
+	kubeClient, err := kube.NewCLIClient(kube.NewClientConfigForRestConfig(rc), "")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create Kubernetes client: %v", err)
+	}
+	client, err := client.New(kubeClient.RESTConfig(), client.Options{Scheme: kube.IstioScheme})
 	if err != nil {
 		return nil, nil, err
 	}
-
-	return restConfig, clientset, nil
-}
-
-func defaultRestConfig(kubeconfig, kubeContext string) (*rest.Config, error) {
-	config, err := BuildClientConfig(kubeconfig, kubeContext)
-	if err != nil {
-		return nil, err
+	if err := k8sversion.IsK8VersionSupported(kubeClient, l); err != nil {
+		return nil, nil, fmt.Errorf("check minimum supported Kubernetes version: %v", err)
 	}
-	config.APIPath = "/api"
-	config.GroupVersion = &v1.SchemeGroupVersion
-	config.NegotiatedSerializer = serializer.WithoutConversionCodecFactory{CodecFactory: scheme.Codecs}
-	return config, nil
-}
-
-// BuildClientConfig is a helper function that builds client config from a kubeconfig filepath.
-// It overrides the current context with the one provided (empty to use default).
-//
-// This is a modified version of k8s.io/client-go/tools/clientcmd/BuildConfigFromFlags with the
-// difference that it loads default configs if not running in-cluster.
-func BuildClientConfig(kubeconfig, context string) (*rest.Config, error) {
-	if kubeconfig != "" {
-		info, err := os.Stat(kubeconfig)
-		if err != nil || info.Size() == 0 {
-			// If the specified kubeconfig doesn't exists / empty file / any other error
-			// from file stat, fall back to default
-			kubeconfig = ""
-		}
-	}
-
-	//Config loading rules:
-	// 1. kubeconfig if it not empty string
-	// 2. In cluster config if running in-cluster
-	// 3. Config(s) in KUBECONFIG environment variable
-	// 4. Use $HOME/.kube/config
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	loadingRules.DefaultClientConfig = &clientcmd.DefaultClientConfig
-	loadingRules.ExplicitPath = kubeconfig
-	configOverrides := &clientcmd.ConfigOverrides{
-		ClusterDefaults: clientcmd.ClusterDefaults,
-		CurrentContext:  context,
-	}
-
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).ClientConfig()
+	return kubeClient, client, nil
 }
 
 // applyOptions contains the startup options for applying the manifest.
@@ -187,11 +153,12 @@ type applyOptions struct {
 	WaitTimeout time.Duration
 }
 
-func applyManifest(restConfig *rest.Config, client client.Client, manifestStr string,
-	componentName name.ComponentName, opts *applyOptions, iop *v1alpha1.IstioOperator, l clog.Logger) error {
+func applyManifest(kubeClient kube.Client, client client.Client, manifestStr string,
+	componentName name.ComponentName, opts *applyOptions, iop *v1alpha1.IstioOperator, l clog.Logger,
+) error {
 	// Needed in case we are running a test through this path that doesn't start a new process.
 	cache.FlushObjectCaches()
-	reconciler, err := helmreconciler.NewHelmReconciler(client, restConfig, iop, &helmreconciler.Options{DryRun: opts.DryRun, Log: l})
+	reconciler, err := helmreconciler.NewHelmReconciler(client, kubeClient, iop, &helmreconciler.Options{DryRun: opts.DryRun, Log: l})
 	if err != nil {
 		l.LogAndError(err)
 		return err
@@ -200,7 +167,7 @@ func applyManifest(restConfig *rest.Config, client client.Client, manifestStr st
 		Name:    componentName,
 		Content: manifestStr,
 	}
-	_, _, err = reconciler.ApplyManifest(ms)
+	_, _, err = reconciler.ApplyManifest(ms, reconciler.CheckSSAEnabled())
 	return err
 }
 
@@ -227,33 +194,13 @@ func getCRAndNamespaceFromFile(filePath string, l clog.Logger) (customResource s
 		return "", "", err
 	}
 
-	b, err := ioutil.ReadFile(filePath)
+	b, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", "", fmt.Errorf("could not read values from file %s: %s", filePath, err)
 	}
 	customResource = string(b)
-	istioNamespace = v1alpha1.Namespace(mergedIOPS)
+	istioNamespace = mergedIOPS.Namespace
 	return
-}
-
-// createNamespace creates a namespace using the given k8s interface.
-func createNamespace(cs kubernetes.Interface, namespace string) error {
-	if namespace == "" {
-		// Setup default namespace
-		namespace = "istio-system"
-	}
-
-	ns := &v1.Namespace{ObjectMeta: v12.ObjectMeta{
-		Name: namespace,
-		Labels: map[string]string{
-			"istio-injection": "disabled",
-		},
-	}}
-	_, err := cs.CoreV1().Namespaces().Create(context.TODO(), ns, v12.CreateOptions{})
-	if err != nil && !errors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create namespace %v: %v", namespace, err)
-	}
-	return nil
 }
 
 // saveIOPToCluster saves the state in an IOP CR in the cluster.
@@ -262,5 +209,5 @@ func saveIOPToCluster(reconciler *helmreconciler.HelmReconciler, iop string) err
 	if err != nil {
 		return err
 	}
-	return reconciler.ApplyObject(obj.UnstructuredObject())
+	return reconciler.ApplyObject(obj.UnstructuredObject(), false)
 }

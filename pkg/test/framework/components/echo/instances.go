@@ -16,71 +16,189 @@ package echo
 
 import (
 	"errors"
-	"strings"
+	"sort"
+
+	"github.com/hashicorp/go-multierror"
 
 	"istio.io/istio/pkg/test"
-	"istio.io/istio/pkg/test/framework/resource"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 )
+
+var _ Target = Instances{}
 
 // Instances contains the instances created by the builder with methods for filtering
 type Instances []Instance
 
-// Matcher is used to filter matching instances
-type Matcher func(Instance) bool
-
-// And combines two or more matches. Example:
-//     Service("a").And(InCluster(c)).And(Match(func(...))
-func (m Matcher) And(other Matcher) Matcher {
-	return func(i Instance) bool {
-		return m(i) && other(i)
-	}
+func (i Instances) ServiceName() string {
+	return i.Config().Service
 }
 
-// ServicePrefix matches instances whose service name starts with the given prefix.
-func ServicePrefix(prefix string) Matcher {
-	return func(i Instance) bool {
-		return strings.HasPrefix(i.Config().Service, prefix)
-	}
+func (i Instances) NamespaceName() string {
+	return i.Config().NamespaceName()
 }
 
-// Service matches instances with have the given service name.
-func Service(value string) Matcher {
-	return func(i Instance) bool {
-		return value == i.Config().Service
-	}
+func (i Instances) ServiceAccountName() string {
+	return i.Config().ServiceAccountName()
 }
 
-// InCluster matches instances deployed on the given cluster.
-func InCluster(c resource.Cluster) Matcher {
-	return func(i Instance) bool {
-		return c.Index() == i.Config().Cluster.Index()
-	}
+func (i Instances) ClusterLocalFQDN() string {
+	return i.Config().ClusterLocalFQDN()
 }
 
-// Match filters instances that matcher the given Matcher
-func (i Instances) Match(matches Matcher) Instances {
-	out := make(Instances, 0)
-	for _, i := range i {
-		if matches(i) {
-			out = append(out, i)
-		}
+func (i Instances) ClusterSetLocalFQDN() string {
+	return i.Config().ClusterSetLocalFQDN()
+}
+
+func (i Instances) NamespacedName() NamespacedName {
+	return i.Config().NamespacedName()
+}
+
+func (i Instances) PortForName(name string) Port {
+	return i.Config().Ports.MustForName(name)
+}
+
+func (i Instances) Config() Config {
+	return i.mustGetFirst().Config()
+}
+
+func (i Instances) Instances() Instances {
+	return i
+}
+
+func (i Instances) mustGetFirst() Instance {
+	if i.Len() == 0 {
+		panic("instances are empty")
+	}
+	return i[0]
+}
+
+// Callers is a convenience method to convert Instances into Callers.
+func (i Instances) Callers() Callers {
+	var out Callers
+	for _, instance := range i {
+		out = append(out, instance)
 	}
 	return out
 }
 
-// Get finds the first Instance that matches the Matcher.
-func (i Instances) Get(matches Matcher) (Instance, error) {
-	res := i.Match(matches)
-	if len(res) == 0 {
-		return nil, errors.New("found 0 matching echo instances")
+// Clusters returns a list of cluster names that the instances are deployed in
+func (i Instances) Clusters() cluster.Clusters {
+	clusters := map[string]cluster.Cluster{}
+	for _, instance := range i {
+		clusters[instance.Config().Cluster.Name()] = instance.Config().Cluster
 	}
-	return res[0], nil
+	out := make(cluster.Clusters, 0, len(clusters))
+	for _, c := range clusters {
+		out = append(out, c)
+	}
+	return out
 }
 
-func (i Instances) GetOrFail(t test.Failer, matches Matcher) Instance {
-	res, err := i.Get(matches)
+func (i Instances) Workloads() (Workloads, error) {
+	var out Workloads
+	for _, inst := range i {
+		ws, err := inst.Workloads()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ws...)
+	}
+
+	if len(out) == 0 {
+		return nil, errors.New("got 0 workloads")
+	}
+
+	return out, nil
+}
+
+func (i Instances) WorkloadsOrFail(t test.Failer) Workloads {
+	t.Helper()
+	out, err := i.Workloads()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return res
+	return out
+}
+
+func (i Instances) MustWorkloads() Workloads {
+	out, err := i.Workloads()
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// IsDeployment returns true if there is only one deployment contained in the Instances
+func (i Instances) IsDeployment() bool {
+	return len(i.Services()) == 1
+}
+
+func (i Instances) ContainsTarget(t Target) bool {
+	return i.Contains(t.Instances()...)
+}
+
+func (i Instances) Contains(instances ...Instance) bool {
+	for _, thatI := range instances {
+		found := false
+		for _, thisI := range i {
+			if thisI == thatI {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// Services groups the Instances by FQDN. Each returned element is an Instances
+// containing only instances of a single service.
+func (i Instances) Services() Services {
+	grouped := map[string]Instances{}
+	for _, instance := range i {
+		k := instance.Config().ClusterLocalFQDN()
+		grouped[k] = append(grouped[k], instance)
+	}
+	var out Services
+	for _, deployment := range grouped {
+		out = append(out, deployment)
+	}
+	sort.Stable(out)
+	return out
+}
+
+// Copy this Instances array.
+func (i Instances) Copy() Instances {
+	return append(Instances{}, i...)
+}
+
+// Append returns a new Instances array with the given values appended.
+func (i Instances) Append(instances Instances) Instances {
+	return append(i.Copy(), instances...)
+}
+
+// Restart each Instance
+func (i Instances) Restart() error {
+	g := multierror.Group{}
+	for _, app := range i {
+		app := app
+		g.Go(app.Restart)
+	}
+	return g.Wait().ErrorOrNil()
+}
+
+func (i Instances) Len() int {
+	return len(i)
+}
+
+func (i Instances) NamespacedNames() NamespacedNames {
+	out := make(NamespacedNames, 0, i.Len())
+	for _, ii := range i {
+		out = append(out, ii.NamespacedName())
+	}
+
+	sort.Stable(out)
+	return out
 }

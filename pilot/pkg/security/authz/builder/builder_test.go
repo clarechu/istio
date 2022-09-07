@@ -15,22 +15,24 @@
 package builder
 
 import (
-	"io/ioutil"
+	"os"
 	"testing"
 
+	tcppb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/config/kube/crd"
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/security/trustdomain"
 	"istio.io/istio/pilot/test/util"
-	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/util/protomarshal"
-
-	"github.com/gogo/protobuf/proto"
-
-	tcppb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-	httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 )
 
 const (
@@ -38,54 +40,178 @@ const (
 )
 
 var (
-	httpbin = labels.Collection{
-		map[string]string{
-			"app":     "httpbin",
-			"version": "v1",
+	httpbin = map[string]string{
+		"app":     "httpbin",
+		"version": "v1",
+	}
+	meshConfigGRPCNoNamespace = &meshconfig.MeshConfig{
+		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+			{
+				Name: "default",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzGrpc{
+					EnvoyExtAuthzGrpc: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationGrpcProvider{
+						Service:       "my-custom-ext-authz.foo.svc.cluster.local",
+						Port:          9000,
+						FailOpen:      true,
+						StatusOnError: "403",
+					},
+				},
+			},
+		},
+	}
+	meshConfigGRPC = &meshconfig.MeshConfig{
+		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+			{
+				Name: "default",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzGrpc{
+					EnvoyExtAuthzGrpc: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationGrpcProvider{
+						Service:       "foo/my-custom-ext-authz.foo.svc.cluster.local",
+						Port:          9000,
+						Timeout:       &durationpb.Duration{Nanos: 2000 * 1000},
+						FailOpen:      true,
+						StatusOnError: "403",
+						IncludeRequestBodyInCheck: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationRequestBody{
+							MaxRequestBytes:     4096,
+							AllowPartialMessage: true,
+						},
+					},
+				},
+			},
+		},
+	}
+	meshConfigHTTP = &meshconfig.MeshConfig{
+		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+			{
+				Name: "default",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzHttp{
+					EnvoyExtAuthzHttp: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationHttpProvider{
+						Service:                         "foo/my-custom-ext-authz.foo.svc.cluster.local",
+						Port:                            9000,
+						Timeout:                         &durationpb.Duration{Seconds: 10},
+						FailOpen:                        true,
+						StatusOnError:                   "403",
+						PathPrefix:                      "/check",
+						IncludeRequestHeadersInCheck:    []string{"x-custom-id", "x-prefix-*", "*-suffix"},
+						IncludeHeadersInCheck:           []string{"should-not-include-when-IncludeRequestHeadersInCheck-is-set"},
+						IncludeAdditionalHeadersInCheck: map[string]string{"x-header-1": "value-1", "x-header-2": "value-2"},
+						IncludeRequestBodyInCheck: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationRequestBody{
+							MaxRequestBytes:     2048,
+							AllowPartialMessage: true,
+							PackAsBytes:         true,
+						},
+						HeadersToUpstreamOnAllow:   []string{"Authorization", "x-prefix-*", "*-suffix"},
+						HeadersToDownstreamOnDeny:  []string{"Set-cookie", "x-prefix-*", "*-suffix"},
+						HeadersToDownstreamOnAllow: []string{"Set-cookie", "x-prefix-*", "*-suffix"},
+					},
+				},
+			},
+		},
+	}
+	meshConfigInvalid = &meshconfig.MeshConfig{
+		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+			{
+				Name: "default",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzHttp{
+					EnvoyExtAuthzHttp: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationHttpProvider{
+						Service:       "foo/my-custom-ext-authz",
+						Port:          999999,
+						PathPrefix:    "check",
+						StatusOnError: "999",
+					},
+				},
+			},
 		},
 	}
 )
 
 func TestGenerator_GenerateHTTP(t *testing.T) {
 	testCases := []struct {
-		name        string
-		tdBundle    trustdomain.Bundle
-		isVersion14 bool
-		input       string
-		want        []string
+		name       string
+		tdBundle   trustdomain.Bundle
+		meshConfig *meshconfig.MeshConfig
+		version    *model.IstioVersion
+		input      string
+		want       []string
 	}{
 		{
-			name:        "path14",
-			input:       "path14-in.yaml",
-			isVersion14: true,
-			want:        []string{"path14-out.yaml"},
+			name:  "allow-empty-rule",
+			input: "allow-empty-rule-in.yaml",
+			want:  []string{"allow-empty-rule-out.yaml"},
 		},
 		{
-			name:  "path15",
-			input: "path15-in.yaml",
-			want:  []string{"path15-out.yaml"},
+			name:  "allow-full-rule",
+			input: "allow-full-rule-in.yaml",
+			want:  []string{"allow-full-rule-out.yaml"},
 		},
 		{
-			name:  "action-both",
-			input: "action-both-in.yaml",
-			want: []string{
-				"action-both-deny-out.yaml",
-				"action-both-allow-out.yaml"},
+			name:  "allow-nil-rule",
+			input: "allow-nil-rule-in.yaml",
+			want:  []string{"allow-nil-rule-out.yaml"},
 		},
 		{
-			name:  "all-fields",
-			input: "all-fields-in.yaml",
-			want:  []string{"all-fields-out.yaml"},
+			name:  "allow-path",
+			input: "allow-path-in.yaml",
+			want:  []string{"allow-path-out.yaml"},
 		},
 		{
-			name:  "allow-all",
-			input: "allow-all-in.yaml",
-			want:  []string{"allow-all-out.yaml"},
+			name:  "audit-full-rule",
+			input: "audit-full-rule-in.yaml",
+			want:  []string{"audit-full-rule-out.yaml"},
 		},
 		{
-			name:  "deny-all",
-			input: "deny-all-in.yaml",
-			want:  []string{"deny-all-out.yaml"},
+			name:       "custom-grpc-provider-no-namespace",
+			meshConfig: meshConfigGRPCNoNamespace,
+			input:      "custom-simple-http-in.yaml",
+			want:       []string{"custom-grpc-provider-no-namespace-out1.yaml", "custom-grpc-provider-no-namespace-out2.yaml"},
+		},
+		{
+			name:       "custom-grpc-provider",
+			meshConfig: meshConfigGRPC,
+			input:      "custom-simple-http-in.yaml",
+			want:       []string{"custom-grpc-provider-out1.yaml", "custom-grpc-provider-out2.yaml"},
+		},
+		{
+			name:       "custom-http-provider",
+			meshConfig: meshConfigHTTP,
+			input:      "custom-simple-http-in.yaml",
+			want:       []string{"custom-http-provider-out1.yaml", "custom-http-provider-out2.yaml"},
+		},
+		{
+			name:       "custom-bad-multiple-providers",
+			meshConfig: meshConfigHTTP,
+			input:      "custom-bad-multiple-providers-in.yaml",
+			want:       []string{"custom-bad-out.yaml"},
+		},
+		{
+			name:       "custom-bad-invalid-config",
+			meshConfig: meshConfigInvalid,
+			input:      "custom-simple-http-in.yaml",
+			want:       []string{"custom-bad-out.yaml"},
+		},
+		{
+			name:  "deny-and-allow",
+			input: "deny-and-allow-in.yaml",
+			want:  []string{"deny-and-allow-out1.yaml", "deny-and-allow-out2.yaml"},
+		},
+		{
+			name:  "deny-empty-rule",
+			input: "deny-empty-rule-in.yaml",
+			want:  []string{"deny-empty-rule-out.yaml"},
+		},
+		{
+			name:  "dry-run-allow-and-deny",
+			input: "dry-run-allow-and-deny-in.yaml",
+			want:  []string{"dry-run-allow-and-deny-out1.yaml", "dry-run-allow-and-deny-out2.yaml"},
+		},
+		{
+			name:  "dry-run-allow",
+			input: "dry-run-allow-in.yaml",
+			want:  []string{"dry-run-allow-out.yaml"},
+		},
+		{
+			name:  "dry-run-mix",
+			input: "dry-run-mix-in.yaml",
+			want:  []string{"dry-run-mix-out.yaml"},
 		},
 		{
 			name:  "multiple-policies",
@@ -123,50 +249,96 @@ func TestGenerator_GenerateHTTP(t *testing.T) {
 		},
 	}
 
+	baseDir := "http/"
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			g := New(tc.tdBundle, httpbin, "foo", yamlPolicy(t, basePath+tc.input), !tc.isVersion14)
+			option := Option{
+				IsCustomBuilder: tc.meshConfig != nil,
+				Logger:          &AuthzLogger{},
+			}
+			push := push(t, baseDir+tc.input, tc.meshConfig)
+			proxy := node(tc.version)
+			defer option.Logger.Report(proxy)
+			policies := push.AuthzPolicies.ListAuthorizationPolicies(proxy.ConfigNamespace, proxy.Labels)
+			g := New(tc.tdBundle, push, policies, option)
 			if g == nil {
 				t.Fatalf("failed to create generator")
 			}
 			got := g.BuildHTTP()
-			verify(t, convertHTTP(got), tc.want, false /* forTCP */)
+			verify(t, convertHTTP(got), baseDir, tc.want, false /* forTCP */)
 		})
 	}
 }
 
 func TestGenerator_GenerateTCP(t *testing.T) {
 	testCases := []struct {
-		name     string
-		tdBundle trustdomain.Bundle
-		input    string
-		want     []string
+		name       string
+		tdBundle   trustdomain.Bundle
+		meshConfig *meshconfig.MeshConfig
+		input      string
+		want       []string
 	}{
 		{
-			name:  "action-allow-HTTP-for-TCP-filter",
-			input: "action-allow-HTTP-for-TCP-filter-in.yaml",
-			want:  []string{"action-allow-HTTP-for-TCP-filter-out.yaml"},
+			name:  "allow-both-http-tcp",
+			input: "allow-both-http-tcp-in.yaml",
+			want:  []string{"allow-both-http-tcp-out.yaml"},
 		},
 		{
-			name:  "action-deny-HTTP-for-TCP-filter",
-			input: "action-deny-HTTP-for-TCP-filter-in.yaml",
-			want:  []string{"action-deny-HTTP-for-TCP-filter-out.yaml"},
+			name:  "allow-only-http",
+			input: "allow-only-http-in.yaml",
+			want:  []string{"allow-only-http-out.yaml"},
+		},
+		{
+			name:  "audit-both-http-tcp",
+			input: "audit-both-http-tcp-in.yaml",
+			want:  []string{"audit-both-http-tcp-out.yaml"},
+		},
+		{
+			name:       "custom-both-http-tcp",
+			meshConfig: meshConfigGRPC,
+			input:      "custom-both-http-tcp-in.yaml",
+			want:       []string{"custom-both-http-tcp-out1.yaml", "custom-both-http-tcp-out2.yaml"},
+		},
+		{
+			name:       "custom-only-http",
+			meshConfig: meshConfigHTTP,
+			input:      "custom-only-http-in.yaml",
+			want:       []string{},
+		},
+		{
+			name:  "deny-both-http-tcp",
+			input: "deny-both-http-tcp-in.yaml",
+			want:  []string{"deny-both-http-tcp-out.yaml"},
+		},
+		{
+			name:  "dry-run-mix",
+			input: "dry-run-mix-in.yaml",
+			want:  []string{"dry-run-mix-out.yaml"},
 		},
 	}
 
+	baseDir := "tcp/"
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			g := New(tc.tdBundle, httpbin, "foo", yamlPolicy(t, basePath+tc.input), true)
+			option := Option{
+				IsCustomBuilder: tc.meshConfig != nil,
+				Logger:          &AuthzLogger{},
+			}
+			push := push(t, baseDir+tc.input, tc.meshConfig)
+			proxy := node(nil)
+			defer option.Logger.Report(proxy)
+			policies := push.AuthzPolicies.ListAuthorizationPolicies(proxy.ConfigNamespace, proxy.Labels)
+			g := New(tc.tdBundle, push, policies, option)
 			if g == nil {
 				t.Fatalf("failed to create generator")
 			}
 			got := g.BuildTCP()
-			verify(t, convertTCP(got), tc.want, true /* forTCP */)
+			verify(t, convertTCP(got), baseDir, tc.want, true /* forTCP */)
 		})
 	}
 }
 
-func verify(t *testing.T, gots []proto.Message, wants []string, forTCP bool) {
+func verify(t *testing.T, gots []proto.Message, baseDir string, wants []string, forTCP bool) {
 	t.Helper()
 
 	if len(gots) != len(wants) {
@@ -178,14 +350,14 @@ func verify(t *testing.T, gots []proto.Message, wants []string, forTCP bool) {
 			t.Fatalf("failed to convert to YAML: %v", err)
 		}
 
-		wantFile := basePath + wants[i]
+		wantFile := basePath + baseDir + wants[i]
 		want := yamlConfig(t, wantFile, forTCP)
 		wantYaml, err := protomarshal.ToYAML(want)
 		if err != nil {
 			t.Fatalf("failed to convert to YAML: %v", err)
 		}
 
-		util.RefreshGoldenFile([]byte(gotYaml), wantFile, t)
+		util.RefreshGoldenFile(t, []byte(gotYaml), wantFile)
 		if err := util.Compare([]byte(gotYaml), []byte(wantYaml)); err != nil {
 			t.Error(err)
 		}
@@ -194,7 +366,7 @@ func verify(t *testing.T, gots []proto.Message, wants []string, forTCP bool) {
 
 func yamlPolicy(t *testing.T, filename string) *model.AuthorizationPolicies {
 	t.Helper()
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatalf("failed to read input yaml file: %v", err)
 	}
@@ -202,7 +374,7 @@ func yamlPolicy(t *testing.T, filename string) *model.AuthorizationPolicies {
 	if err != nil {
 		t.Fatalf("failde to parse CRD: %v", err)
 	}
-	var configs []*model.Config
+	var configs []*config.Config
 	for i := range c {
 		configs = append(configs, &c[i])
 	}
@@ -212,7 +384,7 @@ func yamlPolicy(t *testing.T, filename string) *model.AuthorizationPolicies {
 
 func yamlConfig(t *testing.T, filename string, forTCP bool) proto.Message {
 	t.Helper()
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatalf("failed to read file: %v", err)
 	}
@@ -246,7 +418,7 @@ func convertTCP(in []*tcppb.Filter) []proto.Message {
 	return ret
 }
 
-func newAuthzPolicies(t *testing.T, policies []*model.Config) *model.AuthorizationPolicies {
+func newAuthzPolicies(t *testing.T, policies []*config.Config) *model.AuthorizationPolicies {
 	store := model.MakeIstioStore(memory.Make(collections.Pilot))
 	for _, p := range policies {
 		if _, err := store.Create(*p); err != nil {
@@ -255,10 +427,38 @@ func newAuthzPolicies(t *testing.T, policies []*model.Config) *model.Authorizati
 	}
 
 	authzPolicies, err := model.GetAuthorizationPolicies(&model.Environment{
-		IstioConfigStore: store,
+		ConfigStore: store,
 	})
 	if err != nil {
 		t.Fatalf("newAuthzPolicies: %v", err)
 	}
 	return authzPolicies
+}
+
+func push(t *testing.T, input string, mc *meshconfig.MeshConfig) *model.PushContext {
+	t.Helper()
+	p := &model.PushContext{
+		AuthzPolicies: yamlPolicy(t, basePath+input),
+		Mesh:          mc,
+	}
+	p.ServiceIndex.HostnameAndNamespace = map[host.Name]map[string]*model.Service{
+		"my-custom-ext-authz.foo.svc.cluster.local": {
+			"foo": &model.Service{
+				Hostname: "my-custom-ext-authz.foo.svc.cluster.local",
+			},
+		},
+	}
+	return p
+}
+
+func node(version *model.IstioVersion) *model.Proxy {
+	return &model.Proxy{
+		ID:              "test-node",
+		ConfigNamespace: "foo",
+		Labels:          httpbin,
+		Metadata: &model.NodeMetadata{
+			Labels: httpbin,
+		},
+		IstioVersion: version,
+	}
 }

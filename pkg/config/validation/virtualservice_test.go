@@ -17,16 +17,14 @@ package validation
 import (
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	networking "istio.io/api/networking/v1alpha3"
-
-	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pkg/config"
 )
 
 func TestValidateChainingVirtualService(t *testing.T) {
-	features.EnableVirtualServiceDelegate = true
 	testCases := []struct {
 		name  string
 		in    proto.Message
@@ -57,7 +55,7 @@ func TestValidateChainingVirtualService(t *testing.T) {
 					},
 				}},
 			},
-			valid: false,
+			valid: true,
 		},
 		{
 			name: "root with delegate and destination in one route",
@@ -87,12 +85,13 @@ func TestValidateChainingVirtualService(t *testing.T) {
 			name: "delegate with delegate",
 			in: &networking.VirtualService{
 				Hosts: []string{},
-				Http: []*networking.HTTPRoute{{
-					Delegate: &networking.Delegate{
-						Name:      "test",
-						Namespace: "test",
+				Http: []*networking.HTTPRoute{
+					{
+						Delegate: &networking.Delegate{
+							Name:      "test",
+							Namespace: "test",
+						},
 					},
-				},
 				},
 			},
 			valid: false,
@@ -137,13 +136,13 @@ func TestValidateChainingVirtualService(t *testing.T) {
 					}},
 				}},
 			},
-			valid: false,
+			valid: true,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := ValidateVirtualService("", "", tc.in); (err == nil) != tc.valid {
+			if _, err := ValidateVirtualService(config.Config{Spec: tc.in}); (err == nil) != tc.valid {
 				t.Fatalf("got valid=%v but wanted valid=%v: %v", err == nil, tc.valid, err)
 			}
 		})
@@ -204,7 +203,8 @@ func TestValidateRootHTTPRoute(t *testing.T) {
 						"header": nil,
 					},
 				}},
-			}, valid: false},
+			}, valid: false,
+		},
 		{
 			name: "prefix header match", route: &networking.HTTPRoute{
 				Delegate: &networking.Delegate{
@@ -218,7 +218,8 @@ func TestValidateRootHTTPRoute(t *testing.T) {
 						},
 					},
 				}},
-			}, valid: true},
+			}, valid: true,
+		},
 		{
 			name: "exact header match", route: &networking.HTTPRoute{
 				Delegate: &networking.Delegate{
@@ -232,7 +233,8 @@ func TestValidateRootHTTPRoute(t *testing.T) {
 						},
 					},
 				}},
-			}, valid: true},
+			}, valid: true,
+		},
 		{name: "regex header match", route: &networking.HTTPRoute{
 			Delegate: &networking.Delegate{
 				Name:      "test",
@@ -245,7 +247,7 @@ func TestValidateRootHTTPRoute(t *testing.T) {
 					},
 				},
 			}},
-		}, valid: false},
+		}, valid: true},
 		{name: "regex uri match", route: &networking.HTTPRoute{
 			Delegate: &networking.Delegate{
 				Name:      "test",
@@ -256,7 +258,7 @@ func TestValidateRootHTTPRoute(t *testing.T) {
 					MatchType: &networking.StringMatch_Regex{Regex: "test"},
 				},
 			}},
-		}, valid: false},
+		}, valid: true},
 		{name: "prefix uri match", route: &networking.HTTPRoute{
 			Delegate: &networking.Delegate{
 				Name:      "test",
@@ -292,7 +294,8 @@ func TestValidateRootHTTPRoute(t *testing.T) {
 						},
 					},
 				}},
-			}, valid: true},
+			}, valid: true,
+		},
 		{
 			name: "exact queryParams match", route: &networking.HTTPRoute{
 				Delegate: &networking.Delegate{
@@ -306,7 +309,8 @@ func TestValidateRootHTTPRoute(t *testing.T) {
 						},
 					},
 				}},
-			}, valid: true},
+			}, valid: true,
+		},
 		{name: "regex queryParams match", route: &networking.HTTPRoute{
 			Delegate: &networking.Delegate{
 				Name:      "test",
@@ -319,13 +323,59 @@ func TestValidateRootHTTPRoute(t *testing.T) {
 					},
 				},
 			}},
+		}, valid: true},
+		{name: "empty regex match in method", route: &networking.HTTPRoute{
+			Match: []*networking.HTTPMatchRequest{{
+				Method: &networking.StringMatch{
+					MatchType: &networking.StringMatch_Regex{Regex: ""},
+				},
+			}},
+			Redirect: &networking.HTTPRedirect{
+				Uri:       "/",
+				Authority: "foo.biz",
+			},
+		}, valid: false},
+		{name: "empty regex match in uri", route: &networking.HTTPRoute{
+			Match: []*networking.HTTPMatchRequest{{
+				Uri: &networking.StringMatch{
+					MatchType: &networking.StringMatch_Regex{Regex: ""},
+				},
+			}},
+			Redirect: &networking.HTTPRedirect{
+				Uri:       "/",
+				Authority: "foo.biz",
+			},
+		}, valid: false},
+		{name: "empty regex match in query", route: &networking.HTTPRoute{
+			Match: []*networking.HTTPMatchRequest{{
+				QueryParams: map[string]*networking.StringMatch{
+					"q": {
+						MatchType: &networking.StringMatch_Regex{Regex: ""},
+					},
+				},
+			}},
+			Redirect: &networking.HTTPRedirect{
+				Uri:       "/",
+				Authority: "foo.biz",
+			},
+		}, valid: false},
+		{name: "empty regex match in scheme", route: &networking.HTTPRoute{
+			Match: []*networking.HTTPMatchRequest{{
+				Scheme: &networking.StringMatch{
+					MatchType: &networking.StringMatch_Regex{Regex: ""},
+				},
+			}},
+			Redirect: &networking.HTTPRedirect{
+				Uri:       "/",
+				Authority: "foo.biz",
+			},
 		}, valid: false},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateRootHTTPRoute(tc.route); (err == nil) != tc.valid {
-				t.Fatalf("got valid=%v but wanted valid=%v: %v", err == nil, tc.valid, err)
+			if err := validateHTTPRoute(tc.route, false, false); (err.Err == nil) != tc.valid {
+				t.Fatalf("got valid=%v but wanted valid=%v: %v", err.Err == nil, tc.valid, err)
 			}
 		})
 	}
@@ -366,7 +416,7 @@ func TestValidateDelegateHTTPRoute(t *testing.T) {
 				Destination: &networking.Destination{Host: "foo.baz.east"},
 				Weight:      50,
 			}},
-		}, valid: false},
+		}, valid: true},
 		{name: "total weight < 100", route: &networking.HTTPRoute{
 			Route: []*networking.HTTPRouteDestination{{
 				Destination: &networking.Destination{Host: "foo.baz.south"},
@@ -375,7 +425,7 @@ func TestValidateDelegateHTTPRoute(t *testing.T) {
 				Destination: &networking.Destination{Host: "foo.baz.east"},
 				Weight:      50,
 			}},
-		}, valid: false},
+		}, valid: true},
 		{name: "simple redirect", route: &networking.HTTPRoute{
 			Redirect: &networking.HTTPRedirect{
 				Uri:       "/lerp",
@@ -520,7 +570,7 @@ func TestValidateDelegateHTTPRoute(t *testing.T) {
 			Match: []*networking.HTTPMatchRequest{nil},
 		}, valid: true},
 		{name: "invalid mirror percent", route: &networking.HTTPRoute{
-			MirrorPercent: &types.UInt32Value{Value: 101},
+			MirrorPercent: &wrapperspb.UInt32Value{Value: 101},
 			Route: []*networking.HTTPRouteDestination{{
 				Destination: &networking.Destination{Host: "foo.bar"},
 			}},
@@ -544,6 +594,15 @@ func TestValidateDelegateHTTPRoute(t *testing.T) {
 			}},
 			Match: []*networking.HTTPMatchRequest{nil},
 		}, valid: true},
+		{name: "negative mirror percentage", route: &networking.HTTPRoute{
+			MirrorPercentage: &networking.Percent{
+				Value: -1,
+			},
+			Route: []*networking.HTTPRouteDestination{{
+				Destination: &networking.Destination{Host: "foo.bar"},
+			}},
+			Match: []*networking.HTTPMatchRequest{nil},
+		}, valid: false},
 		{name: "delegate route with delegate", route: &networking.HTTPRoute{
 			Delegate: &networking.Delegate{
 				Name:      "test",
@@ -554,8 +613,8 @@ func TestValidateDelegateHTTPRoute(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateDelegateHTTPRoute(tc.route); (err == nil) != tc.valid {
-				t.Fatalf("got valid=%v but wanted valid=%v: %v", err == nil, tc.valid, err)
+			if err := validateHTTPRoute(tc.route, true, false); (err.Err == nil) != tc.valid {
+				t.Fatalf("got valid=%v but wanted valid=%v: %v", err.Err == nil, tc.valid, err)
 			}
 		})
 	}

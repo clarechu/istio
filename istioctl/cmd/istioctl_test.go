@@ -21,10 +21,8 @@ import (
 	"testing"
 
 	istioclient "istio.io/client-go/pkg/clientset/versioned"
-
-	"istio.io/istio/pkg/kube"
-
 	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/kube"
 )
 
 type testCase struct {
@@ -111,7 +109,7 @@ func verifyOutput(t *testing.T, c testCase) {
 	}
 
 	if c.goldenFilename != "" {
-		util.CompareContent([]byte(output), c.goldenFilename, t)
+		util.CompareContent(t, []byte(output), c.goldenFilename)
 	}
 
 	if c.wantException {

@@ -16,16 +16,14 @@ package framework
 
 import (
 	"flag"
-	"io/ioutil"
+	"io"
 
 	"google.golang.org/grpc/grpclog"
 
 	"istio.io/pkg/log"
 )
 
-var (
-	logOptionsFromCommandline = log.DefaultOptions()
-)
+var logOptionsFromCommandline = log.DefaultOptions()
 
 func init() {
 	logOptionsFromCommandline.AttachFlags(
@@ -41,7 +39,7 @@ func configureLogging() error {
 	o := *logOptionsFromCommandline
 
 	o.LogGrpc = false
-	grpclog.SetLoggerV2(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
 
 	return log.Configure(&o)
 }

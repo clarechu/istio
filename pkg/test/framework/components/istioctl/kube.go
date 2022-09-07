@@ -18,38 +18,46 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
-	"testing"
+	"sync"
+	"time"
 
 	"istio.io/istio/istioctl/cmd"
 	"istio.io/istio/pilot/pkg/config/kube/crd"
-
-	"istio.io/istio/pkg/test/framework/components/environment/kube"
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/framework/resource"
+	"istio.io/istio/pkg/test/scopes"
 )
 
+// We cannot invoke the istioctl library concurrently due to the number of global variables
+// https://github.com/istio/istio/issues/37324
+var invokeMutex sync.Mutex
+
 type kubeComponent struct {
-	config  Config
-	id      resource.ID
-	cluster kube.Cluster
+	config     Config
+	kubeconfig string
 }
 
-func newKube(ctx resource.Context, config Config) Instance {
-	n := &kubeComponent{
-		config:  config,
-		cluster: ctx.Clusters().GetOrDefault(config.Cluster).(kube.Cluster),
+// Filenamer is an interface to avoid importing kubecluster package, instead build our own interface
+// to extract kube context
+type Filenamer interface {
+	Filename() string
+}
+
+func newKube(ctx resource.Context, config Config) (Instance, error) {
+	fn, ok := ctx.Clusters().GetOrDefault(config.Cluster).(Filenamer)
+	if !ok {
+		return nil, fmt.Errorf("cluster does not support fetching kube config")
 	}
-	n.id = ctx.TrackResource(n)
+	n := &kubeComponent{
+		config:     config,
+		kubeconfig: fn.Filename(),
+	}
 
-	return n
-}
-
-// ID implements resource.Instance
-func (c *kubeComponent) ID() resource.ID {
-	return c.id
+	return n, nil
 }
 
 // Invoke implements WaitForConfigs
-func (c *kubeComponent) WaitForConfigs(defaultNamespace string, configs string) error {
+func (c *kubeComponent) WaitForConfig(defaultNamespace string, configs string) error {
 	cfgs, _, err := crd.ParseInputs(configs)
 	if err != nil {
 		return fmt.Errorf("failed to parse input: %v", err)
@@ -59,8 +67,10 @@ func (c *kubeComponent) WaitForConfigs(defaultNamespace string, configs string) 
 		if ns == "" {
 			ns = defaultNamespace
 		}
-		if _, _, err := c.Invoke([]string{"x", "wait", cfg.GroupVersionKind.Kind, cfg.Name + "." + ns}); err != nil {
-			return err
+		// TODO(https://github.com/istio/istio/issues/37148) increase timeout. Right now it fails often, so
+		// set it to low timeout to reduce impact
+		if out, stderr, err := c.Invoke([]string{"x", "wait", "-v", "--timeout=5s", cfg.GroupVersionKind.Kind, cfg.Name + "." + ns}); err != nil {
+			return fmt.Errorf("wait: %v\nout: %v\nerr: %v", err, out, stderr)
 		}
 	}
 	return nil
@@ -68,22 +78,33 @@ func (c *kubeComponent) WaitForConfigs(defaultNamespace string, configs string) 
 
 // Invoke implements Instance
 func (c *kubeComponent) Invoke(args []string) (string, string, error) {
-	var cmdArgs = append([]string{
+	cmdArgs := append([]string{
 		"--kubeconfig",
-		c.cluster.Filename(),
+		c.kubeconfig,
 	}, args...)
 
 	var out bytes.Buffer
 	var err bytes.Buffer
+
+	start := time.Now()
+
+	invokeMutex.Lock()
 	rootCmd := cmd.GetRootCmd(cmdArgs)
 	rootCmd.SetOut(&out)
 	rootCmd.SetErr(&err)
 	fErr := rootCmd.Execute()
+	invokeMutex.Unlock()
+
+	scopes.Framework.Infof("istioctl (%v): completed after %.4fs", args, time.Since(start).Seconds())
+
+	if err.String() != "" {
+		scopes.Framework.Infof("istioctl error: %v", strings.TrimSpace(err.String()))
+	}
 	return out.String(), err.String(), fErr
 }
 
 // InvokeOrFail implements Instance
-func (c *kubeComponent) InvokeOrFail(t *testing.T, args []string) (string, string) {
+func (c *kubeComponent) InvokeOrFail(t test.Failer, args []string) (string, string) {
 	output, stderr, err := c.Invoke(args)
 	if err != nil {
 		t.Logf("Unwanted exception for 'istioctl %s': %v", strings.Join(args, " "), err)

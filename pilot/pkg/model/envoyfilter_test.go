@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pkg/config"
 )
 
 // TestEnvoyFilterMatch tests the matching logic for EnvoyFilter, in particular the regex -> prefix optimization
@@ -94,9 +95,9 @@ func TestEnvoyFilterMatch(t *testing.T) {
 		},
 	}
 	for _, tt := range cases {
-		got := convertToEnvoyFilterWrapper(&Config{
-			ConfigMeta: ConfigMeta{},
-			Spec:       tt.config,
+		got := convertToEnvoyFilterWrapper(&config.Config{
+			Meta: config.Meta{},
+			Spec: tt.config,
 		})
 		if len(got.Patches[networking.EnvoyFilter_INVALID]) != 1 {
 			t.Fatalf("unexpected patches: %v", got.Patches)
@@ -111,5 +112,24 @@ func TestEnvoyFilterMatch(t *testing.T) {
 				t.Errorf("expected %v to match %v, got %v", ver, match, got)
 			}
 		}
+	}
+}
+
+func TestConvertEnvoyFilter(t *testing.T) {
+	cfilter := convertToEnvoyFilterWrapper(&config.Config{
+		Meta: config.Meta{Name: "test", Namespace: "testns"},
+		Spec: &networking.EnvoyFilter{
+			ConfigPatches: []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
+				{
+					Patch: &networking.EnvoyFilter_Patch{},
+					Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+						Proxy: &networking.EnvoyFilter_ProxyMatch{ProxyVersion: `foobar`},
+					},
+				},
+			},
+		},
+	})
+	if cfilter.Name != "test" && cfilter.Namespace != "testns" {
+		t.Errorf("expected name %s got %s and namespace %s got %s", "test", cfilter.Name, "testns", cfilter.Namespace)
 	}
 }

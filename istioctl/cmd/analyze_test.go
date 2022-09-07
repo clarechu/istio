@@ -17,9 +17,9 @@ package cmd
 import (
 	"testing"
 
-	"istio.io/istio/galley/pkg/config/analysis/diag"
-
 	. "github.com/onsi/gomega"
+
+	"istio.io/istio/pkg/config/analysis/diag"
 )
 
 func TestErrorOnIssuesFound(t *testing.T) {
@@ -53,7 +53,7 @@ func TestNoErrorIfMessageLevelsBelowThreshold(t *testing.T) {
 			"",
 		),
 		diag.NewMessage(
-			diag.NewMessageType(diag.Info, "A1", "Template: %q"),
+			diag.NewMessageType(diag.Warning, "A1", "Template: %q"),
 			nil,
 			"",
 		),

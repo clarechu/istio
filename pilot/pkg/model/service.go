@@ -26,20 +26,20 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	"github.com/mitchellh/copystructure"
 
 	"istio.io/api/label"
-
-	"istio.io/istio/pilot/pkg/util/sets"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/visibility"
+	"istio.io/istio/pkg/network"
 )
 
 // Service describes an Istio service (e.g., catalog.mystore.com:8080)
@@ -70,13 +70,18 @@ type Service struct {
 	// Name of the service, e.g. "catalog.mystore.com"
 	Hostname host.Name `json:"hostname"`
 
-	// Address specifies the service IPv4 address of the load balancer
-	// Do not access directly. Use GetServiceAddressForProxy
-	Address string `json:"address,omitempty"`
+	// ClusterVIPs specifies the service address of the load balancer
+	// in each of the clusters where the service resides
+	ClusterVIPs AddressMap `json:"clusterVIPs,omitempty"`
 
-	// AutoAllocatedAddress specifies the automatically allocated
-	// IPv4 address out of the reserved Class E subnet
-	// (240.240.0.0/16) for service entries with non-wildcard
+	// DefaultAddress specifies the default service IP of the load balancer.
+	// Do not access directly. Use GetAddressForProxy
+	DefaultAddress string `json:"defaultAddress,omitempty"`
+
+	// AutoAllocatedIPv4Address and AutoAllocatedIPv6Address specifies
+	// the automatically allocated IPv4/IPv6 address out of the reserved
+	// Class E subnet (240.240.0.0/16) or reserved Benchmarking IP range
+	// (2001:2::/48) in RFC5180.for service entries with non-wildcard
 	// hostnames. The IPs assigned to services are not
 	// synchronized across istiod replicas as the DNS resolution
 	// for these service entries happens completely inside a pod
@@ -84,14 +89,8 @@ type Service struct {
 	// to allocate IPs is pretty deterministic that at stable state, two
 	// istiods will allocate the exact same set of IPs for a given set of
 	// service entries.
-	AutoAllocatedAddress string `json:"autoAllocatedAddress,omitempty"`
-
-	// Protect concurrent ClusterVIPs read/write
-	Mutex sync.RWMutex
-
-	// ClusterVIPs specifies the service address of the load balancer
-	// in each of the clusters where the service resides
-	ClusterVIPs map[string]string `json:"cluster-vips,omitempty"`
+	AutoAllocatedIPv4Address string `json:"autoAllocatedIPv4Address,omitempty"`
+	AutoAllocatedIPv6Address string `json:"autoAllocatedIPv6Address,omitempty"`
 
 	// Resolution indicates how the service instances need to be resolved before routing
 	// traffic. Most services in the service registry will use static load balancing wherein
@@ -104,10 +103,20 @@ type Service struct {
 	// MeshExternal (if true) indicates that the service is external to the mesh.
 	// These services are defined using Istio's ServiceEntry spec.
 	MeshExternal bool
+
+	// ResourceVersion represents the internal version of this object.
+	ResourceVersion string
 }
 
-// Resolution indicates how the service instances need to be resolved before routing
-// traffic.
+func (s *Service) Key() string {
+	if s == nil {
+		return ""
+	}
+
+	return s.Attributes.Namespace + "/" + string(s.Hostname)
+}
+
+// Resolution indicates how the service instances need to be resolved before routing traffic.
 type Resolution int
 
 const (
@@ -117,6 +126,8 @@ const (
 	DNSLB
 	// Passthrough implies that the proxy should forward traffic to the destination IP requested by the caller
 	Passthrough
+	// DNSRoundRobinLB implies that the proxy will resolve a DNS address and forward to the resolved address
+	DNSRoundRobinLB
 )
 
 // String converts Resolution in to String.
@@ -126,6 +137,8 @@ func (resolution Resolution) String() string {
 		return "ClientSide"
 	case DNSLB:
 		return "DNS"
+	case DNSRoundRobinLB:
+		return "DNSRoundRobin"
 	case Passthrough:
 		return "Passthrough"
 	default:
@@ -198,15 +211,6 @@ const (
 	trafficDirectionInboundSrvPrefix = string(TrafficDirectionInbound) + "_"
 )
 
-// Probe represents a health probe associated with an instance of service.
-type Probe struct {
-	Port *Port  `json:"port,omitempty"`
-	Path string `json:"path,omitempty"`
-}
-
-// ProbeList is a set of probes
-type ProbeList []*Probe
-
 // ServiceInstance represents an individual instance of a specific version
 // of a service. It binds a network endpoint (ip:port), the service
 // description (which is oblivious to various versions) and a set of labels
@@ -221,10 +225,11 @@ type ProbeList []*Probe
 //
 // For example, the set of service instances associated with catalog.mystore.com
 // are modeled like this
-//      --> IstioEndpoint(172.16.0.1:8888), Service(catalog.myservice.com), Labels(foo=bar)
-//      --> IstioEndpoint(172.16.0.2:8888), Service(catalog.myservice.com), Labels(foo=bar)
-//      --> IstioEndpoint(172.16.0.3:8888), Service(catalog.myservice.com), Labels(kitty=cat)
-//      --> IstioEndpoint(172.16.0.4:8888), Service(catalog.myservice.com), Labels(kitty=cat)
+//
+//	--> IstioEndpoint(172.16.0.1:8888), Service(catalog.myservice.com), Labels(foo=bar)
+//	--> IstioEndpoint(172.16.0.2:8888), Service(catalog.myservice.com), Labels(foo=bar)
+//	--> IstioEndpoint(172.16.0.3:8888), Service(catalog.myservice.com), Labels(kitty=cat)
+//	--> IstioEndpoint(172.16.0.4:8888), Service(catalog.myservice.com), Labels(kitty=cat)
 type ServiceInstance struct {
 	Service     *Service       `json:"service,omitempty"`
 	ServicePort *Port          `json:"servicePort,omitempty"`
@@ -244,10 +249,35 @@ func (instance *ServiceInstance) DeepCopy() *ServiceInstance {
 	}
 }
 
+type workloadKind int
+
+const (
+	// PodKind indicates the workload is from pod
+	PodKind workloadKind = iota
+	// WorkloadEntryKind indicates the workload is from workloadentry
+	WorkloadEntryKind
+)
+
+func (k workloadKind) String() string {
+	if k == PodKind {
+		return "Pod"
+	}
+
+	if k == WorkloadEntryKind {
+		return "WorkloadEntry"
+	}
+	return ""
+}
+
 type WorkloadInstance struct {
-	Namespace string            `json:"namespace,omitempty"`
-	Endpoint  *IstioEndpoint    `json:"endpoint,omitempty"`
-	PortMap   map[string]uint32 `json:"portMap,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	// Where the workloadInstance come from, valid values are`Pod` or `WorkloadEntry`
+	Kind     workloadKind      `json:"kind"`
+	Endpoint *IstioEndpoint    `json:"endpoint,omitempty"`
+	PortMap  map[string]uint32 `json:"portMap,omitempty"`
+	// Can only be selected by service entry of DNS type.
+	DNSServiceEntryOnly bool `json:"dnsServiceEntryOnly,omitempty"`
 }
 
 // DeepCopy creates a copy of WorkloadInstance.
@@ -257,13 +287,15 @@ func (instance *WorkloadInstance) DeepCopy() *WorkloadInstance {
 		pmap[k] = v
 	}
 	return &WorkloadInstance{
+		Name:      instance.Name,
 		Namespace: instance.Namespace,
+		Kind:      instance.Kind,
 		PortMap:   pmap,
 		Endpoint:  instance.Endpoint.DeepCopy(),
 	}
 }
 
-// a custom comparison of workload instances based on the fields that we need
+// WorkloadInstancesEqual is a custom comparison of workload instances based on the fields that we need
 // i.e. excluding the ports. Returns true if equal, false otherwise.
 func WorkloadInstancesEqual(first, second *WorkloadInstance) bool {
 	if first.Endpoint == nil || second.Endpoint == nil {
@@ -287,13 +319,16 @@ func WorkloadInstancesEqual(first, second *WorkloadInstance) bool {
 	if first.Endpoint.Locality != second.Endpoint.Locality {
 		return false
 	}
-	if first.Endpoint.LbWeight != second.Endpoint.LbWeight {
-		return false
-	}
-	if first.Endpoint.UID != second.Endpoint.UID {
+	if first.Endpoint.GetLoadBalancingWeight() != second.Endpoint.GetLoadBalancingWeight() {
 		return false
 	}
 	if first.Namespace != second.Namespace {
+		return false
+	}
+	if first.Name != second.Name {
+		return false
+	}
+	if first.Kind != second.Kind {
 		return false
 	}
 	if !portMapEquals(first.PortMap, second.PortMap) {
@@ -329,14 +364,37 @@ func GetLocalityLabelOrDefault(label, defaultLabel string) string {
 	return defaultLabel
 }
 
+// SplitLocalityLabel splits a locality label into region, zone and subzone strings.
+func SplitLocalityLabel(locality string) (region, zone, subzone string) {
+	items := strings.Split(locality, "/")
+	switch len(items) {
+	case 1:
+		return items[0], "", ""
+	case 2:
+		return items[0], items[1], ""
+	default:
+		return items[0], items[1], items[2]
+	}
+}
+
 // Locality information for an IstioEndpoint
 type Locality struct {
 	// Label for locality on the endpoint. This is a "/" separated string.
 	Label string
 
 	// ClusterID where the endpoint is located
-	ClusterID string
+	ClusterID cluster.ID
 }
+
+// Endpoint health status.
+type HealthStatus int32
+
+const (
+	// Healthy.
+	Healthy HealthStatus = 0
+	// Unhealthy.
+	UnHealthy HealthStatus = 1
+)
 
 // IstioEndpoint defines a network address (IP:port) associated with an instance of the
 // service. A service has one or more instances each running in a
@@ -351,10 +409,11 @@ type Locality struct {
 // port 80 are forwarded to port 55446, and connections to port 8080 are
 // forwarded to port 33333,
 //
-// then internally, we have two two endpoint structs for the
+// then internally, we have two endpoint structs for the
 // service catalog.mystore.com
-//  --> 172.16.0.1:54546 (with ServicePort pointing to 80) and
-//  --> 172.16.0.1:33333 (with ServicePort pointing to 8080)
+//
+//	--> 172.16.0.1:55446 (with ServicePort pointing to 80) and
+//	--> 172.16.0.1:33333 (with ServicePort pointing to 8080)
 //
 // TODO: Investigate removing ServiceInstance entirely.
 type IstioEndpoint struct {
@@ -367,9 +426,6 @@ type IstioEndpoint struct {
 	// ServicePortName tracks the name of the port, this is used to select the IstioEndpoint by service port.
 	ServicePortName string
 
-	// UID identifies the workload, for telemetry purpose.
-	UID string
-
 	// EnvoyEndpoint is a cached LbEndpoint, converted from the data, to
 	// avoid recomputation
 	EnvoyEndpoint *endpoint.LbEndpoint
@@ -378,7 +434,7 @@ type IstioEndpoint struct {
 	ServiceAccount string
 
 	// Network holds the network where this endpoint is present
-	Network string
+	Network network.ID
 
 	// The locality where the endpoint is present.
 	Locality Locality
@@ -392,6 +448,81 @@ type IstioEndpoint struct {
 
 	// TLSMode endpoint is injected with istio sidecar and ready to configure Istio mTLS
 	TLSMode string
+
+	// Namespace that this endpoint belongs to. This is for telemetry purpose.
+	Namespace string
+
+	// Name of the workload that this endpoint belongs to. This is for telemetry purpose.
+	WorkloadName string
+
+	// Specifies the hostname of the Pod, empty for vm workload.
+	HostName string
+
+	// If specified, the fully qualified Pod hostname will be "<hostname>.<subdomain>.<pod namespace>.svc.<cluster domain>".
+	SubDomain string
+
+	// Determines the discoverability of this endpoint throughout the mesh.
+	DiscoverabilityPolicy EndpointDiscoverabilityPolicy `json:"-"`
+
+	// Indicatesthe endpoint health status.
+	HealthStatus HealthStatus
+}
+
+// GetLoadBalancingWeight returns the weight for this endpoint, normalized to always be > 0.
+func (ep *IstioEndpoint) GetLoadBalancingWeight() uint32 {
+	if ep.LbWeight > 0 {
+		return ep.LbWeight
+	}
+	return 1
+}
+
+// IsDiscoverableFromProxy indicates whether this endpoint is discoverable from the given Proxy.
+func (ep *IstioEndpoint) IsDiscoverableFromProxy(p *Proxy) bool {
+	if ep == nil || ep.DiscoverabilityPolicy == nil {
+		// If no policy was assigned, default to discoverable mesh-wide.
+		// TODO(nmittler): Will need to re-think this default when cluster.local is actually cluster-local.
+		return true
+	}
+	return ep.DiscoverabilityPolicy.IsDiscoverableFromProxy(ep, p)
+}
+
+// EndpointDiscoverabilityPolicy determines the discoverability of an endpoint throughout the mesh.
+type EndpointDiscoverabilityPolicy interface {
+	// IsDiscoverableFromProxy indicates whether an endpoint is discoverable from the given Proxy.
+	IsDiscoverableFromProxy(*IstioEndpoint, *Proxy) bool
+
+	// String returns name of this policy.
+	String() string
+}
+
+type endpointDiscoverabilityPolicyImpl struct {
+	name string
+	f    func(*IstioEndpoint, *Proxy) bool
+}
+
+func (p *endpointDiscoverabilityPolicyImpl) IsDiscoverableFromProxy(ep *IstioEndpoint, proxy *Proxy) bool {
+	return p.f(ep, proxy)
+}
+
+func (p *endpointDiscoverabilityPolicyImpl) String() string {
+	return p.name
+}
+
+// AlwaysDiscoverable is an EndpointDiscoverabilityPolicy that allows an endpoint to be discoverable throughout the mesh.
+var AlwaysDiscoverable EndpointDiscoverabilityPolicy = &endpointDiscoverabilityPolicyImpl{
+	name: "AlwaysDiscoverable",
+	f: func(*IstioEndpoint, *Proxy) bool {
+		return true
+	},
+}
+
+// DiscoverableFromSameCluster is an EndpointDiscoverabilityPolicy that only allows an endpoint to be discoverable
+// from proxies within the same cluster.
+var DiscoverableFromSameCluster EndpointDiscoverabilityPolicy = &endpointDiscoverabilityPolicyImpl{
+	name: "DiscoverableFromSameCluster",
+	f: func(ep *IstioEndpoint, p *Proxy) bool {
+		return p.InCluster(ep.Locality.ClusterID)
+	},
 }
 
 // ServiceAttributes represents a group of custom attributes of the service.
@@ -399,13 +530,13 @@ type ServiceAttributes struct {
 	// ServiceRegistry indicates the backing service registry system where this service
 	// was sourced from.
 	// TODO: move the ServiceRegistry type from platform.go to model
-	ServiceRegistry string
+	ServiceRegistry provider.ID
 	// Name is "destination.service.name" attribute
 	Name string
 	// Namespace is "destination.service.namespace" attribute
 	Namespace string
-	// UID is "destination.service.uid" attribute
-	UID string
+	// Labels applied to the service
+	Labels map[string]string
 	// ExportTo defines the visibility of Service in
 	// a namespace when the namespace is imported.
 	ExportTo map[visibility.Instance]bool
@@ -420,24 +551,34 @@ type ServiceAttributes struct {
 	// address(es) to access the service from outside the cluster.
 	// Used by the aggregator to aggregate the Attributes.ClusterExternalAddresses
 	// for clusters where the service resides
-	ClusterExternalAddresses map[string][]string
+	ClusterExternalAddresses AddressMap
 
 	// ClusterExternalPorts is a mapping between a cluster name and the service port
 	// to node port mappings for a given service. When accessing the service via
 	// node port IPs, we need to use the kubernetes assigned node ports of the service
 	// The port that the user provides in the meshNetworks config is the service port.
 	// We translate that to the appropriate node port here.
-	ClusterExternalPorts map[string]map[uint32]uint32
+	ClusterExternalPorts map[cluster.ID]map[uint32]uint32
+}
+
+// DeepCopy creates a deep copy of ServiceAttributes, but skips internal mutexes.
+func (s *ServiceAttributes) DeepCopy() ServiceAttributes {
+	// Nested mutexes are configured to be ignored by copystructure.Copy.
+	// Disabling `go vet` warning since this is actually safe in this case.
+	// nolint: vet
+	return copyInternal(*s).(ServiceAttributes)
 }
 
 // ServiceDiscovery enumerates Istio service instances.
 // nolint: lll
 type ServiceDiscovery interface {
+	NetworkGatewaysWatcher
+
 	// Services list declarations of all services in the system
-	Services() ([]*Service, error)
+	Services() []*Service
 
 	// GetService retrieves a service by host name if it exists
-	GetService(hostname host.Name) (*Service, error)
+	GetService(hostname host.Name) *Service
 
 	// InstancesByPort retrieves instances for a service on the given ports with labels that match
 	// any of the supplied labels. All instances match an empty tag list.
@@ -461,7 +602,7 @@ type ServiceDiscovery interface {
 	// CDS (clusters.go) calls it for building 'dnslb' type clusters.
 	// EDS calls it for building the endpoints result.
 	// Consult istio-dev before using this for anything else (except debugging/tools)
-	InstancesByPort(svc *Service, servicePort int, labels labels.Collection) ([]*ServiceInstance, error)
+	InstancesByPort(svc *Service, servicePort int, labels labels.Instance) []*ServiceInstance
 
 	// GetProxyServiceInstances returns the service instances that co-located with a given Proxy
 	//
@@ -480,14 +621,25 @@ type ServiceDiscovery interface {
 	// though with a different ServicePort and IstioEndpoint for each.  If any of these overlapping
 	// services are not HTTP or H2-based, behavior is undefined, since the listener may not be able to
 	// determine the intended destination of a connection without a Host header on the request.
-	GetProxyServiceInstances(*Proxy) ([]*ServiceInstance, error)
+	GetProxyServiceInstances(*Proxy) []*ServiceInstance
+	GetProxyWorkloadLabels(*Proxy) labels.Instance
 
-	GetProxyWorkloadLabels(*Proxy) (labels.Collection, error)
+	// MCSServices returns information about the services that have been exported/imported via the
+	// Kubernetes Multi-Cluster Services (MCS) ServiceExport API. Only applies to services in
+	// Kubernetes clusters.
+	MCSServices() []MCSServiceInfo
+}
 
-	// GetIstioServiceAccounts returns a list of service accounts looked up from
-	// the specified service hostname and ports.
-	// Deprecated - service account tracking moved to XdsServer, incremental.
-	GetIstioServiceAccounts(svc *Service, ports []int) []string
+// MCSServiceInfo combines the name of a service with a particular Kubernetes cluster. This
+// is used for debug information regarding the state of Kubernetes Multi-Cluster Services (MCS).
+type MCSServiceInfo struct {
+	Cluster         cluster.ID
+	Name            string
+	Namespace       string
+	Exported        bool
+	Imported        bool
+	ClusterSetVIP   string
+	Discoverability map[host.Name]string
 }
 
 // GetNames returns port names
@@ -530,6 +682,11 @@ func BuildSubsetKey(direction TrafficDirection, subsetName string, hostname host
 	return string(direction) + "|" + strconv.Itoa(port) + "|" + subsetName + "|" + string(hostname)
 }
 
+// BuildInboundSubsetKey generates a unique string referencing service instances with port.
+func BuildInboundSubsetKey(port int) string {
+	return BuildSubsetKey(TrafficDirectionInbound, "", "", port)
+}
+
 // BuildDNSSrvSubsetKey generates a unique string referencing service instances for a given service name, a subset and a port.
 // The proxy queries Pilot with this key to obtain the list of instances in a subset.
 // This is used only for the SNI-DNAT router. Do not use for other purposes.
@@ -541,6 +698,15 @@ func BuildDNSSrvSubsetKey(direction TrafficDirection, subsetName string, hostnam
 // IsValidSubsetKey checks if a string is valid for subset key parsing.
 func IsValidSubsetKey(s string) bool {
 	return strings.Count(s, "|") == 3
+}
+
+// IsDNSSrvSubsetKey checks whether the given key is a DNSSrv key (built by BuildDNSSrvSubsetKey).
+func IsDNSSrvSubsetKey(s string) bool {
+	if strings.HasPrefix(s, trafficDirectionOutboundSrvPrefix) ||
+		strings.HasPrefix(s, trafficDirectionInboundSrvPrefix) {
+		return true
+	}
+	return false
 }
 
 // ParseSubsetKey is the inverse of the BuildSubsetKey method
@@ -574,19 +740,63 @@ func ParseSubsetKey(s string) (direction TrafficDirection, subsetName string, ho
 	return
 }
 
-// GetServiceAddressForProxy returns a Service's IP address specific to the cluster where the node resides
-func (s *Service) GetServiceAddressForProxy(node *Proxy) string {
-	// todo reduce unnecessary locking
-	s.Mutex.RLock()
-	defer s.Mutex.RUnlock()
-	if node.Metadata != nil && node.Metadata.ClusterID != "" && s.ClusterVIPs[node.Metadata.ClusterID] != "" {
-		return s.ClusterVIPs[node.Metadata.ClusterID]
+// GetAddresses returns a Service's addresses.
+// This method returns all the VIPs of a service if the ClusterID is explicitly set to "", otherwise only return the VIP
+// specific to the cluster where the node resides
+func (s *Service) GetAddresses(node *Proxy) []string {
+	if node.Metadata != nil && node.Metadata.ClusterID == "" {
+		return s.getAllAddresses()
 	}
-	if node.Metadata != nil && node.Metadata.DNSCapture != "" &&
-		s.Address == constants.UnspecifiedIP && s.AutoAllocatedAddress != "" {
-		return s.AutoAllocatedAddress
+
+	return []string{s.GetAddressForProxy(node)}
+}
+
+// GetAddressForProxy returns a Service's address specific to the cluster where the node resides
+func (s *Service) GetAddressForProxy(node *Proxy) string {
+	if node.Metadata != nil {
+		if node.Metadata.ClusterID != "" {
+			addresses := s.ClusterVIPs.GetAddressesFor(node.Metadata.ClusterID)
+			if len(addresses) > 0 {
+				return addresses[0]
+			}
+		}
+
+		if node.Metadata.DNSCapture && node.Metadata.DNSAutoAllocate && s.DefaultAddress == constants.UnspecifiedIP {
+			if node.SupportsIPv4() && s.AutoAllocatedIPv4Address != "" {
+				return s.AutoAllocatedIPv4Address
+			}
+			if node.SupportsIPv6() && s.AutoAllocatedIPv6Address != "" {
+				return s.AutoAllocatedIPv6Address
+			}
+		}
 	}
-	return s.Address
+
+	return s.DefaultAddress
+}
+
+// GetExtraAddressesForProxy returns a k8s service's extra addresses to the cluster where the node resides.
+// Especially for dual stack k8s service to get other IP family addresses.
+func (s *Service) GetExtraAddressesForProxy(node *Proxy) []string {
+	if node.Metadata != nil {
+		if node.Metadata.ClusterID != "" {
+			addresses := s.ClusterVIPs.GetAddressesFor(node.Metadata.ClusterID)
+			if len(addresses) > 1 {
+				return addresses[1:]
+			}
+		}
+	}
+	return nil
+}
+
+// getAllAddresses returns a Service's all addresses.
+func (s *Service) getAllAddresses() []string {
+	var addresses []string
+	addressMap := s.ClusterVIPs.GetAddresses()
+	for _, clusterAddresses := range addressMap {
+		addresses = append(addresses, clusterAddresses...)
+	}
+
+	return addresses
 }
 
 // GetTLSModeFromEndpointLabels returns the value of the label
@@ -595,59 +805,39 @@ func (s *Service) GetServiceAddressForProxy(node *Proxy) string {
 // and apply custom transport socket matchers here.
 func GetTLSModeFromEndpointLabels(labels map[string]string) string {
 	if labels != nil {
-		if val, exists := labels[label.TLSMode]; exists {
+		if val, exists := labels[label.SecurityTlsMode.Name]; exists {
 			return val
 		}
 	}
 	return DisabledTLSModeLabel
 }
 
-// GetServiceAccounts returns aggregated list of service accounts of Service plus its instances.
-func GetServiceAccounts(svc *Service, ports []int, discovery ServiceDiscovery) []string {
-	sa := sets.Set{}
-
-	instances := make([]*ServiceInstance, 0)
-	// Get the service accounts running service within Kubernetes. This is reflected by the pods that
-	// the service is deployed on, and the service accounts of the pods.
-	for _, port := range ports {
-		svcInstances, err := discovery.InstancesByPort(svc, port, labels.Collection{})
-		if err != nil {
-			log.Warnf("InstancesByPort(%s:%d) error: %v", svc.Hostname, port, err)
-			return nil
-		}
-		instances = append(instances, svcInstances...)
-	}
-
-	for _, si := range instances {
-		if si.Endpoint.ServiceAccount != "" {
-			sa.Insert(si.Endpoint.ServiceAccount)
-		}
-	}
-	sa.Insert(svc.ServiceAccounts...)
-
-	return sa.UnsortedList()
-}
-
 // DeepCopy creates a clone of Service.
-// TODO : See if there is any efficient alternative to this function - copystructure can not be used as is because
-// Service has sync.RWMutex that can not be copied.
 func (s *Service) DeepCopy() *Service {
-	attrs := copyInternal(s.Attributes)
-	ports := copyInternal(s.Ports)
-	accounts := copyInternal(s.ServiceAccounts)
-	clusterVIPs := copyInternal(s.ClusterVIPs)
-
-	return &Service{
-		Attributes:      attrs.(ServiceAttributes),
-		Ports:           ports.(PortList),
-		ServiceAccounts: accounts.([]string),
-		CreationTime:    s.CreationTime,
-		Hostname:        s.Hostname,
-		Address:         s.Address,
-		ClusterVIPs:     clusterVIPs.(map[string]string),
-		Resolution:      s.Resolution,
-		MeshExternal:    s.MeshExternal,
+	// nolint: govet
+	out := *s
+	out.Attributes = s.Attributes.DeepCopy()
+	if s.Ports != nil {
+		out.Ports = make(PortList, len(s.Ports))
+		for i, port := range s.Ports {
+			if port != nil {
+				out.Ports[i] = &Port{
+					Name:     port.Name,
+					Port:     port.Port,
+					Protocol: port.Protocol,
+				}
+			} else {
+				out.Ports[i] = nil
+			}
+		}
 	}
+
+	if s.ServiceAccounts != nil {
+		out.ServiceAccounts = make([]string, len(s.ServiceAccounts))
+		copy(out.ServiceAccounts, s.ServiceAccounts)
+	}
+	out.ClusterVIPs = s.ClusterVIPs.DeepCopy()
+	return &out
 }
 
 // DeepCopy creates a clone of IstioEndpoint.
@@ -655,7 +845,7 @@ func (ep *IstioEndpoint) DeepCopy() *IstioEndpoint {
 	return copyInternal(ep).(*IstioEndpoint)
 }
 
-func copyInternal(v interface{}) interface{} {
+func copyInternal(v any) any {
 	copied, err := copystructure.Copy(v)
 	if err != nil {
 		// There are 2 locations where errors are generated in copystructure.Copy:

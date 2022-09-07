@@ -18,8 +18,8 @@ import (
 	"testing"
 
 	rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
-	"github.com/gogo/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
 	"istio.io/istio/pkg/util/protomarshal"
@@ -32,7 +32,7 @@ func TestGenerator(t *testing.T) {
 		key    string
 		value  string
 		forTCP bool
-		want   interface{}
+		want   any
 	}{
 		{
 			name:  "destIPGenerator",
@@ -73,6 +73,12 @@ func TestGenerator(t *testing.T) {
               exact: val`),
 		},
 		{
+			name:  "envoyFilterGenerator-invalid",
+			g:     envoyFilterGenerator{},
+			key:   "experimental.a.b.c]",
+			value: "val",
+		},
+		{
 			name:  "envoyFilterGenerator-list",
 			g:     envoyFilterGenerator{},
 			key:   "experimental.a.b.c[d]",
@@ -93,7 +99,16 @@ func TestGenerator(t *testing.T) {
 			g:     srcIPGenerator{},
 			value: "1.2.3.4",
 			want: yamlPrincipal(t, `
-         sourceIp:
+         directRemoteIp:
+          addressPrefix: 1.2.3.4
+          prefixLen: 32`),
+		},
+		{
+			name:  "remoteIPGenerator",
+			g:     remoteIPGenerator{},
+			value: "1.2.3.4",
+			want: yamlPrincipal(t, `
+         remoteIp:
           addressPrefix: 1.2.3.4
           prefixLen: 32`),
 		},
@@ -102,15 +117,11 @@ func TestGenerator(t *testing.T) {
 			g:     srcNamespaceGenerator{},
 			value: "foo",
 			want: yamlPrincipal(t, `
-         metadata:
-          filter: istio_authn
-          path:
-          - key: source.principal
-          value:
-            stringMatch:
-              safeRegex:
-                googleRe2: {}
-                regex: .*/ns/foo/.*`),
+         authenticated:
+          principalName:
+            safeRegex:
+              googleRe2: {}
+              regex: .*/ns/foo/.*`),
 		},
 		{
 			name:   "srcNamespaceGenerator-tcp",
@@ -130,13 +141,9 @@ func TestGenerator(t *testing.T) {
 			key:   "source.principal",
 			value: "foo",
 			want: yamlPrincipal(t, `
-         metadata:
-          filter: istio_authn
-          path:
-          - key: source.principal
-          value:
-            stringMatch:
-              exact: foo`),
+         authenticated:
+          principalName:
+            exact: spiffe://foo`),
 		},
 		{
 			name:   "srcPrincipalGenerator-tcp",
@@ -219,26 +226,37 @@ func TestGenerator(t *testing.T) {
                   exact: foo`),
 		},
 		{
+			name:  "requestNestedClaimsGenerator",
+			g:     requestClaimGenerator{},
+			key:   "request.auth.claims[bar][baz]",
+			value: "foo",
+			want: yamlPrincipal(t, `
+         metadata:
+          filter: istio_authn
+          path:
+          - key: request.auth.claims
+          - key: bar
+          - key: baz
+          value:
+            listMatch:
+              oneOf:
+                stringMatch:
+                  exact: foo`),
+		},
+		{
 			name:  "hostGenerator",
 			g:     hostGenerator{},
 			value: "foo",
 			want: yamlPermission(t, `
          header:
-          exactMatch: foo
+          stringMatch:
+            exact: foo
+            ignoreCase: true
           name: :authority`),
 		},
 		{
-			name:  "pathGenerator14",
-			g:     pathGenerator{isIstioVersionGE15: false},
-			value: "/abc",
-			want: yamlPermission(t, `
-         header:
-          exactMatch: /abc
-          name: :path`),
-		},
-		{
-			name:  "pathGenerator15",
-			g:     pathGenerator{isIstioVersionGE15: true},
+			name:  "pathGenerator",
+			g:     pathGenerator{},
 			value: "/abc",
 			want: yamlPermission(t, `
          urlPath:
@@ -258,18 +276,26 @@ func TestGenerator(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var got interface{}
+			var got any
 			var err error
+			// nolint: gocritic
 			if _, ok := tc.want.(*rbacpb.Permission); ok {
 				got, err = tc.g.permission(tc.key, tc.value, tc.forTCP)
 				if err != nil {
 					t.Errorf("both permission and principal returned error")
 				}
-			} else {
+			} else if _, ok := tc.want.(*rbacpb.Principal); ok {
 				got, err = tc.g.principal(tc.key, tc.value, tc.forTCP)
 				if err != nil {
 					t.Errorf("both permission and principal returned error")
 				}
+			} else {
+				_, err1 := tc.g.principal(tc.key, tc.value, tc.forTCP)
+				_, err2 := tc.g.permission(tc.key, tc.value, tc.forTCP)
+				if err1 == nil || err2 == nil {
+					t.Fatalf("wanted error")
+				}
+				return
 			}
 			if diff := cmp.Diff(got, tc.want, protocmp.Transform()); diff != "" {
 				var gotYaml string

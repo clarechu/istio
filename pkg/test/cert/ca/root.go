@@ -15,15 +15,13 @@
 package ca
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"istio.io/istio/pkg/test/cert"
 )
 
-var (
-	rootCAConf = `
+var rootCAConf = `
 [ req ]
 encrypt_key = no
 prompt = no
@@ -40,7 +38,6 @@ keyUsage = critical, digitalSignature, nonRepudiation, keyEncipherment, keyCertS
 [ req_dn ]
 O = Istio
 CN = Root CA`
-)
 
 // Root contains the cryptographic files for a self-signed root CA.
 type Root struct {
@@ -67,7 +64,7 @@ func NewRoot(workDir string) (Root, error) {
 	}
 
 	// Write out the conf file.
-	if err := ioutil.WriteFile(root.ConfFile, []byte(rootCAConf), os.ModePerm); err != nil {
+	if err := os.WriteFile(root.ConfFile, []byte(rootCAConf), os.ModePerm); err != nil {
 		return Root{}, err
 	}
 

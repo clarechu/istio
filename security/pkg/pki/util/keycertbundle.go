@@ -26,47 +26,16 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"sync"
 	"time"
 )
 
 // KeyCertBundle stores the cert, private key, cert chain and root cert for an entity. It is thread safe.
-// TODO(myidpt): Remove this interface.
-type KeyCertBundle interface {
-	// GetAllPem returns all key/cert PEMs in KeyCertBundle together. Getting all values together avoids inconsistency.
-	GetAllPem() (certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte)
-
-	// GetAll returns all key/cert in KeyCertBundle together. Getting all values together avoids inconsistency.
-	GetAll() (cert *x509.Certificate, privKey *crypto.PrivateKey, certChainBytes, rootCertBytes []byte)
-
-	// GetCertChainPem returns the certificate chain PEM.
-	GetCertChainPem() []byte
-
-	// GetRootCertPem returns the root certificate PEM.
-	GetRootCertPem() []byte
-
-	// VerifyAndSetAll verifies the key/certs, and sets all key/certs in KeyCertBundle together.
-	// Setting all values together avoids inconsistency.
-	VerifyAndSetAll(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error
-
-	// CertOptions returns the CertOptions for rotating the current key cert.
-	CertOptions() (*CertOptions, error)
-
-	// ExtractRootCertExpiryTimestamp returns the unix timestamp when the root becomes expires.
-	// An error indicates the certificate is expired.
-	ExtractRootCertExpiryTimestamp() (float64, error)
-
-	// ExtractCACertExpiryTimestamp returns the unix timestamp when the CA cert becomes expires.
-	// An error indicates the certificate is expired.
-	ExtractCACertExpiryTimestamp() (float64, error)
-}
-
-// KeyCertBundleImpl implements the KeyCertBundle interface.
 // The cert and privKey should be a public/private key pair.
 // The cert should be verifiable from the rootCert through the certChain.
 // cert and priveKey are pointers to the cert/key parsed from certBytes/privKeyBytes.
-type KeyCertBundleImpl struct {
+type KeyCertBundle struct {
 	certBytes      []byte
 	cert           *x509.Certificate
 	privKeyBytes   []byte
@@ -77,11 +46,19 @@ type KeyCertBundleImpl struct {
 	mutex sync.RWMutex
 }
 
+// NewKeyCertBundleFromPem returns a new KeyCertBundle, regardless of whether or not the key can be correctly parsed.
+func NewKeyCertBundleFromPem(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) *KeyCertBundle {
+	bundle := &KeyCertBundle{}
+	bundle.setAllFromPem(certBytes, privKeyBytes, certChainBytes, rootCertBytes)
+	return bundle
+}
+
 // NewVerifiedKeyCertBundleFromPem returns a new KeyCertBundle, or error if the provided certs failed the
 // verification.
 func NewVerifiedKeyCertBundleFromPem(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) (
-	*KeyCertBundleImpl, error) {
-	bundle := &KeyCertBundleImpl{}
+	*KeyCertBundle, error,
+) {
+	bundle := &KeyCertBundle{}
 	if err := bundle.VerifyAndSetAll(certBytes, privKeyBytes, certChainBytes, rootCertBytes); err != nil {
 		return nil, err
 	}
@@ -90,23 +67,30 @@ func NewVerifiedKeyCertBundleFromPem(certBytes, privKeyBytes, certChainBytes, ro
 
 // NewVerifiedKeyCertBundleFromFile returns a new KeyCertBundle, or error if the provided certs failed the
 // verification.
-func NewVerifiedKeyCertBundleFromFile(certFile, privKeyFile, certChainFile, rootCertFile string) (
-	*KeyCertBundleImpl, error) {
-	certBytes, err := ioutil.ReadFile(certFile)
+func NewVerifiedKeyCertBundleFromFile(certFile string, privKeyFile string, certChainFiles []string, rootCertFile string) (
+	*KeyCertBundle, error,
+) {
+	certBytes, err := os.ReadFile(certFile)
 	if err != nil {
 		return nil, err
 	}
-	privKeyBytes, err := ioutil.ReadFile(privKeyFile)
+	privKeyBytes, err := os.ReadFile(privKeyFile)
 	if err != nil {
 		return nil, err
 	}
-	certChainBytes := []byte{}
-	if len(certChainFile) != 0 {
-		if certChainBytes, err = ioutil.ReadFile(certChainFile); err != nil {
-			return nil, err
+	var certChainBytes []byte
+	if len(certChainFiles) > 0 {
+		for _, f := range certChainFiles {
+			var b []byte
+
+			if b, err = os.ReadFile(f); err != nil {
+				return nil, err
+			}
+
+			certChainBytes = append(certChainBytes, b...)
 		}
 	}
-	rootCertBytes, err := ioutil.ReadFile(rootCertFile)
+	rootCertBytes, err := os.ReadFile(rootCertFile)
 	if err != nil {
 		return nil, err
 	}
@@ -114,12 +98,18 @@ func NewVerifiedKeyCertBundleFromFile(certFile, privKeyFile, certChainFile, root
 }
 
 // NewKeyCertBundleWithRootCertFromFile returns a new KeyCertBundle with the root cert without verification.
-func NewKeyCertBundleWithRootCertFromFile(rootCertFile string) (*KeyCertBundleImpl, error) {
-	rootCertBytes, err := ioutil.ReadFile(rootCertFile)
-	if err != nil {
-		return nil, err
+func NewKeyCertBundleWithRootCertFromFile(rootCertFile string) (*KeyCertBundle, error) {
+	var rootCertBytes []byte
+	var err error
+	if rootCertFile == "" {
+		rootCertBytes = []byte{}
+	} else {
+		rootCertBytes, err = os.ReadFile(rootCertFile)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return &KeyCertBundleImpl{
+	return &KeyCertBundle{
 		certBytes:      []byte{},
 		cert:           nil,
 		privKeyBytes:   []byte{},
@@ -130,7 +120,7 @@ func NewKeyCertBundleWithRootCertFromFile(rootCertFile string) (*KeyCertBundleIm
 }
 
 // GetAllPem returns all key/cert PEMs in KeyCertBundle together. Getting all values together avoids inconsistency.
-func (b *KeyCertBundleImpl) GetAllPem() (certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) {
+func (b *KeyCertBundle) GetAllPem() (certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) {
 	b.mutex.RLock()
 	certBytes = copyBytes(b.certBytes)
 	privKeyBytes = copyBytes(b.privKeyBytes)
@@ -142,8 +132,9 @@ func (b *KeyCertBundleImpl) GetAllPem() (certBytes, privKeyBytes, certChainBytes
 
 // GetAll returns all key/cert in KeyCertBundle together. Getting all values together avoids inconsistency.
 // NOTE: Callers should not modify the content of cert and privKey.
-func (b *KeyCertBundleImpl) GetAll() (cert *x509.Certificate, privKey *crypto.PrivateKey, certChainBytes,
-	rootCertBytes []byte) {
+func (b *KeyCertBundle) GetAll() (cert *x509.Certificate, privKey *crypto.PrivateKey, certChainBytes,
+	rootCertBytes []byte,
+) {
 	b.mutex.RLock()
 	cert = b.cert
 	privKey = b.privKey
@@ -154,14 +145,14 @@ func (b *KeyCertBundleImpl) GetAll() (cert *x509.Certificate, privKey *crypto.Pr
 }
 
 // GetCertChainPem returns the certificate chain PEM.
-func (b *KeyCertBundleImpl) GetCertChainPem() []byte {
+func (b *KeyCertBundle) GetCertChainPem() []byte {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 	return copyBytes(b.certChainBytes)
 }
 
 // GetRootCertPem returns the root certificate PEM.
-func (b *KeyCertBundleImpl) GetRootCertPem() []byte {
+func (b *KeyCertBundle) GetRootCertPem() []byte {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 	return copyBytes(b.rootCertBytes)
@@ -169,10 +160,16 @@ func (b *KeyCertBundleImpl) GetRootCertPem() []byte {
 
 // VerifyAndSetAll verifies the key/certs, and sets all key/certs in KeyCertBundle together.
 // Setting all values together avoids inconsistency.
-func (b *KeyCertBundleImpl) VerifyAndSetAll(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error {
+func (b *KeyCertBundle) VerifyAndSetAll(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error {
 	if err := Verify(certBytes, privKeyBytes, certChainBytes, rootCertBytes); err != nil {
 		return err
 	}
+	b.setAllFromPem(certBytes, privKeyBytes, certChainBytes, rootCertBytes)
+	return nil
+}
+
+// Setting all values together avoids inconsistency.
+func (b *KeyCertBundle) setAllFromPem(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) {
 	b.mutex.Lock()
 	b.certBytes = copyBytes(certBytes)
 	b.privKeyBytes = copyBytes(privKeyBytes)
@@ -184,11 +181,10 @@ func (b *KeyCertBundleImpl) VerifyAndSetAll(certBytes, privKeyBytes, certChainBy
 	privKey, _ := ParsePemEncodedKey(privKeyBytes)
 	b.privKey = &privKey
 	b.mutex.Unlock()
-	return nil
 }
 
 // CertOptions returns the certificate config based on currently stored cert.
-func (b *KeyCertBundleImpl) CertOptions() (*CertOptions, error) {
+func (b *KeyCertBundle) CertOptions() (*CertOptions, error) {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 	ids, err := ExtractIDs(b.cert.Extensions)
@@ -223,13 +219,47 @@ func (b *KeyCertBundleImpl) CertOptions() (*CertOptions, error) {
 	return opts, nil
 }
 
+// UpdateVerifiedKeyCertBundleFromFile Verifies and updates KeyCertBundle with new certs
+func (b *KeyCertBundle) UpdateVerifiedKeyCertBundleFromFile(certFile string, privKeyFile string, certChainFiles []string, rootCertFile string) error {
+	certBytes, err := os.ReadFile(certFile)
+	if err != nil {
+		return err
+	}
+	privKeyBytes, err := os.ReadFile(privKeyFile)
+	if err != nil {
+		return err
+	}
+	certChainBytes := []byte{}
+	if len(certChainFiles) != 0 {
+		for _, f := range certChainFiles {
+			var b []byte
+			if b, err = os.ReadFile(f); err != nil {
+				return err
+			}
+
+			certChainBytes = append(certChainBytes, b...)
+		}
+	}
+	rootCertBytes, err := os.ReadFile(rootCertFile)
+	if err != nil {
+		return err
+	}
+
+	err = b.VerifyAndSetAll(certBytes, privKeyBytes, certChainBytes, rootCertBytes)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // ExtractRootCertExpiryTimestamp returns the unix timestamp when the root becomes expires.
-func (b *KeyCertBundleImpl) ExtractRootCertExpiryTimestamp() (float64, error) {
+func (b *KeyCertBundle) ExtractRootCertExpiryTimestamp() (float64, error) {
 	return extractCertExpiryTimestamp("root cert", b.GetRootCertPem())
 }
 
 // ExtractCACertExpiryTimestamp returns the unix timestamp when the cert chain becomes expires.
-func (b *KeyCertBundleImpl) ExtractCACertExpiryTimestamp() (float64, error) {
+func (b *KeyCertBundle) ExtractCACertExpiryTimestamp() (float64, error) {
 	return extractCertExpiryTimestamp("CA cert", b.GetCertChainPem())
 }
 

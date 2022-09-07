@@ -24,10 +24,10 @@ import (
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
-
 	"istio.io/istio/pilot/pkg/config/kube/crd"
 	"istio.io/istio/pkg/config/schema/collections"
-	"istio.io/istio/pkg/util/gogoprotomarshal"
+	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
 func TestApplyJSON(t *testing.T) {
@@ -48,7 +48,7 @@ func TestApplyJSON(t *testing.T) {
 	for i, c := range cases {
 		t.Run(fmt.Sprintf("[%v]", i), func(tt *testing.T) {
 			var got meshconfig.MeshConfig
-			err := gogoprotomarshal.ApplyJSON(c.in, &got)
+			err := protomarshal.ApplyJSON(c.in, &got)
 			if err != nil {
 				if !c.wantErr {
 					tt.Fatalf("got unexpected error: %v", err)
@@ -57,9 +57,7 @@ func TestApplyJSON(t *testing.T) {
 				if c.wantErr {
 					tt.Fatal("unexpected success, expected error")
 				}
-				if !reflect.DeepEqual(&got, c.want) {
-					tt.Fatalf("ApplyJSON(%v): got %v want %v", c.in, &got, c.want)
-				}
+				assert.Equal(t, &got, c.want)
 			}
 		})
 	}
@@ -89,7 +87,7 @@ func TestProtoSchemaConversions(t *testing.T) {
 		{
       "host":"something.svc.local",
       "trafficPolicy": {
-        "loadBalancer":{"simple":"ROUND_ROBIN"}
+        "loadBalancer":{"simple":"UNSPECIFIED"}
        },
        "subsets": [
          {"name":"foo","labels":{"test":"label"}}
@@ -103,20 +101,20 @@ subsets:
   name: foo
 trafficPolicy:
   loadBalancer:
-    simple: ROUND_ROBIN
+    simple: UNSPECIFIED
 `
 
-	wantJSONMap := map[string]interface{}{
+	wantJSONMap := map[string]any{
 		"host": "something.svc.local",
-		"trafficPolicy": map[string]interface{}{
-			"loadBalancer": map[string]interface{}{
-				"simple": "ROUND_ROBIN",
+		"trafficPolicy": map[string]any{
+			"loadBalancer": map[string]any{
+				"simple": "UNSPECIFIED",
 			},
 		},
-		"subsets": []interface{}{
-			map[string]interface{}{
+		"subsets": []any{
+			map[string]any{
 				"name": "foo",
-				"labels": map[string]interface{}{
+				"labels": map[string]any{
 					"test": "label",
 				},
 			},
@@ -128,7 +126,7 @@ trafficPolicy:
 		t.Errorf("FromYAML should have failed using Schema with bad MessageName")
 	}
 
-	gotJSON, err := gogoprotomarshal.ToJSON(msg)
+	gotJSON, err := protomarshal.ToJSON(msg)
 	if err != nil {
 		t.Errorf("ToJSON failed: %v", err)
 	}
@@ -136,7 +134,7 @@ trafficPolicy:
 		t.Errorf("ToJSON failed: got %s, want %s", gotJSON, wantJSON)
 	}
 
-	if _, err = gogoprotomarshal.ToJSON(nil); err == nil {
+	if _, err = protomarshal.ToJSON(nil); err == nil {
 		t.Error("should produce an error")
 	}
 
@@ -148,7 +146,7 @@ trafficPolicy:
 		t.Errorf("FromYAML failed: got %+v want %+v", spew.Sdump(gotFromJSON), spew.Sdump(msg))
 	}
 
-	gotYAML, err := gogoprotomarshal.ToYAML(msg)
+	gotYAML, err := protomarshal.ToYAML(msg)
 	if err != nil {
 		t.Errorf("ToYAML failed: %v", err)
 	}
@@ -156,7 +154,7 @@ trafficPolicy:
 		t.Errorf("ToYAML failed: got %+v want %+v", spew.Sdump(gotYAML), spew.Sdump(wantYAML))
 	}
 
-	if _, err = gogoprotomarshal.ToYAML(nil); err == nil {
+	if _, err = protomarshal.ToYAML(nil); err == nil {
 		t.Error("should produce an error")
 	}
 
@@ -172,7 +170,7 @@ trafficPolicy:
 		t.Errorf("should produce an error")
 	}
 
-	gotJSONMap, err := gogoprotomarshal.ToJSONMap(msg)
+	gotJSONMap, err := protomarshal.ToJSONMap(msg)
 	if err != nil {
 		t.Errorf("ToJSONMap failed: %v", err)
 	}
@@ -180,7 +178,7 @@ trafficPolicy:
 		t.Errorf("ToJSONMap failed: \ngot %vwant %v", spew.Sdump(gotJSONMap), spew.Sdump(wantJSONMap))
 	}
 
-	if _, err = gogoprotomarshal.ToJSONMap(nil); err == nil {
+	if _, err = protomarshal.ToJSONMap(nil); err == nil {
 		t.Error("should produce an error")
 	}
 

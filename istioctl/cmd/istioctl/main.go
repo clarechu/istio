@@ -22,6 +22,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"istio.io/istio/istioctl/cmd"
+	"istio.io/pkg/log"
 )
 
 func main() {
@@ -32,6 +33,8 @@ func main() {
 	}
 
 	rootCmd := cmd.GetRootCmd(os.Args[1:])
+
+	log.EnableKlogWithCobra()
 
 	if err := rootCmd.Execute(); err != nil {
 		exitCode := cmd.GetExitCode(err)

@@ -20,8 +20,6 @@ This folder contains Istio integration tests that use the test framework checked
         1. [Step 2: Add a Prow Job](#step-2-add-a-prow-job)
         1. [Step 3: Update TestGrid](#step-3-update-testgrid)
 1. [Environments](#environments)
-    1. [Native Environment](#native-environment-default)
-    1. [Kubernetes Environment](#kubernetes-environment)
 1. [Diagnosing Failures](#diagnosing-failures)
     1. [Working Directory](#working-directory)
     1. [Enabling CI Mode](#enabling-ci-mode)
@@ -39,12 +37,13 @@ This folder contains Istio integration tests that use the test framework checked
 The goal of the framework is to make it as easy as possible to author and run tests. In its simplest
 case, just typing ```go test ./...``` should be sufficient to run tests.
 
+This guide walks through the basics of writing tests with the Istio test framework. For best
+practices, see [Writing Good Integration Tests](https://github.com/istio/istio/wiki/Writing-Good-Integration-Tests).
+
 ## Writing Tests
 
 The test framework is designed to work with standard go tooling and allows developers
-to write environment-agnostics tests in a high-level fashion. The quickest way to get started with authoring
-new tests is to checkout the code in the
-[framework](https://github.com/istio/istio/tree/master/tests/integration/framework) folder.
+to write environment-agnostics tests in a high-level fashion.
 
 ### Adding a Test Suite
 
@@ -210,7 +209,7 @@ same way: T2 exits, then T2a and T2b are run asynchronously to completion.
 
 ### Using Components
 
-The framework, itself, is just a platform for running tests and tracking resources. Without these `resources`, there
+The framework itself is just a platform for running tests and tracking resources. Without these `resources`, there
 isn't much added value. Enter: components.
 
 Components are utilities that provide abstractions for Istio resources. They are maintained in the
@@ -353,22 +352,21 @@ the standard `go test` command-line.  For example, to run the tests under the `/
 using the default (native) environment, you can simply type:
 
 ```console
-$ go test ./tests/integration/mycomponent/...
+$ go test -tags=integ ./tests/integration/mycomponent/...
 ```
 
 Note that samples below invoking variations of ```go test ./...``` are intended to be run from the ```tests/integration``` directory.
 
-| WARNING: Many tests, including integration tests, assume that a [Helm](https://helm.sh/docs/using_helm/#installing-helm) client is installed and on the path.|
-| --- |
+Tests are tagged with the `integ` build target to avoid accidental invocation. If this is not set, no tests will be run.
 
 ### Test Parellelism and Kubernetes
 
 By default, Go will run tests within the same package (i.e. suite) synchronously. However, tests in other packages
 may be run concurrently.
 
-When running in the [Kubernetes environment](#kubernetes-environment) this can be problematic for suites that deploy
-Istio. The Istio deployment, as it stands is a singleton per cluster. If multiple suites attempt to deploy/configure
-Istio, they can corrupt each other and/or simply fail.  To avoid this issue, you have a couple of options:
+When running in the Kubernetes environment this can be problematic for suites that deploy Istio. The Istio deployment,
+as it stands is a singleton per cluster. If multiple suites attempt to deploy/configure Istio,
+they can corrupt each other and/or simply fail.  To avoid this issue, you have a couple of options:
 
 1. Run one suite per command (e.g. `go test ./tests/integration/mysuite/...`)
 1. Disable parallelism with `-p 1` (e.g. `go test -p 1 ./...`). A major disadvantage to doing this is that it will also disable
@@ -499,7 +497,7 @@ The framework accepts standard istio logging flags. You can use these flags to e
 framework, as well as some of the components that are used in-line in the native environment:
 
 ```console
-$ go test ./... --log_output_level=tf:debug,mcp:debug
+$ go test ./... --log_output_level=tf:debug
 ```
 
 The above example will enable debugging logging for the test framework (```tf```) and the MCP protocol stack (```mcp```).
@@ -511,11 +509,6 @@ pass command-line flags to the test while running under the debugger, you can us
 [Run/Debug configurations dialog](https://i.stack.imgur.com/C6y0L.png) to specify these flags as program arguments.
 
 ## Reference
-
-### Helm Values Overrides
-
-If your tests require special Helm values flags, you can specify your Helm values via additional
-for Kubernetes environments. See [mtls_healthcheck_test.go](security/healthcheck/mtls_healthcheck_test.go) for example.
 
 ### Command-Line Flags
 
@@ -544,16 +537,13 @@ The test framework supports the following command-line flags:
         Common image pull policy to use when deploying container images
 
   -istio.test.kube.config string
-        A comma-seperated list of paths to kube config files for cluster environments. (default ~/.kube/config)
+        A comma-separated list of paths to kube config files for cluster environments. (default ~/.kube/config)
 
   -istio.test.kube.deploy
         Deploy Istio into the target Kubernetes environment. (default true)
 
-  -istio.test.kube.deployTimeout duration
-        Timeout applied to deploying Istio into the target Kubernetes environment. Only applies if DeployIstio=true.
-
-  -istio.test.kube.undeployTimeout duration
-        Timeout applied to undeploying Istio from the target Kubernetes environment. Only applies if DeployIstio=true.
+  -istio.test.kube.deployEastWestGW
+        Deploy Istio east west gateway into the target Kubernetes environment. (default true)
 
   -istio.test.kube.systemNamespace string
         The namespace where the Istio components reside in a typical deployment. (default "istio-system")
@@ -566,9 +556,13 @@ The test framework supports the following command-line flags:
 
   -istio.test.kube.loadbalancer bool
         Used to obtain the right IP address for ingress gateway. This should be false for any environment that doesn't support a LoadBalancer type.
-```
 
-}
+  -istio.test.revision string
+        Overwrite the default namespace label (istio-enabled=true) with revision lable (istio.io/rev=XXX). (default is no overwrite)
+
+  -istio.test.skipVM bool
+        Skip all the VM related parts in all the tests. (default is "false")
+```
 
 ## Notes
 

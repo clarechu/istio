@@ -38,10 +38,8 @@ const (
 	EscapedPathSeparator = "\\" + PathSeparator
 )
 
-var (
-	// ValidKeyRegex is a regex for a valid path key element.
-	ValidKeyRegex = regexp.MustCompile("^[a-zA-Z0-9_-]*$")
-)
+// ValidKeyRegex is a regex for a valid path key element.
+var ValidKeyRegex = regexp.MustCompile("^[a-zA-Z0-9_-]*$")
 
 // Path is a path in slice form.
 type Path []string
@@ -137,7 +135,7 @@ func IsNPathElement(pe string) bool {
 	}
 
 	n, err := strconv.Atoi(pe)
-	return err == nil && n > InsertIndex
+	return err == nil && n >= InsertIndex
 }
 
 // PathKV returns the key and value string parts of the entire key/value path element.

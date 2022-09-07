@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"istio.io/istio/pkg/security"
 	"istio.io/istio/security/pkg/stsservice"
 	"istio.io/istio/security/pkg/stsservice/tokenmanager/google/mock"
 )
@@ -74,7 +75,8 @@ func TestTokenExchangePlugin(t *testing.T) {
 }
 
 func verifyDumpStatus(t *testing.T, tCase string, dumpJSON []byte, lastStatus map[string]stsservice.TokenInfo,
-	expected []string) map[string]stsservice.TokenInfo {
+	expected []string,
+) map[string]stsservice.TokenInfo {
 	newStatus := &stsservice.TokensDump{}
 	if err := json.Unmarshal(dumpJSON, newStatus); err != nil {
 		t.Errorf("(Test case %s), failed to unmarshal status dump: %v", tCase, err)
@@ -125,8 +127,8 @@ func verifyToken(t *testing.T, tCase string, stsRespJSON []byte, actualErr error
 	}
 }
 
-func defaultSTSRequest() stsservice.StsRequestParameters {
-	return stsservice.StsRequestParameters{
+func defaultSTSRequest() security.StsRequestParameters {
+	return security.StsRequestParameters{
 		GrantType:        "urn:ietf:params:oauth:grant-type:token-exchange",
 		Audience:         mock.FakeTrustDomain,
 		Scope:            scope,
@@ -142,14 +144,14 @@ type testSetUp struct {
 
 // setUpTest sets up token manager, authorization server.
 func setUpTest(t *testing.T, setup testSetUp) (*Plugin, *mock.AuthorizationServer, string, string) {
-	tm, _ := CreateTokenManagerPlugin(mock.FakeTrustDomain, mock.FakeProjectNum, mock.FakeGKEClusterURL, setup.enableCache)
+	tm, _ := CreateTokenManagerPlugin(nil, mock.FakeTrustDomain, mock.FakeProjectNum, mock.FakeGKEClusterURL, setup.enableCache)
 	ms, err := mock.StartNewServer(t, mock.Config{Port: 0})
 	ms.EnableDynamicAccessToken(setup.enableDynamicToken)
 	if err != nil {
 		t.Fatalf("failed to start a mock server: %v", err)
 	}
 	originalFederatedTokenEndpoint := federatedTokenEndpoint
-	federatedTokenEndpoint = ms.URL + "/v1/identitybindingtoken"
+	federatedTokenEndpoint = ms.URL + "/v1/token"
 	originalAccessTokenEndpoint := accessTokenEndpoint
 	accessTokenEndpoint = ms.URL + "/v1/projects/-/serviceAccounts/service-%s@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken"
 	return tm, ms, originalFederatedTokenEndpoint, originalAccessTokenEndpoint
@@ -157,8 +159,7 @@ func setUpTest(t *testing.T, setup testSetUp) (*Plugin, *mock.AuthorizationServe
 
 // TestAccessToken verifies that token manager could return a cached token to client.
 func TestTokenExchangePluginWithCache(t *testing.T) {
-	tmPlugin, ms, originalFederatedTokenEndpoint, originalAccessTokenEndpoint :=
-		setUpTest(t, testSetUp{enableCache: true, enableDynamicToken: true})
+	tmPlugin, ms, originalFederatedTokenEndpoint, originalAccessTokenEndpoint := setUpTest(t, testSetUp{enableCache: true, enableDynamicToken: true})
 	defer func() {
 		if err := ms.Stop(); err != nil {
 			t.Logf("failed to stop mock server: %v", err)

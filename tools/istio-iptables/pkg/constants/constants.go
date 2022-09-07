@@ -14,13 +14,18 @@
 
 package constants
 
-import "time"
+import (
+	"time"
+
+	"istio.io/pkg/env"
+)
 
 // iptables tables
 const (
 	MANGLE = "mangle"
 	NAT    = "nat"
 	FILTER = "filter"
+	RAW    = "raw"
 )
 
 // Built-in iptables chains
@@ -51,6 +56,14 @@ const (
 	REJECT   = "REJECT"
 	REDIRECT = "REDIRECT"
 	MARK     = "MARK"
+	CT       = "CT"
+	DROP     = "DROP"
+)
+
+const (
+	// IPVersionSpecific is used as an input to rules that will be replaced with an ip version (v4/v6)
+	// specific value
+	IPVersionSpecific = "PLACEHOLDER_IP_VERSION_SPECIFIC"
 )
 
 // iptables chains
@@ -70,6 +83,7 @@ const (
 	InboundTProxyRouteTable   = "istio-inbound-tproxy-route-table"
 	InboundPorts              = "istio-inbound-ports"
 	LocalExcludePorts         = "istio-local-exclude-ports"
+	ExcludeInterfaces         = "istio-exclude-interfaces"
 	ServiceCidr               = "istio-service-cidr"
 	ServiceExcludeCidr        = "istio-service-exclude-cidr"
 	OutboundPorts             = "istio-outbound-ports"
@@ -81,12 +95,37 @@ const (
 	ProxyGID                  = "proxy-gid"
 	KubeVirtInterfaces        = "kube-virt-interfaces"
 	DryRun                    = "dry-run"
+	TraceLogging              = "iptables-trace-logging"
 	Clean                     = "clean"
 	RestoreFormat             = "restore-format"
 	SkipRuleApply             = "skip-rule-apply"
 	RunValidation             = "run-validation"
 	IptablesProbePort         = "iptables-probe-port"
 	ProbeTimeout              = "probe-timeout"
+	RedirectDNS               = "redirect-dns"
+	DropInvalid               = "drop-invalid"
+	CaptureAllDNS             = "capture-all-dns"
+	OutputPath                = "output-paths"
+	NetworkNamespace          = "network-namespace"
+	CNIMode                   = "cni-mode"
+	HostNSEnterExec           = "host-nsenter-exec"
+)
+
+// Environment variables that deliberately have no equivalent command-line flags.
+//
+// The variables are defined as env.Var for documentation purposes.
+//
+// Use viper to resolve the value of the environment variable.
+var (
+	OwnerGroupsInclude = env.Register("ISTIO_OUTBOUND_OWNER_GROUPS", "*",
+		`Comma separated list of groups whose outgoing traffic is to be redirected to Envoy.
+A group can be specified either by name or by a numeric GID.
+The wildcard character "*" can be used to configure redirection of traffic from all groups.`)
+
+	OwnerGroupsExclude = env.Register("ISTIO_OUTBOUND_OWNER_GROUPS_EXCLUDE", "",
+		`Comma separated list of groups whose outgoing traffic is to be excluded from redirection to Envoy.
+A group can be specified either by name or by a numeric GID.
+Only applies when traffic from all groups (i.e. "*") is being redirected to Envoy.`)
 )
 
 const (
@@ -107,7 +146,7 @@ const (
 	IP6TABLES        = "ip6tables"
 	IP6TABLESRESTORE = "ip6tables-restore"
 	IP6TABLESSAVE    = "ip6tables-save"
-	IP               = "ip"
+	NSENTER          = "nsenter"
 )
 
 // Constants for syscall
@@ -117,16 +156,20 @@ const (
 )
 
 const (
-	DefaultIptablesProbePort = 15002
+	DefaultIptablesProbePort = "15002"
 	DefaultProbeTimeout      = 5 * time.Second
 )
 
 const (
-	ValidationErrorCode = 126
+	ValidationContainerName = "istio-validation"
+	ValidationErrorCode     = 126
 )
 
 // DNS ports
 const (
-	EnvoyDNSListenerPort      = "15013"
 	IstioAgentDNSListenerPort = "15053"
+)
+
+const (
+	CommandConfigureRoutes = "configure-routes"
 )

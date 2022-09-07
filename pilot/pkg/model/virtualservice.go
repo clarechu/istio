@@ -18,15 +18,76 @@ import (
 	"strings"
 
 	"github.com/gogo/protobuf/jsonpb"
+	"google.golang.org/protobuf/proto"
 
 	networking "istio.io/api/networking/v1alpha3"
-
-	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/config/visibility"
+	"istio.io/istio/pkg/util/sets"
 )
 
-func resolveVirtualServiceShortnames(rule *networking.VirtualService, meta ConfigMeta) {
+// SelectVirtualServices selects the virtual services by matching given services' host names.
+// This is a common function used by both sidecar converter and http route.
+func SelectVirtualServices(virtualServices []config.Config, hosts map[string][]host.Name) []config.Config {
+	importedVirtualServices := make([]config.Config, 0)
+
+	vsset := sets.New()
+	addVirtualService := func(vs config.Config, hosts host.Names) {
+		vsname := vs.Name + "/" + vs.Namespace
+		rule := vs.Spec.(*networking.VirtualService)
+		for _, ih := range hosts {
+			// Check if the virtual service is already processed.
+			if vsset.Contains(vsname) {
+				break
+			}
+			for _, h := range rule.Hosts {
+				// VirtualServices can have many hosts, so we need to avoid appending
+				// duplicated virtualservices to slice importedVirtualServices
+				if vsHostMatches(h, ih, vs) {
+					importedVirtualServices = append(importedVirtualServices, vs)
+					vsset.Insert(vsname)
+					break
+				}
+			}
+		}
+	}
+	for _, c := range virtualServices {
+		configNamespace := c.Namespace
+		// Selection algorithm:
+		// virtualservices have a list of hosts in the API spec
+		// if any host in the list matches one service hostname, select the virtual service
+		// and break out of the loop.
+
+		// Check if there is an explicit import of form ns/* or ns/host
+		if importedHosts, nsFound := hosts[configNamespace]; nsFound {
+			addVirtualService(c, importedHosts)
+		}
+
+		// Check if there is an import of form */host or */*
+		if importedHosts, wnsFound := hosts[wildcardNamespace]; wnsFound {
+			addVirtualService(c, importedHosts)
+		}
+	}
+
+	return importedVirtualServices
+}
+
+// vsHostMatches checks if the given VirtualService host matches the importedHost (from Sidecar)
+func vsHostMatches(vsHost string, importedHost host.Name, vs config.Config) bool {
+	if UseGatewaySemantics(vs) {
+		// The new way. Matching logic exactly mirrors Service matching
+		// If a route defines `*.com` and we import `a.com`, it will not match
+		return host.Name(vsHost).SubsetOf(importedHost)
+	}
+
+	// The old way. We check Matches which is bi-directional. This is for backwards compatibility
+	return host.Name(vsHost).Matches(importedHost)
+}
+
+func resolveVirtualServiceShortnames(rule *networking.VirtualService, meta config.Meta) {
 	// resolve top level hosts
 	for i, h := range rule.Hosts {
 		rule.Hosts[i] = string(ResolveShortnameToFQDN(h, meta))
@@ -70,7 +131,7 @@ func resolveVirtualServiceShortnames(rule *networking.VirtualService, meta Confi
 			}
 		}
 	}
-	//resolve host in tls route.destination
+	// resolve host in tls route.destination
 	for _, tls := range rule.Tls {
 		for _, m := range tls.Match {
 			for i, g := range m.Gateways {
@@ -87,12 +148,16 @@ func resolveVirtualServiceShortnames(rule *networking.VirtualService, meta Confi
 	}
 }
 
-func mergeVirtualServicesIfNeeded(vServices []Config, defaultExportTo map[visibility.Instance]bool) (out []Config) {
-	out = make([]Config, 0, len(vServices))
-	delegatesMap := map[string]Config{}
+// Return merged virtual services and the root->delegate vs map
+func mergeVirtualServicesIfNeeded(
+	vServices []config.Config,
+	defaultExportTo map[visibility.Instance]bool,
+) ([]config.Config, map[ConfigKey][]ConfigKey) {
+	out := make([]config.Config, 0, len(vServices))
+	delegatesMap := map[string]config.Config{}
 	delegatesExportToMap := map[string]map[visibility.Instance]bool{}
 	// root virtualservices with delegate
-	var rootVses []Config
+	var rootVses []config.Config
 
 	// 1. classify virtualservices
 	for _, vs := range vServices {
@@ -127,36 +192,39 @@ func mergeVirtualServicesIfNeeded(vServices []Config, defaultExportTo map[visibi
 		out = append(out, vs)
 	}
 
-	// If `PILOT_ENABLE_VIRTUAL_SERVICE_DELEGATE` feature disabled,
-	// filter out invalid vs(root or delegate), this can happen after enable -> disable
-	if !features.EnableVirtualServiceDelegate {
-		return
-	}
+	delegatesByRoot := make(map[ConfigKey][]ConfigKey, len(rootVses))
 
 	// 2. merge delegates and root
 	for _, root := range rootVses {
+		rootConfigKey := ConfigKey{Kind: kind.VirtualService, Name: root.Name, Namespace: root.Namespace}
 		rootVs := root.Spec.(*networking.VirtualService)
 		mergedRoutes := []*networking.HTTPRoute{}
 		for _, route := range rootVs.Http {
 			// it is root vs with delegate
-			if route.Delegate != nil {
-				delegate, ok := delegatesMap[key(route.Delegate.Name, route.Delegate.Namespace)]
+			if delegate := route.Delegate; delegate != nil {
+				delegateNamespace := delegate.Namespace
+				if delegateNamespace == "" {
+					delegateNamespace = root.Namespace
+				}
+				delegateConfigKey := ConfigKey{Kind: kind.VirtualService, Name: delegate.Name, Namespace: delegateNamespace}
+				delegatesByRoot[rootConfigKey] = append(delegatesByRoot[rootConfigKey], delegateConfigKey)
+				delegateVS, ok := delegatesMap[key(delegate.Name, delegateNamespace)]
 				if !ok {
 					log.Debugf("delegate virtual service %s/%s of %s/%s not found",
-						route.Delegate.Namespace, route.Delegate.Name, root.Namespace, root.Name)
+						delegateNamespace, delegate.Name, root.Namespace, root.Name)
 					// delegate not found, ignore only the current HTTP route
 					continue
 				}
 				// make sure that the delegate is visible to root virtual service's namespace
-				exportTo := delegatesExportToMap[key(route.Delegate.Name, route.Delegate.Namespace)]
+				exportTo := delegatesExportToMap[key(delegate.Name, delegateNamespace)]
 				if !exportTo[visibility.Public] && !exportTo[visibility.Instance(root.Namespace)] {
 					log.Debugf("delegate virtual service %s/%s of %s/%s is not exported to %s",
-						route.Delegate.Namespace, route.Delegate.Name, root.Namespace, root.Name, root.Namespace)
+						delegateNamespace, delegate.Name, root.Namespace, root.Name, root.Namespace)
 					continue
 				}
 				// DeepCopy to prevent mutate the original delegate, it can conflict
 				// when multiple routes delegate to one single VS.
-				copiedDelegate := delegate.DeepCopy()
+				copiedDelegate := delegateVS.DeepCopy()
 				vs := copiedDelegate.Spec.(*networking.VirtualService)
 				merged := mergeHTTPRoutes(route, vs.Http)
 				mergedRoutes = append(mergedRoutes, merged...)
@@ -173,7 +241,7 @@ func mergeVirtualServicesIfNeeded(vServices []Config, defaultExportTo map[visibi
 		out = append(out, root)
 	}
 
-	return
+	return out, delegatesByRoot
 }
 
 // merge root's route with delegate's and the merged route number equals the delegate's.
@@ -210,6 +278,9 @@ func mergeHTTPRoute(root *networking.HTTPRoute, delegate *networking.HTTPRoute) 
 	if delegate.Rewrite == nil {
 		delegate.Rewrite = root.Rewrite
 	}
+	if delegate.DirectResponse == nil {
+		delegate.DirectResponse = root.DirectResponse
+	}
 	if delegate.Timeout == nil {
 		delegate.Timeout = root.Timeout
 	}
@@ -222,6 +293,7 @@ func mergeHTTPRoute(root *networking.HTTPRoute, delegate *networking.HTTPRoute) 
 	if delegate.Mirror == nil {
 		delegate.Mirror = root.Mirror
 	}
+	// nolint: staticcheck
 	if delegate.MirrorPercent == nil {
 		delegate.MirrorPercent = root.MirrorPercent
 	}
@@ -271,7 +343,7 @@ func mergeHTTPMatchRequests(root, delegate []*networking.HTTPMatchRequest) (out 
 }
 
 func mergeHTTPMatchRequest(root, delegate *networking.HTTPMatchRequest) *networking.HTTPMatchRequest {
-	out := *delegate
+	out := proto.Clone(delegate).(*networking.HTTPMatchRequest)
 	if out.Name == "" {
 		out.Name = root.Name
 	} else if root.Name != "" {
@@ -324,9 +396,29 @@ func mergeHTTPMatchRequest(root, delegate *networking.HTTPMatchRequest) *network
 		out.Port = root.Port
 	}
 
-	// SourceLabels, SourceNamespace and Gateways only apply to sidecar, ignore here
+	// SourceLabels
+	if len(root.SourceLabels) > 0 || len(delegate.SourceLabels) > 0 {
+		out.SourceLabels = make(map[string]string)
+	}
+	for k, v := range root.SourceLabels {
+		out.SourceLabels[k] = v
+	}
+	for k, v := range delegate.SourceLabels {
+		out.SourceLabels[k] = v
+	}
 
-	return &out
+	if out.SourceNamespace == "" {
+		out.SourceNamespace = root.SourceNamespace
+	}
+
+	if len(out.Gateways) == 0 {
+		out.Gateways = root.Gateways
+	}
+
+	if len(out.StatPrefix) == 0 {
+		out.StatPrefix = root.StatPrefix
+	}
+	return out
 }
 
 func hasConflict(root, leaf *networking.HTTPMatchRequest) bool {
@@ -346,7 +438,7 @@ func hasConflict(root, leaf *networking.HTTPMatchRequest) bool {
 
 	// without headers
 	for key, leafValue := range leaf.WithoutHeaders {
-		if stringMatchConflict(root.Headers[key], leafValue) {
+		if stringMatchConflict(root.WithoutHeaders[key], leafValue) {
 			return true
 		}
 	}
@@ -365,8 +457,30 @@ func hasConflict(root, leaf *networking.HTTPMatchRequest) bool {
 		return true
 	}
 
-	// sourceLabels, sourceNamespace and gateways do not apply to delegate
-	// and are empty, so no conflict for them.
+	// sourceNamespace
+	if root.SourceNamespace != "" && leaf.SourceNamespace != root.SourceNamespace {
+		return true
+	}
+
+	// sourceLabels should not conflict, root should have superset of sourceLabels.
+	for key, leafValue := range leaf.SourceLabels {
+		if v, ok := root.SourceLabels[key]; ok && v != leafValue {
+			return true
+		}
+	}
+
+	// gateways should not conflict, root should have superset of gateways.
+	if len(root.Gateways) > 0 && len(leaf.Gateways) > 0 {
+		if len(root.Gateways) < len(leaf.Gateways) {
+			return true
+		}
+		rootGateway := sets.New(root.Gateways...)
+		for _, gw := range leaf.Gateways {
+			if !rootGateway.Contains(gw) {
+				return true
+			}
+		}
+	}
 
 	return false
 }
@@ -376,9 +490,17 @@ func stringMatchConflict(root, leaf *networking.StringMatch) bool {
 	if root == nil || leaf == nil {
 		return false
 	}
-	// regex match is not allowed
-	if root.GetRegex() != "" || leaf.GetRegex() != "" {
-		return true
+	// If root regex match is specified, delegate should not have other matches.
+	if root.GetRegex() != "" {
+		if leaf.GetRegex() != "" || leaf.GetPrefix() != "" || leaf.GetExact() != "" {
+			return true
+		}
+	}
+	// If delgate regex match is specified, root should not have other matches.
+	if leaf.GetRegex() != "" {
+		if root.GetRegex() != "" || root.GetPrefix() != "" || root.GetExact() != "" {
+			return true
+		}
 	}
 	// root is exact match
 	if exact := root.GetExact(); exact != "" {
@@ -417,4 +539,18 @@ func isRootVs(vs *networking.VirtualService) bool {
 		}
 	}
 	return false
+}
+
+// UseIngressSemantics determines which logic we should use for VirtualService
+// This allows ingress and VS to both be represented by VirtualService, but have different
+// semantics.
+func UseIngressSemantics(cfg config.Config) bool {
+	return cfg.Annotations[constants.InternalRouteSemantics] == constants.RouteSemanticsIngress
+}
+
+// UseGatewaySemantics determines which logic we should use for VirtualService
+// This allows gateway-api and VS to both be represented by VirtualService, but have different
+// semantics.
+func UseGatewaySemantics(cfg config.Config) bool {
+	return cfg.Annotations[constants.InternalRouteSemantics] == constants.RouteSemanticsGateway
 }

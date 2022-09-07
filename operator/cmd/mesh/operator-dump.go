@@ -15,9 +15,12 @@
 package mesh
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
 	"istio.io/istio/operator/pkg/util/clog"
+	"istio.io/istio/pkg/config/constants"
 	buildversion "istio.io/pkg/version"
 )
 
@@ -28,23 +31,21 @@ type operatorDumpArgs struct {
 
 func addOperatorDumpFlags(cmd *cobra.Command, args *operatorDumpArgs) {
 	hub, tag := buildversion.DockerInfo.Hub, buildversion.DockerInfo.Tag
-	if hub == "" {
-		hub = "gcr.io/istio-testing"
-	}
-	if tag == "" {
-		tag = "latest"
-	}
-	cmd.PersistentFlags().StringVar(&args.common.hub, "hub", hub, "The hub for the operator controller image")
-	cmd.PersistentFlags().StringVar(&args.common.tag, "tag", tag, "The tag for the operator controller image")
-	cmd.PersistentFlags().StringVar(&args.common.operatorNamespace, "operatorNamespace", "istio-operator",
-		"The namespace the operator controller is installed into")
-	cmd.PersistentFlags().StringVar(&args.common.istioNamespace, "istioNamespace", "istio-system",
-		"The namespace Istio is installed into")
+
+	cmd.PersistentFlags().StringVar(&args.common.hub, "hub", hub, HubFlagHelpStr)
+	cmd.PersistentFlags().StringVar(&args.common.tag, "tag", tag, TagFlagHelpStr)
+	cmd.PersistentFlags().StringSliceVar(&args.common.imagePullSecrets, "imagePullSecrets", nil, ImagePullSecretsHelpStr)
+	cmd.PersistentFlags().StringVar(&args.common.watchedNamespaces, "watchedNamespaces", constants.IstioSystemNamespace,
+		"The namespaces the operator controller watches, could be namespace list separated by comma, eg. 'ns1,ns2'")
+	cmd.PersistentFlags().StringVar(&args.common.operatorNamespace, "operatorNamespace", operatorDefaultNamespace, OperatorNamespaceHelpstr)
 	cmd.PersistentFlags().StringVarP(&args.common.manifestsPath, "charts", "", "", ChartsDeprecatedStr)
 	cmd.PersistentFlags().StringVarP(&args.common.manifestsPath, "manifests", "d", "", ManifestsFlagHelpStr)
+	cmd.PersistentFlags().StringVarP(&args.common.revision, "revision", "r", "", OperatorRevFlagHelpStr)
+	cmd.PersistentFlags().StringVarP(&args.common.outputFormat, "output", "o", yamlOutput,
+		"Output format: one of json|yaml")
 }
 
-func operatorDumpCmd(rootArgs *rootArgs, odArgs *operatorDumpArgs) *cobra.Command {
+func operatorDumpCmd(rootArgs *RootArgs, odArgs *operatorDumpArgs) *cobra.Command {
 	return &cobra.Command{
 		Use:   "dump",
 		Short: "Dumps the Istio operator controller manifest.",
@@ -53,15 +54,34 @@ func operatorDumpCmd(rootArgs *rootArgs, odArgs *operatorDumpArgs) *cobra.Comman
 		Run: func(cmd *cobra.Command, args []string) {
 			l := clog.NewConsoleLogger(cmd.OutOrStdout(), cmd.ErrOrStderr(), installerScope)
 			operatorDump(rootArgs, odArgs, l)
-		}}
+		},
+	}
 }
 
 // operatorDump dumps the manifest used to install the operator.
-func operatorDump(args *rootArgs, odArgs *operatorDumpArgs, l clog.Logger) {
+func operatorDump(args *RootArgs, odArgs *operatorDumpArgs, l clog.Logger) {
+	if err := validateOperatorOutputFormatFlag(odArgs.common.outputFormat); err != nil {
+		l.LogAndFatal(fmt.Errorf("unknown output format: %v", odArgs.common.outputFormat))
+	}
+
 	_, mstr, err := renderOperatorManifest(args, &odArgs.common)
 	if err != nil {
 		l.LogAndFatal(err)
 	}
 
-	l.Print(mstr)
+	var output string
+	if output, err = yamlToFormat(mstr, odArgs.common.outputFormat); err != nil {
+		l.LogAndFatal(err)
+	}
+	l.Print(output)
+}
+
+// validateOutputFormatFlag validates if the output format is valid.
+func validateOperatorOutputFormatFlag(outputFormat string) error {
+	switch outputFormat {
+	case jsonOutput, yamlOutput:
+	default:
+		return fmt.Errorf("unknown output format: %s", outputFormat)
+	}
+	return nil
 }

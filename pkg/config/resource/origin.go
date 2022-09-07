@@ -17,10 +17,13 @@ package resource
 // Origin of a resource. This is source-implementation dependent.
 type Origin interface {
 	FriendlyName() string
-
 	Namespace() Namespace
-
 	Reference() Reference
+
+	// FieldMap returns the flat map containing paths of the fields in the resource as keys,
+	// and their corresponding line numbers as values
+	FieldMap() map[string]int
+	Comparator() string
 }
 
 // Reference provides more information about an Origin. This is also source-implementation dependant.

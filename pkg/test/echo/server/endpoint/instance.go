@@ -38,18 +38,24 @@ type Config struct {
 	UDSServer     string
 	Dialer        common.Dialer
 	Port          *common.Port
+	ListenerIP    string
+	IstioVersion  string
+	DisableALPN   bool
 }
 
 // Instance of an endpoint that serves the Echo application on a single port/protocol.
 type Instance interface {
 	io.Closer
 	Start(onReady OnReadyFunc) error
+	GetConfig() Config
 }
 
 // New creates a new endpoint Instance.
 func New(cfg Config) (Instance, error) {
 	if cfg.Port != nil {
 		switch cfg.Port.Protocol {
+		case protocol.HBONE:
+			return newHBONE(cfg), nil
 		case protocol.HTTP, protocol.HTTPS:
 			return newHTTP(cfg), nil
 		case protocol.HTTP2, protocol.GRPC:

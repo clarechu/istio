@@ -23,35 +23,47 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"istio.io/api/label"
 	"istio.io/api/operator/v1alpha1"
-	valuesv1alpha1 "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
+	"istio.io/istio/istioctl/pkg/util/formatting"
+	istioV1Alpha1 "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
+	"istio.io/istio/operator/pkg/metrics"
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/object"
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/util/clog"
 	"istio.io/istio/operator/pkg/util/progress"
+	"istio.io/istio/pkg/config/analysis"
+	"istio.io/istio/pkg/config/analysis/analyzers/webhook"
+	"istio.io/istio/pkg/config/analysis/local"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/kube"
 	"istio.io/pkg/version"
 )
 
 // HelmReconciler reconciles resources rendered by a set of helm charts.
 type HelmReconciler struct {
 	client     client.Client
-	restConfig *rest.Config
-	clientSet  *kubernetes.Clientset
-	iop        *valuesv1alpha1.IstioOperator
+	kubeClient kube.Client
+	iop        *istioV1Alpha1.IstioOperator
 	opts       *Options
 	// copy of the last generated manifests.
 	manifests name.ManifestMap
 	// dependencyWaitCh is a map of signaling channels. A parent with children ch1...chN will signal
 	// dependencyWaitCh[ch1]...dependencyWaitCh[chN] when it's completely installed.
 	dependencyWaitCh map[name.ComponentName]chan struct{}
+
+	// The fields below are for metrics and reporting
+	countLock     *sync.Mutex
+	prunedKindSet map[schema.GroupKind]struct{}
 }
 
 // Options are options for HelmReconciler.
@@ -69,56 +81,57 @@ type Options struct {
 	ProgressLog *progress.Log
 	// Force ignores validation errors
 	Force bool
+	// SkipPrune will skip pruning
+	SkipPrune bool
 }
 
-var defaultOptions = &Options{
-	Log:         clog.NewDefaultLogger(),
-	ProgressLog: progress.NewLog(),
-}
+var (
+	defaultOptions = &Options{
+		Log:         clog.NewDefaultLogger(),
+		ProgressLog: progress.NewLog(),
+	}
+	conflictBackoff = wait.Backoff{
+		Duration: time.Millisecond * 10,
+		Factor:   2,
+		Steps:    3,
+	}
+)
 
 // NewHelmReconciler creates a HelmReconciler and returns a ptr to it
-func NewHelmReconciler(client client.Client, restConfig *rest.Config, iop *valuesv1alpha1.IstioOperator, opts *Options) (*HelmReconciler, error) {
+func NewHelmReconciler(client client.Client, kubeClient kube.Client, iop *istioV1Alpha1.IstioOperator, opts *Options) (*HelmReconciler, error) {
 	if opts == nil {
 		opts = defaultOptions
 	}
 	if opts.ProgressLog == nil {
 		opts.ProgressLog = progress.NewLog()
 	}
-	if waitForResourcesTimeoutStr, found := os.LookupEnv("WAIT_FOR_RESOURCES_TIMEOUT"); found {
-		if waitForResourcesTimeout, err := time.ParseDuration(waitForResourcesTimeoutStr); err == nil {
-			opts.WaitTimeout = waitForResourcesTimeout
+	if int64(opts.WaitTimeout) == 0 {
+		if waitForResourcesTimeoutStr, found := os.LookupEnv("WAIT_FOR_RESOURCES_TIMEOUT"); found {
+			if waitForResourcesTimeout, err := time.ParseDuration(waitForResourcesTimeoutStr); err == nil {
+				opts.WaitTimeout = waitForResourcesTimeout
+			} else {
+				scope.Warnf("invalid env variable value: %s for 'WAIT_FOR_RESOURCES_TIMEOUT'! falling back to default value...", waitForResourcesTimeoutStr)
+				// fallback to default wait resource timeout
+				opts.WaitTimeout = defaultWaitResourceTimeout
+			}
 		} else {
-			scope.Warnf("invalid env variable value: %s for 'WAIT_FOR_RESOURCES_TIMEOUT'! falling back to default value...", waitForResourcesTimeoutStr)
 			// fallback to default wait resource timeout
 			opts.WaitTimeout = defaultWaitResourceTimeout
 		}
-	} else {
-		// fallback to default wait resource timeout
-		opts.WaitTimeout = defaultWaitResourceTimeout
 	}
 	if iop == nil {
 		// allows controller code to function for cases where IOP is not provided (e.g. operator remove).
-		iop = &valuesv1alpha1.IstioOperator{}
+		iop = &istioV1Alpha1.IstioOperator{}
 		iop.Spec = &v1alpha1.IstioOperatorSpec{}
-	}
-	if operatorRevision, found := os.LookupEnv("REVISION"); found {
-		iop.Spec.Revision = operatorRevision
-	}
-	var cs *kubernetes.Clientset
-	var err error
-	if restConfig != nil {
-		cs, err = kubernetes.NewForConfig(restConfig)
-	}
-	if err != nil {
-		return nil, err
 	}
 	return &HelmReconciler{
 		client:           client,
-		restConfig:       restConfig,
-		clientSet:        cs,
+		kubeClient:       kubeClient,
 		iop:              iop,
 		opts:             opts,
 		dependencyWaitCh: initDependencies(),
+		countLock:        &sync.Mutex{},
+		prunedKindSet:    make(map[schema.GroupKind]struct{}),
 	}, nil
 }
 
@@ -135,15 +148,30 @@ func initDependencies() map[name.ComponentName]chan struct{} {
 
 // Reconcile reconciles the associated resources.
 func (h *HelmReconciler) Reconcile() (*v1alpha1.InstallStatus, error) {
+	if err := util.CreateNamespace(h.kubeClient.Kube(), istioV1Alpha1.Namespace(h.iop.Spec), h.networkName(), h.opts.DryRun); err != nil {
+		return nil, err
+	}
 	manifestMap, err := h.RenderCharts()
 	if err != nil {
 		return nil, err
 	}
 
+	err = h.analyzeWebhooks(manifestMap[name.PilotComponentName])
+	if err != nil {
+		if h.opts.Force {
+			scope.Error("invalid webhook configs; continuing because of --force")
+		} else {
+			return nil, err
+		}
+	}
 	status := h.processRecursive(manifestMap)
 
-	h.opts.ProgressLog.SetState(progress.StatePruning)
-	pruneErr := h.Prune(manifestMap, false)
+	var pruneErr error
+	if !h.opts.SkipPrune {
+		h.opts.ProgressLog.SetState(progress.StatePruning)
+		pruneErr = h.Prune(manifestMap, false)
+		h.reportPrunedObjectKind()
+	}
 	return status, pruneErr
 }
 
@@ -156,6 +184,8 @@ func (h *HelmReconciler) processRecursive(manifests name.ManifestMap) *v1alpha1.
 	var mu sync.Mutex
 	// wg waits for all manifest processing goroutines to finish
 	var wg sync.WaitGroup
+
+	serverSideApply := h.CheckSSAEnabled()
 
 	for c, ms := range manifests {
 		c, ms := c, ms
@@ -183,7 +213,7 @@ func (h *HelmReconciler) processRecursive(manifests name.ManifestMap) *v1alpha1.
 					Name:    c,
 					Content: name.MergeManifestSlices(ms),
 				}
-				processedObjs, deployedObjects, err = h.ApplyManifest(m)
+				processedObjs, deployedObjects, err = h.ApplyManifest(m, serverSideApply)
 				if err != nil {
 					status = v1alpha1.InstallStatus_ERROR
 				} else if len(processedObjs) != 0 || deployedObjects > 0 {
@@ -204,6 +234,8 @@ func (h *HelmReconciler) processRecursive(manifests name.ManifestMap) *v1alpha1.
 	}
 	wg.Wait()
 
+	metrics.ReportOwnedResourceCounts()
+
 	out := &v1alpha1.InstallStatus{
 		Status:          overallStatus(componentStatus),
 		ComponentStatus: componentStatus,
@@ -212,37 +244,64 @@ func (h *HelmReconciler) processRecursive(manifests name.ManifestMap) *v1alpha1.
 	return out
 }
 
+// CheckSSAEnabled is a helper function to check whether ServerSideApply should be used when applying manifests.
+func (h *HelmReconciler) CheckSSAEnabled() bool {
+	if h.kubeClient != nil {
+		// There is a mutatingwebhook in gke that would corrupt the managedFields, which is fixed in k8s 1.18.
+		// See: https://github.com/kubernetes/kubernetes/issues/96351
+		if kube.IsAtLeastVersion(h.kubeClient, 18) {
+			// todo(kebe7jun) a more general test method
+			// API Server does not support detecting whether ServerSideApply is enabled
+			// through the API for the time being.
+			ns, err := h.kubeClient.Kube().CoreV1().Namespaces().Get(context.TODO(), constants.KubeSystemNamespace, metav1.GetOptions{})
+			if err != nil {
+				scope.Warnf("failed to get namespace: %v", err)
+				return false
+			}
+			if ns.ManagedFields == nil {
+				scope.Infof("k8s support ServerSideApply but was manually disabled")
+				return false
+			}
+			return true
+		}
+	}
+	return false
+}
+
 // Delete resources associated with the custom resource instance
 func (h *HelmReconciler) Delete() error {
+	defer func() {
+		metrics.ReportOwnedResourceCounts()
+		h.reportPrunedObjectKind()
+	}()
 	iop := h.iop
 	if iop.Spec.Revision == "" {
-		return h.Prune(nil, true)
+		err := h.Prune(nil, true)
+		return err
 	}
 	// Delete IOP with revision:
 	// for this case we update the status field to pending if there are still proxies pointing to this revision
 	// and we do not prune shared resources, same effect as `istioctl uninstall --revision foo` command.
-	status, err := h.PruneControlPlaneByRevisionWithController(iop.Spec.Namespace, iop.Spec.Revision)
+	status, err := h.PruneControlPlaneByRevisionWithController(iop.Spec)
 	if err != nil {
 		return err
 	}
+
+	// check status here because terminating iop's status can't be updated.
+	if status.Status == v1alpha1.InstallStatus_ACTION_REQUIRED {
+		return fmt.Errorf("action is required before deleting the iop instance: %s", status.Message)
+	}
+
+	// updating status taking no effect for terminating resources.
 	if err := h.SetStatusComplete(status); err != nil {
 		return err
 	}
 	return nil
 }
 
-// DeleteAll deletes all Istio resources in the cluster.
-func (h *HelmReconciler) DeleteAll() error {
-	manifestMap := name.ManifestMap{}
-	for _, c := range name.AllComponentNames {
-		manifestMap[c] = nil
-	}
-	return h.Prune(manifestMap, true)
-}
-
 // SetStatusBegin updates the status field on the IstioOperator instance before reconciling.
 func (h *HelmReconciler) SetStatusBegin() error {
-	isop := &valuesv1alpha1.IstioOperator{}
+	isop := &istioV1Alpha1.IstioOperator{}
 	namespacedName := types.NamespacedName{
 		Name:      h.iop.Name,
 		Namespace: h.iop.Namespace,
@@ -270,7 +329,7 @@ func (h *HelmReconciler) SetStatusBegin() error {
 
 // SetStatusComplete updates the status field on the IstioOperator instance based on the resulting err parameter.
 func (h *HelmReconciler) SetStatusComplete(status *v1alpha1.InstallStatus) error {
-	iop := &valuesv1alpha1.IstioOperator{}
+	iop := &istioV1Alpha1.IstioOperator{}
 	namespacedName := types.NamespacedName{
 		Name:      h.iop.Name,
 		Namespace: h.iop.Namespace,
@@ -345,6 +404,15 @@ func (h *HelmReconciler) getCoreOwnerLabels() (map[string]string, error) {
 	}
 	labels[istioVersionLabelStr] = version.Info.Version
 
+	revision := ""
+	if h.iop != nil {
+		revision = h.iop.Spec.Revision
+	}
+	if revision == "" {
+		revision = "default"
+	}
+	labels[label.IoIstioRev.Name] = revision
+
 	return labels, nil
 }
 
@@ -353,14 +421,6 @@ func (h *HelmReconciler) addComponentLabels(coreLabels map[string]string, compon
 	for k, v := range coreLabels {
 		labels[k] = v
 	}
-	revision := ""
-	if h.iop != nil {
-		revision = h.iop.Spec.Revision
-	}
-	if revision == "" {
-		revision = "default"
-	}
-	labels[label.IstioRev] = revision
 
 	labels[IstioComponentLabelStr] = componentName
 
@@ -416,8 +476,8 @@ func (h *HelmReconciler) getCRHash(componentName string) (string, error) {
 		return "", err
 	}
 	var host string
-	if h.restConfig != nil {
-		host = h.restConfig.Host
+	if h.kubeClient != nil && h.kubeClient.RESTConfig() != nil {
+		host = h.kubeClient.RESTConfig().Host
 	}
 	return strings.Join([]string{crName, crNamespace, componentName, host}, "-"), nil
 }
@@ -437,4 +497,88 @@ func (h *HelmReconciler) getCRNamespace() (string, error) {
 // getClient returns the kubernetes client associated with this HelmReconciler
 func (h *HelmReconciler) getClient() client.Client {
 	return h.client
+}
+
+func (h *HelmReconciler) addPrunedKind(gk schema.GroupKind) {
+	h.countLock.Lock()
+	defer h.countLock.Unlock()
+	h.prunedKindSet[gk] = struct{}{}
+}
+
+func (h *HelmReconciler) reportPrunedObjectKind() {
+	h.countLock.Lock()
+	defer h.countLock.Unlock()
+	for gvk := range h.prunedKindSet {
+		metrics.ResourcePruneTotal.
+			With(metrics.ResourceKindLabel.Value(util.GKString(gvk))).
+			Increment()
+	}
+}
+
+func (h *HelmReconciler) analyzeWebhooks(whs []string) error {
+	if len(whs) == 0 {
+		return nil
+	}
+
+	sa := local.NewSourceAnalyzer(analysis.Combine("webhook", &webhook.Analyzer{
+		SkipServiceCheck: true,
+	}),
+		resource.Namespace(h.iop.Spec.GetNamespace()), resource.Namespace(istioV1Alpha1.Namespace(h.iop.Spec)), nil, true, 30*time.Second)
+	var localWebhookYAMLReaders []local.ReaderSource
+	var parsedK8sObjects object.K8sObjects
+	for _, wh := range whs {
+		k8sObjects, err := object.ParseK8sObjectsFromYAMLManifest(wh)
+		if err != nil {
+			return err
+		}
+		objYaml, err := k8sObjects.YAMLManifest()
+		if err != nil {
+			return err
+		}
+		whReaderSource := local.ReaderSource{
+			Name:   "",
+			Reader: strings.NewReader(objYaml),
+		}
+		localWebhookYAMLReaders = append(localWebhookYAMLReaders, whReaderSource)
+		parsedK8sObjects = append(parsedK8sObjects, k8sObjects...)
+	}
+	err := sa.AddReaderKubeSource(localWebhookYAMLReaders)
+	if err != nil {
+		return err
+	}
+
+	if h.kubeClient != nil {
+		sa.AddRunningKubeSource(h.kubeClient)
+	}
+
+	// Analyze webhooks
+	res, err := sa.Analyze(make(chan struct{}))
+	if err != nil {
+		return err
+	}
+	relevantMessages := res.Messages.FilterOutBasedOnResources(parsedK8sObjects)
+	if len(relevantMessages) > 0 {
+		o, err := formatting.Print(relevantMessages, formatting.LogFormat, false)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("creating default tag would conflict:\n%v", o)
+	}
+	return nil
+}
+
+func (h *HelmReconciler) networkName() string {
+	if h.iop.Spec.GetValues() == nil {
+		return ""
+	}
+	globalI := h.iop.Spec.Values.AsMap()["global"]
+	global, ok := globalI.(map[string]any)
+	if !ok {
+		return ""
+	}
+	nw, ok := global["network"].(string)
+	if !ok {
+		return ""
+	}
+	return nw
 }

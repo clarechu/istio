@@ -21,13 +21,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"sync"
 	"time"
 
+	"istio.io/istio/pkg/security"
 	"istio.io/istio/security/pkg/stsservice"
+	"istio.io/istio/security/pkg/util"
+	"istio.io/pkg/env"
 	"istio.io/pkg/log"
 )
 
@@ -40,21 +43,26 @@ const (
 	tokenType        = "urn:ietf:params:oauth:token-type:access_token"
 	federatedToken   = "federated token"
 	accessToken      = "access token"
+	GCPAuthProvider  = "gcp"
 )
 
 var (
 	pluginLog              = log.RegisterScope("token", "token manager plugin debugging", 0)
-	federatedTokenEndpoint = "https://securetoken.googleapis.com/v1/identitybindingtoken"
+	federatedTokenEndpoint = "https://sts.googleapis.com/v1/token"
 	accessTokenEndpoint    = "https://iamcredentials.googleapis.com/v1/projects/-/" +
 		"serviceAccounts/service-%s@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken"
 	// default grace period in seconds of an access token. If caching is enabled and token remaining life time is
 	// within this period, refresh access token.
 	defaultGracePeriod = 300
+	GCEProvider        = "GoogleComputeEngine"
+	// GKEClusterURL is the URL to send requests to the token exchange service.
+	GKEClusterURL = env.Register("GKE_CLUSTER_URL", "", "The url of GKE cluster").Get()
 )
 
 // Plugin supports token exchange with Google OAuth 2.0 authorization server.
 type Plugin struct {
 	httpClient  *http.Client
+	credFetcher security.CredFetcher
 	trustDomain string
 	// tokens is the cache for fetched tokens.
 	// map key is token type, map value is tokenInfo.
@@ -69,7 +77,7 @@ type Plugin struct {
 }
 
 // CreateTokenManagerPlugin creates a plugin that fetches token from a Google OAuth 2.0 authorization server.
-func CreateTokenManagerPlugin(trustDomain, gcpProjectNumber, gkeClusterURL string, enableCache bool) (*Plugin, error) {
+func CreateTokenManagerPlugin(credFetcher security.CredFetcher, trustDomain, gcpProjectNumber, gkeClusterURL string, enableCache bool) (*Plugin, error) {
 	caCertPool, err := x509.SystemCertPool()
 	if err != nil {
 		pluginLog.Errorf("Failed to get SystemCertPool: %v", err)
@@ -84,6 +92,7 @@ func CreateTokenManagerPlugin(trustDomain, gcpProjectNumber, gkeClusterURL strin
 				},
 			},
 		},
+		credFetcher:      credFetcher,
 		trustDomain:      trustDomain,
 		gcpProjectNumber: gcpProjectNumber,
 		gkeClusterURL:    gkeClusterURL,
@@ -100,7 +109,7 @@ type federatedTokenResponse struct {
 }
 
 // GenerateToken takes STS request parameters and fetches token, returns StsResponseParameters in JSON.
-func (p *Plugin) ExchangeToken(parameters stsservice.StsRequestParameters) ([]byte, error) {
+func (p *Plugin) ExchangeToken(parameters security.StsRequestParameters) ([]byte, error) {
 	if tokenSTS, ok := p.useCachedToken(); ok {
 		return tokenSTS, nil
 	}
@@ -151,24 +160,57 @@ func (p *Plugin) useCachedToken() ([]byte, bool) {
 	return nil, false
 }
 
+// Construct the audience field for GetFederatedToken request.
+func (p *Plugin) constructAudience(subjectToken string) string {
+	provider := ""
+	if p.credFetcher != nil {
+		provider = p.credFetcher.GetIdentityProvider()
+	}
+	// For GKE, we do not register IdentityProvider explicitly. The provider name
+	// is GKEClusterURL by default.
+	if provider == "" {
+		if GKEClusterURL != "" {
+			provider = GKEClusterURL
+		} else {
+			provider = p.gkeClusterURL
+		}
+	}
+
+	var identityNS string
+	// Prefer to use the identity namespace from the token audience. The trust domain
+	// could configured differently from the identity namespace.
+	// Note the token exchange request would fail anyway if the identity namespace is not
+	// matched with the audience of the token.
+	if audiences, err := util.GetAud(subjectToken); len(audiences) == 1 && audiences[0] != "" {
+		identityNS = audiences[0]
+	} else {
+		pluginLog.Errorf("expect only 1 non-empty audience in token but found %v with error %v. Fallback to use trust domain %q as the identity namespace.",
+			audiences, err, p.trustDomain)
+		identityNS = p.trustDomain
+	}
+
+	return fmt.Sprintf("identitynamespace:%s:%s", identityNS, provider)
+}
+
 // constructFederatedTokenRequest returns an HTTP request for federated token.
 // Example of a federated token request:
-// POST https://securetoken.googleapis.com/v1/identitybindingtoken
+// POST https://sts.googleapis.com/v1/token
 // Content-Type: application/json
-// {
-//    audience: <trust domain>
-//    grantType: urn:ietf:params:oauth:grant-type:token-exchange
-//    requestedTokenType: urn:ietf:params:oauth:token-type:access_token
-//    subjectTokenType: urn:ietf:params:oauth:token-type:jwt
-//    subjectToken: <jwt token>
-//    Scope: https://www.googleapis.com/auth/cloud-platform
-// }
-func (p *Plugin) constructFederatedTokenRequest(parameters stsservice.StsRequestParameters) (*http.Request, error) {
+//
+//	{
+//	   audience: <trust domain>:<provider>
+//	   grantType: urn:ietf:params:oauth:grant-type:token-exchange
+//	   requestedTokenType: urn:ietf:params:oauth:token-type:access_token
+//	   subjectTokenType: urn:ietf:params:oauth:token-type:jwt
+//	   subjectToken: <jwt token>
+//	   Scope: https://www.googleapis.com/auth/cloud-platform
+//	}
+func (p *Plugin) constructFederatedTokenRequest(parameters security.StsRequestParameters) (*http.Request, error) {
 	reqScope := scope
 	if len(parameters.Scope) != 0 {
 		reqScope = parameters.Scope
 	}
-	aud := fmt.Sprintf("identitynamespace:%s:%s", p.trustDomain, p.gkeClusterURL)
+	aud := p.constructAudience(parameters.SubjectToken)
 	query := map[string]string{
 		"audience":           aud,
 		"grantType":          parameters.GrantType,
@@ -198,17 +240,18 @@ func (p *Plugin) constructFederatedTokenRequest(parameters stsservice.StsRequest
 		dJSONQuery, _ := json.Marshal(dQuery)
 		dReq, _ := http.NewRequest("POST", federatedTokenEndpoint, bytes.NewBuffer(dJSONQuery))
 		dReq.Header.Set("Content-Type", contentType)
+
 		reqDump, _ := httputil.DumpRequest(dReq, true)
 		pluginLog.Debugf("Prepared federated token request: \n%s", string(reqDump))
 	} else {
-		pluginLog.Info("Prepared federated token request")
+		pluginLog.Infof("Prepared federated token request for aud %q", aud)
 	}
 	return req, nil
 }
 
 // fetchFederatedToken exchanges a third-party issued Json Web Token for an OAuth2.0 access token
 // which asserts a third-party identity within an identity namespace.
-func (p *Plugin) fetchFederatedToken(parameters stsservice.StsRequestParameters) (*federatedTokenResponse, error) {
+func (p *Plugin) fetchFederatedToken(parameters security.StsRequestParameters) (*federatedTokenResponse, error) {
 	respData := &federatedTokenResponse{}
 
 	req, err := p.constructFederatedTokenRequest(parameters)
@@ -234,11 +277,9 @@ func (p *Plugin) fetchFederatedToken(parameters stsservice.StsRequestParameters)
 		respDump, _ := httputil.DumpResponse(resp, false)
 		pluginLog.Debugf("Received federated token response after %s: \n%s",
 			timeElapsed.String(), string(respDump))
-	} else {
-		pluginLog.Infof("Received federated token response after %s", timeElapsed.String())
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		pluginLog.Errorf("Failed to read federated token response body: %+v", err)
 		return respData, fmt.Errorf("failed to read federated token response body: %+v", err)
@@ -248,15 +289,16 @@ func (p *Plugin) fetchFederatedToken(parameters stsservice.StsRequestParameters)
 		return respData, fmt.Errorf("failed to unmarshal federated token response data: %v", err)
 	}
 	if respData.AccessToken == "" {
-		pluginLog.Errora("federated token response does not have access token", string(body))
+		pluginLog.Error("federated token response does not have access token", string(body))
 		return respData, errors.New("federated token response does not have access token. " + string(body))
 	}
-	pluginLog.Infof("Federated token will expire in %d seconds", respData.ExpiresIn)
+	pluginLog.WithLabels("latency", timeElapsed.String(), "ttl", respData.ExpiresIn).Infof("fetched federated token")
 	tokenReceivedTime := time.Now()
 	p.tokens.Store(federatedToken, stsservice.TokenInfo{
 		TokenType:  federatedToken,
 		IssueTime:  tokenReceivedTime,
-		ExpireTime: tokenReceivedTime.Add(time.Duration(respData.ExpiresIn) * time.Second)})
+		ExpireTime: tokenReceivedTime.Add(time.Duration(respData.ExpiresIn) * time.Second),
+	})
 	return respData, nil
 }
 
@@ -278,7 +320,7 @@ func (p *Plugin) sendRequestWithRetry(req *http.Request) (resp *http.Response, e
 		time.Sleep(10 * time.Millisecond)
 	}
 	if resp != nil && resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(resp.Body)
 		defer resp.Body.Close()
 		return resp, time.Since(start), fmt.Errorf("HTTP Status %d, body: %s", resp.StatusCode, string(bodyBytes))
 	}
@@ -310,12 +352,13 @@ type accessTokenResponse struct {
 // service-<GCP project number>@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken
 // Content-Type: application/json
 // Authorization: Bearer <federated token>
-// {
-//  "Delegates": [],
-//  "Scope": [
-//      https://www.googleapis.com/auth/cloud-platform
-//  ],
-// }
+//
+//	{
+//	 "Delegates": [],
+//	 "Scope": [
+//	     https://www.googleapis.com/auth/cloud-platform
+//	 ],
+//	}
 func (p *Plugin) constructGenerateAccessTokenRequest(fResp *federatedTokenResponse) (*http.Request, error) {
 	// Request for access token with a lifetime of 3600 seconds.
 	query := accessTokenRequest{
@@ -336,8 +379,6 @@ func (p *Plugin) constructGenerateAccessTokenRequest(fResp *federatedTokenRespon
 	if pluginLog.DebugEnabled() {
 		reqDump, _ := httputil.DumpRequest(req, true)
 		pluginLog.Debugf("Prepared access token request: \n%s", string(reqDump))
-	} else {
-		pluginLog.Info("Prepared access token request")
 	}
 	req.Header.Add("Authorization", "Bearer "+fResp.AccessToken)
 	return req, nil
@@ -367,11 +408,9 @@ func (p *Plugin) fetchAccessToken(federatedToken *federatedTokenResponse) (*acce
 		respDump, _ := httputil.DumpResponse(resp, false)
 		pluginLog.Debugf("Received access token response after %s: \n%s",
 			timeElapsed.String(), string(respDump))
-	} else {
-		pluginLog.Infof("Received access token response after %s", timeElapsed.String())
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		pluginLog.Errorf("Failed to read access token response body: %+v", err)
 		return respData, fmt.Errorf("failed to read access token response body: %+v", err)
@@ -381,7 +420,7 @@ func (p *Plugin) fetchAccessToken(federatedToken *federatedTokenResponse) (*acce
 		return respData, fmt.Errorf("failed to unmarshal access token response data: %v", err)
 	}
 	if respData.AccessToken == "" {
-		pluginLog.Errora("access token response does not have access token", string(body))
+		pluginLog.Error("access token response does not have access token", string(body))
 		return respData, errors.New("access token response does not have access token. " + string(body))
 	}
 	pluginLog.Debug("successfully exchanged an access token")
@@ -395,12 +434,14 @@ func (p *Plugin) fetchAccessToken(federatedToken *federatedTokenResponse) (*acce
 	} else {
 		tokenExp = exp
 	}
+	pluginLog.WithLabels("latency", timeElapsed.String(), "ttl", time.Until(tokenExp)).Infof("fetched access token")
 	// Update cache and reset cache hit counter.
 	p.tokens.Store(accessToken, stsservice.TokenInfo{
 		TokenType:  accessToken,
 		IssueTime:  time.Now(),
 		ExpireTime: tokenExp,
-		Token:      respData.AccessToken})
+		Token:      respData.AccessToken,
+	})
 	p.mutex.Lock()
 	p.accessTokenCacheHit = 0
 	p.mutex.Unlock()
@@ -431,7 +472,7 @@ func (p *Plugin) generateSTSRespInner(token string, expire int64) ([]byte, error
 	statusJSON, err := json.MarshalIndent(stsRespParam, "", " ")
 	if pluginLog.DebugEnabled() {
 		stsRespParam.AccessToken = "redacted"
-		pluginLog.Infof("Populated STS response parameters: %+v", stsRespParam)
+		pluginLog.Debugf("Populated STS response parameters: %+v", stsRespParam)
 	}
 	return statusJSON, err
 }
@@ -439,10 +480,11 @@ func (p *Plugin) generateSTSRespInner(token string, expire int64) ([]byte, error
 // DumpTokenStatus dumps all token status in JSON
 func (p *Plugin) DumpPluginStatus() ([]byte, error) {
 	tokenStatus := make([]stsservice.TokenInfo, 0)
-	p.tokens.Range(func(k interface{}, v interface{}) bool {
+	p.tokens.Range(func(k any, v any) bool {
 		token := v.(stsservice.TokenInfo)
 		tokenStatus = append(tokenStatus, stsservice.TokenInfo{
-			TokenType: token.TokenType, IssueTime: token.IssueTime, ExpireTime: token.ExpireTime})
+			TokenType: token.TokenType, IssueTime: token.IssueTime, ExpireTime: token.ExpireTime,
+		})
 		return true
 	})
 	td := stsservice.TokensDump{
@@ -452,10 +494,32 @@ func (p *Plugin) DumpPluginStatus() ([]byte, error) {
 	return statusJSON, err
 }
 
+// GetMetadata returns the metadata headers related to the token
+func (p *Plugin) GetMetadata(forCA bool, xdsAuthProvider, token string) (map[string]string, error) {
+	if token == "" {
+		return nil, fmt.Errorf("empty token in plugin GetMetadata")
+	}
+	gcpProjectNumber := p.GetGcpProjectNumber()
+	if !forCA && xdsAuthProvider == GCPAuthProvider && len(gcpProjectNumber) > 0 {
+		return map[string]string{
+			"authorization":       "Bearer " + token,
+			"x-goog-user-project": gcpProjectNumber,
+		}, nil
+	}
+	return map[string]string{
+		"authorization": "Bearer " + token,
+	}, nil
+}
+
 // SetEndpoints changes the endpoints for testing purposes only.
 func (p *Plugin) SetEndpoints(fTokenEndpoint, aTokenEndpoint string) {
 	federatedTokenEndpoint = fTokenEndpoint
 	accessTokenEndpoint = aTokenEndpoint
+}
+
+// GetGcpProjectNumber returns the GCP project number
+func (p *Plugin) GetGcpProjectNumber() string {
+	return p.gcpProjectNumber
 }
 
 // ClearCache is only used for testing purposes.

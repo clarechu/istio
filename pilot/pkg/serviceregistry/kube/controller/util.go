@@ -17,17 +17,22 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	listerv1 "k8s.io/client-go/listers/core/v1"
-
-	"istio.io/pkg/log"
+	"k8s.io/client-go/tools/cache"
 
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 )
 
@@ -40,18 +45,14 @@ func hasProxyIP(addresses []v1.EndpointAddress, proxyIP string) bool {
 	return false
 }
 
-func getLabelValue(metadata metav1.Object, label string, fallBackLabel string) string {
-	labels := metadata.GetLabels()
-	val := labels[label]
+func getLabelValue(metadata metav1.ObjectMeta, label string, fallBackLabel string) string {
+	metaLabels := metadata.GetLabels()
+	val := metaLabels[label]
 	if val != "" {
 		return val
 	}
 
-	return labels[fallBackLabel]
-}
-
-func createUID(podName, namespace string) string {
-	return "kubernetes://" + podName + "." + namespace
+	return metaLabels[fallBackLabel]
 }
 
 // Forked from Kubernetes k8s.io/kubernetes/pkg/api/v1/pod
@@ -98,22 +99,28 @@ func findPortFromMetadata(svcPort v1.ServicePort, podPorts []model.PodPort) (int
 	return 0, fmt.Errorf("no matching port found for %+v", svcPort)
 }
 
-// get the target Port for this service port
-func findServiceTargetPort(servicePort *model.Port, k8sService *v1.Service) (int, string) {
-	targetPort := 0
-	targetPortName := ""
+type serviceTargetPort struct {
+	// the mapped port number, or 0 if unspecified
+	num int
+	// the mapped port name
+	name string
+	// a bool indicating if the mapped port name was explicitly set on the TargetPort field, or inferred from k8s' port.Name
+	explicitName bool
+}
+
+func findServiceTargetPort(servicePort *model.Port, k8sService *v1.Service) serviceTargetPort {
 	for _, p := range k8sService.Spec.Ports {
 		// TODO(@hzxuzhonghu): check protocol as well as port
 		if p.Name == servicePort.Name || p.Port == int32(servicePort.Port) {
 			if p.TargetPort.Type == intstr.Int && p.TargetPort.IntVal > 0 {
-				targetPort = int(p.TargetPort.IntVal)
-			} else {
-				targetPortName = p.TargetPort.StrVal
+				return serviceTargetPort{num: int(p.TargetPort.IntVal), name: p.Name, explicitName: false}
 			}
-			break
+			return serviceTargetPort{num: 0, name: p.TargetPort.StrVal, explicitName: true}
 		}
 	}
-	return targetPort, targetPortName
+	// should never happen
+	log.Debugf("did not find matching target port for %v on service %s", servicePort, k8sService.Name)
+	return serviceTargetPort{num: 0, name: "", explicitName: false}
 }
 
 func getPodServices(s listerv1.ServiceLister, pod *v1.Pod) ([]*v1.Service, error) {
@@ -191,6 +198,59 @@ func nodeEquals(a, b kubernetesNode) bool {
 }
 
 func isNodePortGatewayService(svc *v1.Service) bool {
+	if svc == nil {
+		return false
+	}
 	_, ok := svc.Annotations[kube.NodeSelectorAnnotation]
 	return ok && svc.Spec.Type == v1.ServiceTypeNodePort
+}
+
+// Get the pod key of the proxy which can be used to get pod from the informer cache
+func podKeyByProxy(proxy *model.Proxy) string {
+	parts := strings.Split(proxy.ID, ".")
+	if len(parts) == 2 && proxy.Metadata.Namespace == parts[1] {
+		return kube.KeyFunc(parts[0], parts[1])
+	}
+
+	return ""
+}
+
+func extractService(obj any) (*v1.Service, error) {
+	cm, ok := obj.(*v1.Service)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return nil, fmt.Errorf("couldn't get object from tombstone %#v", obj)
+		}
+		cm, ok = tombstone.Obj.(*v1.Service)
+		if !ok {
+			return nil, fmt.Errorf("tombstone contained object that is not a Service %#v", obj)
+		}
+	}
+	return cm, nil
+}
+
+func namespacedNameForService(svc *model.Service) types.NamespacedName {
+	return types.NamespacedName{
+		Namespace: svc.Attributes.Namespace,
+		Name:      svc.Attributes.Name,
+	}
+}
+
+// serviceClusterSetLocalHostname produces Kubernetes Multi-Cluster Services (MCS) ClusterSet FQDN for a k8s service
+func serviceClusterSetLocalHostname(nn types.NamespacedName) host.Name {
+	return host.Name(nn.Name + "." + nn.Namespace + "." + "svc" + "." + constants.DefaultClusterSetLocalDomain)
+}
+
+// serviceClusterSetLocalHostnameForKR calls serviceClusterSetLocalHostname with the name and namespace of the given kubernetes resource.
+func serviceClusterSetLocalHostnameForKR(obj metav1.Object) host.Name {
+	return serviceClusterSetLocalHostname(types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()})
+}
+
+func labelRequirement(key string, op selection.Operator, vals []string, opts ...field.PathOption) *klabels.Requirement {
+	out, err := klabels.NewRequirement(key, op, vals, opts...)
+	if err != nil {
+		panic(fmt.Sprintf("failed creating requirements for Service: %v", err))
+	}
+	return out
 }

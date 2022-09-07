@@ -19,7 +19,27 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/atomic"
 )
+
+func BenchmarkQueue(b *testing.B) {
+	for n := 0; n < b.N; n++ {
+		q := NewQueue(1 * time.Microsecond)
+		s := make(chan struct{})
+		go q.Run(s)
+		wg := sync.WaitGroup{}
+		wg.Add(1000)
+		for i := 0; i < 1000; i++ {
+			q.Push(func() error {
+				wg.Done()
+				return nil
+			})
+		}
+		wg.Wait()
+		close(s)
+	}
+}
 
 func TestOrdering(t *testing.T) {
 	numValues := 1000
@@ -114,55 +134,34 @@ func TestResourceFree(t *testing.T) {
 	}
 }
 
-func TestRerun(t *testing.T) {
-	q := NewQueue(1 * time.Microsecond)
-
-	notifyCh := make(chan struct{})
-
-	// Push a task
-	q.Push(func() error {
-		notifyCh <- struct{}{}
-		return nil
+func TestClosed(t *testing.T) {
+	t.Run("immediate close", func(t *testing.T) {
+		stop := make(chan struct{})
+		q := NewQueue(0)
+		go q.Run(stop)
+		close(stop)
+		if err := WaitForClose(q, 10*time.Second); err != nil {
+			t.Error(err)
+		}
 	})
-
-	stop := make(chan struct{})
-	go q.Run(stop)
-	select {
-	case <-time.After(200 * time.Millisecond):
-		t.Error("task should be processed")
-	case <-notifyCh:
-	}
-	// close queue
-	close(stop)
-
-	// wait for queue closed
-	time.Sleep(1 * time.Microsecond)
-	// Push a task
-	q.Push(func() error {
-		notifyCh <- struct{}{}
-		return nil
+	t.Run("no tasks after close", func(t *testing.T) {
+		stop := make(chan struct{})
+		q := NewQueue(0)
+		taskComplete := atomic.NewBool(false)
+		q.Push(func() error {
+			close(stop)
+			return nil
+		})
+		go q.Run(stop)
+		if err := WaitForClose(q, 10*time.Second); err != nil {
+			t.Error()
+		}
+		q.Push(func() error {
+			taskComplete.Store(true)
+			return nil
+		})
+		if taskComplete.Load() {
+			t.Error("task ran on closed queue")
+		}
 	})
-	select {
-	case <-time.After(200 * time.Millisecond):
-	case <-notifyCh:
-		t.Errorf("closed queue should not process task")
-	}
-
-	stop = make(chan struct{})
-	defer close(stop)
-	// re run queue
-	go q.Run(stop)
-
-	// Wait for queue rerun
-	time.Sleep(1 * time.Millisecond)
-	// Push a task
-	q.Push(func() error {
-		notifyCh <- struct{}{}
-		return nil
-	})
-	select {
-	case <-time.After(200 * time.Millisecond):
-		t.Error("task should be processed")
-	case <-notifyCh:
-	}
 }

@@ -15,7 +15,7 @@
 package mesh
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
@@ -26,7 +26,7 @@ import (
 )
 
 func TestProfileDump(t *testing.T) {
-	testDataDir = filepath.Join(operatorRootDir, "cmd/mesh/testdata/profile-dump")
+	testDataDir := filepath.Join(operatorRootDir, "cmd/mesh/testdata/profile-dump")
 	tests := []struct {
 		desc       string
 		configPath string
@@ -37,6 +37,10 @@ func TestProfileDump(t *testing.T) {
 		{
 			desc:       "config_path",
 			configPath: "components",
+		},
+		{
+			desc:       "list_path",
+			configPath: "values.gateways.istio-egressgateway.secretVolumes",
 		},
 	}
 	installPackagePathRegex := regexp.MustCompile("  installPackagePath: .*")
@@ -54,7 +58,7 @@ func TestProfileDump(t *testing.T) {
 
 			if refreshGoldenFiles() {
 				t.Logf("Refreshing golden file for %s", outPath)
-				if err := ioutil.WriteFile(outPath, []byte(got), 0644); err != nil {
+				if err := os.WriteFile(outPath, []byte(got), 0o644); err != nil {
 					t.Error(err)
 				}
 			}
@@ -85,7 +89,7 @@ func runProfileDump(profilePath, configPath string, chartSource chartSourceType,
 }
 
 func TestProfileDumpFlags(t *testing.T) {
-	testDataDir = filepath.Join(operatorRootDir, "cmd/mesh/testdata/profile-dump")
+	testDataDir := filepath.Join(operatorRootDir, "cmd/mesh/testdata/profile-dump")
 	tests := []struct {
 		desc       string
 		configPath string
@@ -96,6 +100,10 @@ func TestProfileDumpFlags(t *testing.T) {
 		{
 			desc:       "config_path",
 			configPath: "components",
+		},
+		{
+			desc:       "list_path",
+			configPath: "values.gateways.istio-egressgateway.secretVolumes",
 		},
 	}
 	installPackagePathRegex := regexp.MustCompile("(?m)^installPackagePath=\".*\"\n")
@@ -113,7 +121,7 @@ func TestProfileDumpFlags(t *testing.T) {
 
 			if refreshGoldenFiles() {
 				t.Logf("Refreshing golden file for %s", outPath)
-				if err := ioutil.WriteFile(outPath, []byte(got), 0644); err != nil {
+				if err := os.WriteFile(outPath, []byte(got), 0o644); err != nil {
 					t.Error(err)
 				}
 			}

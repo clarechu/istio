@@ -15,25 +15,31 @@
 package validation_test
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
-	"github.com/gogo/protobuf/types"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
 	v1alpha12 "istio.io/api/operator/v1alpha1"
-
 	"istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/apis/istio/v1alpha1/validation"
 	"istio.io/istio/operator/pkg/helm"
 	"istio.io/istio/operator/pkg/manifest"
+	"istio.io/istio/operator/pkg/util"
+	"istio.io/istio/operator/pkg/util/clog"
 	"istio.io/istio/pkg/test/env"
 )
 
+// nolint: lll
 func TestValidateConfig(t *testing.T) {
 	tests := []struct {
 		name     string
 		value    *v1alpha12.IstioOperatorSpec
+		values   string
+		errors   string
 		warnings string
 	}{
 		{
@@ -41,38 +47,219 @@ func TestValidateConfig(t *testing.T) {
 			value: &v1alpha12.IstioOperatorSpec{
 				AddonComponents: map[string]*v1alpha12.ExternalComponentSpec{
 					"grafana": {
-						Enabled: &v1alpha12.BoolValueForPB{BoolValue: types.BoolValue{Value: true}},
+						Enabled: &wrappers.BoolValue{Value: true},
 					},
 				},
-				Values: map[string]interface{}{
-					"grafana": map[string]interface{}{
+				Values: util.MustStruct(map[string]any{
+					"grafana": map[string]any{
 						"enabled": true,
 					},
-				},
+				}),
 			},
-			warnings: `! values.grafana.enabled is deprecated; use the samples/addons/ deployments instead
-! addonComponents.grafana.enabled is deprecated; use the samples/addons/ deployments instead`,
+			errors: `! values.grafana.enabled is deprecated; use the samples/addons/ deployments instead
+, ! addonComponents.grafana.enabled is deprecated; use the samples/addons/ deployments instead
+`,
 		},
 		{
 			name: "global",
 			value: &v1alpha12.IstioOperatorSpec{
-				Values: map[string]interface{}{
-					"global": map[string]interface{}{
-						"localityLbSetting": map[string]interface{}{"foo": "bar"},
+				Values: util.MustStruct(map[string]any{
+					"global": map[string]any{
+						"localityLbSetting": map[string]any{"foo": "bar"},
 					},
-				},
+				}),
 			},
 			warnings: `! values.global.localityLbSetting is deprecated; use meshConfig.localityLbSetting instead`,
+		},
+		{
+			name: "unset target port",
+			values: `
+components:
+  ingressGateways:
+    - name: istio-ingressgateway
+      enabled: true
+    - name: cluster-local-gateway
+      enabled: true
+      k8s:
+        service:
+          type: ClusterIP
+          ports:
+          - port: 15020
+            name: status-port
+          - port: 80
+            name: http2
+`,
+			errors: `port http2/80 in gateway cluster-local-gateway invalid: targetPort is set to 0, which requires root. Set targetPort to be greater than 1024 or configure values.gateways.istio-ingressgateway.runAsRoot=true`,
+		},
+		{
+			name: "explicitly invalid target port",
+			values: `
+components:
+  ingressGateways:
+    - name: istio-ingressgateway
+      enabled: true
+    - name: cluster-local-gateway
+      enabled: true
+      k8s:
+        service:
+          type: ClusterIP
+          ports:
+          - port: 15020
+            name: status-port
+          - port: 80
+            name: http2
+            targetPort: 90
+`,
+			errors: `port http2/80 in gateway cluster-local-gateway invalid: targetPort is set to 90, which requires root. Set targetPort to be greater than 1024 or configure values.gateways.istio-ingressgateway.runAsRoot=true`,
+		},
+		{
+			name: "explicitly invalid target port for egress",
+			values: `
+components:
+  egressGateways:
+    - name: egress-gateway
+      enabled: true
+      k8s:
+        service:
+          type: ClusterIP
+          ports:
+          - port: 15020
+            name: status-port
+          - port: 80
+            name: http2
+            targetPort: 90
+`,
+			errors: `port http2/80 in gateway egress-gateway invalid: targetPort is set to 90, which requires root. Set targetPort to be greater than 1024 or configure values.gateways.istio-egressgateway.runAsRoot=true`,
+		},
+		{
+			name: "low target port with root",
+			values: `
+components:
+  ingressGateways:
+    - name: istio-ingressgateway
+      enabled: true
+    - name: cluster-local-gateway
+      enabled: true
+      k8s:
+        service:
+          type: ClusterIP
+          ports:
+          - port: 15020
+            name: status-port
+          - port: 80
+            name: http2
+            targetPort: 90
+values:
+  gateways:
+    istio-ingressgateway:
+      runAsRoot: true
+`,
+			errors: ``,
+		},
+		{
+			name: "legacy values ports config empty targetPort",
+			values: `
+values:
+  gateways:
+    istio-ingressgateway:
+      ingressPorts:
+      - name: http
+        port: 80
+`,
+			errors: `port 80 is invalid: targetPort is set to 0, which requires root. Set targetPort to be greater than 1024 or configure values.gateways.istio-ingressgateway.runAsRoot=true`,
+		},
+		{
+			name: "legacy values ports config explicit targetPort",
+			values: `
+values:
+  gateways:
+    istio-ingressgateway:
+      ingressPorts:
+      - name: http
+        port: 80
+        targetPort: 90
+`,
+			errors: `port 80 is invalid: targetPort is set to 90, which requires root. Set targetPort to be greater than 1024 or configure values.gateways.istio-ingressgateway.runAsRoot=true`,
+		},
+		{
+			name: "legacy values ports valid",
+			values: `
+values:
+  gateways:
+    istio-ingressgateway:
+      ingressPorts:
+      - name: http
+        port: 80
+        targetPort: 8080
+`,
+			errors: ``,
+		},
+		{
+			name: "replicaCount set when autoscaleEnabled is true",
+			values: `
+values:
+  pilot:
+    autoscaleEnabled: true
+  gateways:
+    istio-ingressgateway:
+      autoscaleEnabled: true
+    istio-egressgateway:
+      autoscaleEnabled: true
+components:
+  pilot:
+    k8s:
+      replicaCount: 2
+  ingressGateways:
+    - name: istio-ingressgateway
+      enabled: true
+      k8s:
+        replicaCount: 2
+  egressGateways:
+    - name: istio-egressgateway
+      enabled: true
+      k8s:
+        replicaCount: 2
+`,
+			warnings: strings.TrimSpace(`
+components.pilot.k8s.replicaCount should not be set when values.pilot.autoscaleEnabled is true
+components.ingressGateways[name=istio-ingressgateway].k8s.replicaCount should not be set when values.gateways.istio-ingressgateway.autoscaleEnabled is true
+components.egressGateways[name=istio-egressgateway].k8s.replicaCount should not be set when values.gateways.istio-egressgateway.autoscaleEnabled is true
+`),
+		},
+		{
+			name: "pilot.k8s.replicaCount is default value set when autoscaleEnabled is true",
+			values: `
+values:
+  pilot:
+    autoscaleEnabled: true
+  gateways:
+    istio-ingressgateway:
+      autoscaleEnabled: true
+    istio-egressgateway:
+      autoscaleEnabled: true
+components:
+  pilot:
+    k8s:
+      replicaCount: 1
+`,
+			warnings: strings.TrimSpace(``),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err, warnings := validation.ValidateConfig(false, tt.value)
-			if err != nil {
-				t.Fatal(err)
+			iop := tt.value
+			if tt.values != "" {
+				iop = &v1alpha12.IstioOperatorSpec{}
+				if err := util.UnmarshalWithJSONPB(tt.values, iop, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err, warnings := validation.ValidateConfig(false, iop)
+			if tt.errors != err.String() {
+				t.Fatalf("expected errors: \n%q\n got: \n%q\n", tt.errors, err.String())
 			}
 			if tt.warnings != warnings {
-				t.Fatalf("expected warnings: %q got %q", tt.warnings, warnings)
+				t.Fatalf("expected warnings: \n%q\n got \n%q\n", tt.warnings, warnings)
 			}
 		})
 	}
@@ -88,13 +275,14 @@ func TestValidateProfiles(t *testing.T) {
 		// Just ensure we find some profiles, in case this code breaks
 		t.Fatalf("Maybe have failed getting profiles, got %v", profiles)
 	}
+	l := clog.NewConsoleLogger(os.Stdout, os.Stderr, nil)
 	for _, tt := range profiles {
 		t.Run(tt, func(t *testing.T) {
-			_, s, err := manifest.GenIOPSFromProfile(tt, "", []string{"installPackagePath=" + manifests}, false, nil, nil)
+			_, s, err := manifest.GenIOPFromProfile(tt, "", []string{"installPackagePath=" + manifests}, false, false, nil, l)
 			if err != nil {
 				t.Fatal(err)
 			}
-			verr, warnings := validation.ValidateConfig(false, s)
+			verr, warnings := validation.ValidateConfig(false, s.Spec)
 			if verr != nil {
 				t.Fatalf("got error validating: %v", verr)
 			}
@@ -120,7 +308,7 @@ func TestValidate(t *testing.T) {
 			name: "With CNI defined",
 			toValidate: &v1alpha1.Values{
 				Cni: &v1alpha1.CNIConfig{
-					Enabled: &types.BoolValue{Value: true},
+					Enabled: &wrappers.BoolValue{Value: true},
 				},
 			},
 			validated: true,

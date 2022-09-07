@@ -21,8 +21,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/go-multierror"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/config"
 )
 
 // Schemas contains metadata about configuration resources.
@@ -94,6 +95,30 @@ func (s Schemas) ForEach(handleSchema func(Schema) (done bool)) {
 	}
 }
 
+func (s Schemas) Intersect(otherSchemas Schemas) Schemas {
+	resultBuilder := NewSchemasBuilder()
+	for _, myschema := range s.All() {
+		if _, ok := otherSchemas.FindByGroupVersionResource(myschema.Resource().GroupVersionResource()); ok {
+			// an error indicates the schema has already been added, which doesn't negatively impact intersect
+			_ = resultBuilder.Add(myschema)
+		}
+	}
+	return resultBuilder.Build()
+}
+
+func (s Schemas) Union(otherSchemas Schemas) Schemas {
+	resultBuilder := NewSchemasBuilder()
+	for _, myschema := range s.All() {
+		// an error indicates the schema has already been added, which doesn't negatively impact intersect
+		_ = resultBuilder.Add(myschema)
+	}
+	for _, myschema := range otherSchemas.All() {
+		// an error indicates the schema has already been added, which doesn't negatively impact intersect
+		_ = resultBuilder.Add(myschema)
+	}
+	return resultBuilder.Build()
+}
+
 // Find looks up a Schema by its collection name.
 func (s Schemas) Find(collection string) (Schema, bool) {
 	i, ok := s.byCollection[Name(collection)]
@@ -109,8 +134,8 @@ func (s Schemas) MustFind(collection string) Schema {
 	return i
 }
 
-// FindByKind searches and returns the first schema with the given kind
-func (s Schemas) FindByGroupVersionKind(gvk resource.GroupVersionKind) (Schema, bool) {
+// FindByGroupVersionKind searches and returns the first schema with the given GVK
+func (s Schemas) FindByGroupVersionKind(gvk config.GroupVersionKind) (Schema, bool) {
 	for _, rs := range s.byAddOrder {
 		if rs.Resource().GroupVersionKind() == gvk {
 			return rs, true
@@ -120,7 +145,31 @@ func (s Schemas) FindByGroupVersionKind(gvk resource.GroupVersionKind) (Schema, 
 	return nil, false
 }
 
-// FindByKind searches and returns the first schema with the given kind
+// FindByGroupVersionAliasesKind searches and returns the first schema with the given GVK,
+// if not found, it will search for version aliases for the schema to see if there is a match.
+func (s Schemas) FindByGroupVersionAliasesKind(gvk config.GroupVersionKind) (Schema, bool) {
+	for _, rs := range s.byAddOrder {
+		for _, va := range rs.Resource().GroupVersionAliasKinds() {
+			if va == gvk {
+				return rs, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// FindByGroupVersionResource searches and returns the first schema with the given GVR
+func (s Schemas) FindByGroupVersionResource(gvr schema.GroupVersionResource) (Schema, bool) {
+	for _, rs := range s.byAddOrder {
+		if rs.Resource().GroupVersionResource() == gvr {
+			return rs, true
+		}
+	}
+
+	return nil, false
+}
+
+// FindByPlural searches and returns the first schema with the given Group, Version and plural form of the Kind
 func (s Schemas) FindByPlural(group, version, plural string) (Schema, bool) {
 	for _, rs := range s.byAddOrder {
 		if rs.Resource().Plural() == plural &&
@@ -133,8 +182,8 @@ func (s Schemas) FindByPlural(group, version, plural string) (Schema, bool) {
 	return nil, false
 }
 
-// MustFind calls FindByGroupVersionKind and panics if not found.
-func (s Schemas) MustFindByGroupVersionKind(gvk resource.GroupVersionKind) Schema {
+// MustFindByGroupVersionKind calls FindByGroupVersionKind and panics if not found.
+func (s Schemas) MustFindByGroupVersionKind(gvk config.GroupVersionKind) Schema {
 	r, found := s.FindByGroupVersionKind(gvk)
 	if !found {
 		panic(fmt.Sprintf("Schemas.MustFindByGroupVersionKind: unable to find %s", gvk))
@@ -160,7 +209,6 @@ func (s Schemas) Add(toAdd ...Schema) Schemas {
 	}
 
 	return b.Build()
-
 }
 
 // Remove creates a copy of this Schemas with the given schemas removed.
@@ -212,17 +260,6 @@ func (s Schemas) Kinds() []string {
 
 	sort.Strings(out)
 	return out
-}
-
-// DisabledCollectionNames returns the names of disabled collections
-func (s Schemas) DisabledCollectionNames() Names {
-	disabledCollections := make(Names, 0)
-	for _, i := range s.byAddOrder {
-		if i.IsDisabled() {
-			disabledCollections = append(disabledCollections, i.Name())
-		}
-	}
-	return disabledCollections
 }
 
 // Validate the schemas. Returns error if there is a problem.

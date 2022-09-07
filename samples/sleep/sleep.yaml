@@ -26,6 +26,7 @@ metadata:
   name: sleep
   labels:
     app: sleep
+    service: sleep
 spec:
   ports:
   - port: 80
@@ -47,11 +48,12 @@ spec:
       labels:
         app: sleep
     spec:
+      terminationGracePeriodSeconds: 0
       serviceAccountName: sleep
       containers:
       - name: sleep
-        image: governmentpaas/curl-ssl
-        command: ["/bin/sleep", "3650d"]
+        image: curlimages/curl
+        command: ["/bin/sleep", "infinity"]
         imagePullPolicy: IfNotPresent
         volumeMounts:
         - mountPath: /etc/sleep/tls

@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,19 +22,16 @@ import (
 	"math"
 	"strings"
 	"testing"
-	"time"
 
-	"istio.io/pkg/log"
-
-	"istio.io/istio/pkg/test/util/retry"
-
-	"istio.io/istio/tests/util"
+	"github.com/hashicorp/go-multierror"
+	"k8s.io/apimachinery/pkg/util/rand"
 
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/util/file"
-	"istio.io/istio/pkg/test/util/tmpl"
+	"istio.io/istio/pkg/test/framework/components/echo/common/deployment"
+	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/pkg/log"
 )
 
 //	Virtual service topology
@@ -54,47 +54,41 @@ type testCaseMirror struct {
 	absent              bool
 	percentage          float64
 	threshold           float64
-	expectedDestination echo.Instance
+	expectedDestination echo.Instances
 }
 
 type mirrorTestOptions struct {
-	t          *testing.T
 	cases      []testCaseMirror
 	mirrorHost string
 }
 
-var (
-	mirrorProtocols = []protocol.Instance{protocol.HTTP, protocol.GRPC}
-)
+var mirrorProtocols = []protocol.Instance{protocol.HTTP, protocol.GRPC}
 
 func TestMirroring(t *testing.T) {
-	cases := []testCaseMirror{
-		{
-			name:       "mirror-percent-absent",
-			absent:     true,
-			percentage: 100.0,
-			threshold:  0.0,
+	runMirrorTest(t, mirrorTestOptions{
+		cases: []testCaseMirror{
+			{
+				name:       "mirror-percent-absent",
+				absent:     true,
+				percentage: 100.0,
+				threshold:  0.0,
+			},
+			{
+				name:       "mirror-50",
+				percentage: 50.0,
+				threshold:  10.0,
+			},
+			{
+				name:       "mirror-10",
+				percentage: 10.0,
+				threshold:  5.0,
+			},
+			{
+				name:       "mirror-0",
+				percentage: 0.0,
+				threshold:  0.0,
+			},
 		},
-		{
-			name:       "mirror-50",
-			percentage: 50.0,
-			threshold:  10.0,
-		},
-		{
-			name:       "mirror-10",
-			percentage: 10.0,
-			threshold:  5.0,
-		},
-		{
-			name:       "mirror-0",
-			percentage: 0.0,
-			threshold:  0.0,
-		},
-	}
-
-	runMirrorTest(mirrorTestOptions{
-		t:     t,
-		cases: cases,
 	})
 }
 
@@ -107,33 +101,34 @@ func TestMirroring(t *testing.T) {
 // Thus when "a" tries to mirror to the external service, it is actually connecting to "external" (which is not part of the
 // mesh because of the Sidecar), then we can inspect "external" logs to verify the requests were properly mirrored.
 func TestMirroringExternalService(t *testing.T) {
-	cases := []testCaseMirror{
-		{
-			name:                "mirror-external",
-			absent:              true,
-			percentage:          100.0,
-			threshold:           0.0,
-			expectedDestination: apps.external,
-		},
+	header := ""
+	if len(apps.External.All) > 0 {
+		header = apps.External.All.Config().HostHeader()
 	}
-
-	runMirrorTest(mirrorTestOptions{
-		t:          t,
-		cases:      cases,
-		mirrorHost: apps.externalHost,
+	runMirrorTest(t, mirrorTestOptions{
+		mirrorHost: header,
+		cases: []testCaseMirror{
+			{
+				name:                "mirror-external",
+				absent:              true,
+				percentage:          100.0,
+				threshold:           0.0,
+				expectedDestination: apps.External.All,
+			},
+		},
 	})
 }
 
-func runMirrorTest(options mirrorTestOptions) {
+func runMirrorTest(t *testing.T, options mirrorTestOptions) {
 	framework.
-		NewTest(options.t).
-		RequiresSingleCluster().
-		Run(func(ctx framework.TestContext) {
+		NewTest(t).
+		Features("traffic.mirroring").
+		Run(func(t framework.TestContext) {
 			for _, c := range options.cases {
-				options.t.Run(c.name, func(t *testing.T) {
+				t.NewSubTest(c.name).Run(func(t framework.TestContext) {
 					mirrorHost := options.mirrorHost
 					if len(mirrorHost) == 0 {
-						mirrorHost = apps.podC.Config().Service
+						mirrorHost = deployment.CSvc
 					}
 					vsc := VirtualServiceMirrorConfig{
 						c.name,
@@ -142,24 +137,29 @@ func runMirrorTest(options mirrorTestOptions) {
 						mirrorHost,
 					}
 
-					deployment := tmpl.EvaluateOrFail(t,
-						file.AsStringOrFail(t, "testdata/traffic-mirroring-template.yaml"), vsc)
-					ctx.Config().ApplyYAMLOrFail(t, apps.namespace.Name(), deployment)
-					defer ctx.Config().DeleteYAMLOrFail(t, apps.namespace.Name(), deployment)
+					// we only apply to config clusters
+					t.ConfigIstio().EvalFile(apps.Namespace.Name(), vsc, "testdata/traffic-mirroring-template.yaml").
+						ApplyOrFail(t)
 
-					for _, proto := range mirrorProtocols {
-						t.Run(string(proto), func(t *testing.T) {
-							retry.UntilSuccessOrFail(t, func() error {
-								testID := util.RandomString(16)
-								if err := sendTrafficMirror(apps.podA, apps.podB, proto, testID); err != nil {
-									return err
-								}
-								expected := c.expectedDestination
-								if expected == nil {
-									expected = apps.podC
-								}
-								return verifyTrafficMirror(apps.podB, expected, c, testID)
-							}, retry.Delay(time.Second))
+					for _, podA := range apps.A {
+						podA := podA
+						t.NewSubTest(fmt.Sprintf("from %s", podA.Config().Cluster.StableName())).Run(func(t framework.TestContext) {
+							for _, proto := range mirrorProtocols {
+								t.NewSubTest(string(proto)).Run(func(t framework.TestContext) {
+									retry.UntilSuccessOrFail(t, func() error {
+										testID := rand.String(16)
+										if err := sendTrafficMirror(podA, apps.B, proto, testID); err != nil {
+											return err
+										}
+										expected := c.expectedDestination
+										if expected == nil {
+											expected = apps.C
+										}
+
+										return verifyTrafficMirror(apps.B, expected, c, testID)
+									}, echo.DefaultCallRetryOptions()...)
+								})
+							}
 						})
 					}
 				})
@@ -167,15 +167,20 @@ func runMirrorTest(options mirrorTestOptions) {
 		})
 }
 
-func sendTrafficMirror(from, to echo.Instance, proto protocol.Instance, testID string) error {
+func sendTrafficMirror(from echo.Instance, to echo.Target, proto protocol.Instance, testID string) error {
 	options := echo.CallOptions{
-		Target:   to,
-		Count:    50,
-		PortName: strings.ToLower(string(proto)),
+		To:    to,
+		Count: 100,
+		Port: echo.Port{
+			Name: strings.ToLower(proto.String()),
+		},
+		Retry: echo.Retry{
+			NoRetry: true,
+		},
 	}
 	switch proto {
 	case protocol.HTTP:
-		options.Path = "/" + testID
+		options.HTTP.Path = "/" + testID
 	case protocol.GRPC:
 		options.Message = testID
 	default:
@@ -190,7 +195,7 @@ func sendTrafficMirror(from, to echo.Instance, proto protocol.Instance, testID s
 	return nil
 }
 
-func verifyTrafficMirror(dest, mirror echo.Instance, tc testCaseMirror, testID string) error {
+func verifyTrafficMirror(dest, mirror echo.Instances, tc testCaseMirror, testID string) error {
 	countB, err := logCount(dest, testID)
 	if err != nil {
 		return err
@@ -204,32 +209,43 @@ func verifyTrafficMirror(dest, mirror echo.Instance, tc testCaseMirror, testID s
 	actualPercent := (countC / countB) * 100
 	deltaFromExpected := math.Abs(actualPercent - tc.percentage)
 
+	var merr *multierror.Error
 	if tc.threshold-deltaFromExpected < 0 {
 		err := fmt.Errorf("unexpected mirror traffic. Expected %g%%, got %.1f%% (threshold: %g%%, testID: %s)",
 			tc.percentage, actualPercent, tc.threshold, testID)
 		log.Infof("%v", err)
-		return err
+		merr = multierror.Append(merr, err)
+	} else {
+		log.Infof("Got expected mirror traffic. Expected %g%%, got %.1f%% (threshold: %g%%, , testID: %s)",
+			tc.percentage, actualPercent, tc.threshold, testID)
 	}
 
-	log.Infof("Got expected mirror traffic. Expected %g%%, got %.1f%% (threshold: %g%%, , testID: %s)",
-		tc.percentage, actualPercent, tc.threshold, testID)
-	return nil
+	return merr.ErrorOrNil()
 }
 
-func logCount(instance echo.Instance, testID string) (float64, error) {
-	workloads, err := instance.Workloads()
-	if err != nil {
-		return -1, fmt.Errorf("failed to get Subsets: %v", err)
-	}
-
-	var logs string
-	for _, w := range workloads {
-		l, err := w.Logs()
+func logCount(instances echo.Instances, testID string) (float64, error) {
+	counts := map[string]float64{}
+	for _, instance := range instances {
+		workloads, err := instance.Workloads()
 		if err != nil {
-			return -1, fmt.Errorf("failed getting logs: %v", err)
+			return -1, fmt.Errorf("failed to get Subsets: %v", err)
 		}
-		logs += l
+		var logs string
+		for _, w := range workloads {
+			l, err := w.Logs()
+			if err != nil {
+				return -1, fmt.Errorf("failed getting logs: %v", err)
+			}
+			logs += l
+		}
+		if c := float64(strings.Count(logs, testID)); c > 0 {
+			counts[instance.Config().Cluster.Name()] = c
+		}
 	}
-
-	return float64(strings.Count(logs, testID)), nil
+	var total float64
+	for _, c := range counts {
+		total += c
+	}
+	// TODO(landow) mirorr split does not always hit all clusters
+	return total, nil
 }

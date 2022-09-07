@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 //  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,36 +22,13 @@ import (
 
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/istio"
-	"istio.io/istio/pkg/test/framework/label"
 )
 
-var (
-	inst istio.Instance
-)
+var inst istio.Instance
 
 func TestMain(m *testing.M) {
 	framework.
 		NewSuite(m).
-		Label(label.CustomSetup).
-
-		// SDS requires Kubernetes 1.13
-		RequireEnvironmentVersion("1.13").
-		RequireSingleCluster().
-		Label("CustomSetup").
-		Setup(istio.Setup(&inst, setupConfig)).
+		Setup(istio.Setup(&inst, nil)).
 		Run()
-
-}
-
-func setupConfig(cfg *istio.Config) {
-	if cfg == nil {
-		return
-	}
-	cfg.ControlPlaneValues = `
-components:
-  egressGateways:
-  - enabled: true
-  ingressGateways:
-  - enabled: false
-`
 }

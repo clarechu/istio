@@ -15,38 +15,42 @@
 package validate
 
 import (
-	"github.com/ghodss/yaml"
+	"reflect"
+
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/util"
 )
 
-var (
-	// DefaultValuesValidations maps a data path to a validation function.
-	DefaultValuesValidations = map[string]ValidatorFunc{
-		"global.proxy.includeIPRanges":     validateIPRangesOrStar,
-		"global.proxy.excludeIPRanges":     validateIPRangesOrStar,
-		"global.proxy.includeInboundPorts": validateStringList(validatePortNumberString),
-		"global.proxy.excludeInboundPorts": validateStringList(validatePortNumberString),
-		"meshConfig":                       validateMeshConfig,
-	}
-)
+// DefaultValuesValidations maps a data path to a validation function.
+var DefaultValuesValidations = map[string]ValidatorFunc{
+	"global.proxy.includeIPRanges":     validateIPRangesOrStar,
+	"global.proxy.excludeIPRanges":     validateIPRangesOrStar,
+	"global.proxy.includeInboundPorts": validateStringList(validatePortNumberString),
+	"global.proxy.excludeInboundPorts": validateStringList(validatePortNumberString),
+	"meshConfig":                       validateMeshConfig,
+}
 
 // CheckValues validates the values in the given tree, which follows the Istio values.yaml schema.
-func CheckValues(root interface{}) util.Errors {
-	vs, err := yaml.Marshal(root)
+func CheckValues(root any) util.Errors {
+	v := reflect.ValueOf(root)
+	if root == nil || (v.Kind() == reflect.Ptr && v.IsNil()) {
+		return nil
+	}
+	vs, err := util.ToYAMLGeneric(root)
 	if err != nil {
 		return util.Errors{err}
 	}
 	val := &v1alpha1.Values{}
-	if err := util.UnmarshalValuesWithJSONPB(string(vs), val, false); err != nil {
+	if err := util.UnmarshalWithJSONPB(string(vs), val, false); err != nil {
 		return util.Errors{err}
 	}
-	return ValuesValidate(DefaultValuesValidations, root, nil)
+	return ValuesValidate(DefaultValuesValidations, root.(*structpb.Struct).AsMap(), nil)
 }
 
 // ValuesValidate validates the values of the tree using the supplied Func
-func ValuesValidate(validations map[string]ValidatorFunc, node interface{}, path util.Path) (errs util.Errors) {
+func ValuesValidate(validations map[string]ValidatorFunc, node any, path util.Path) (errs util.Errors) {
 	pstr := path.String()
 	scope.Debugf("ValuesValidate %s", pstr)
 	vf := validations[pstr]
@@ -54,7 +58,7 @@ func ValuesValidate(validations map[string]ValidatorFunc, node interface{}, path
 		errs = util.AppendErrs(errs, vf(path, node))
 	}
 
-	nn, ok := node.(map[string]interface{})
+	nn, ok := node.(map[string]any)
 	if !ok {
 		// Leaf, nothing more to recurse.
 		return errs

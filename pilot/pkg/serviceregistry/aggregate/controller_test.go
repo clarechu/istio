@@ -15,146 +15,174 @@
 package aggregate
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
+	"go.uber.org/atomic"
+
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/mock"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/host"
-	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
-var discovery1 *mock.ServiceDiscovery
-var discovery2 *mock.ServiceDiscovery
+type mockMeshConfigHolder struct {
+	trustDomainAliases []string
+}
+
+func (mh mockMeshConfigHolder) Mesh() *meshconfig.MeshConfig {
+	return &meshconfig.MeshConfig{
+		TrustDomainAliases: mh.trustDomainAliases,
+	}
+}
 
 func buildMockController() *Controller {
-	discovery1 = mock.NewDiscovery(
-		map[host.Name]*model.Service{
-			mock.HelloService.Hostname:   mock.HelloService,
-			mock.ExtHTTPService.Hostname: mock.ExtHTTPService,
-		}, 2)
+	discovery1 := memory.NewServiceDiscovery(mock.ReplicatedFooServiceV1.DeepCopy(),
+		mock.HelloService.DeepCopy(),
+		mock.ExtHTTPService.DeepCopy(),
+	)
+	for _, port := range mock.HelloService.Ports {
+		discovery1.AddInstance(mock.HelloService.Hostname, mock.MakeServiceInstance(mock.HelloService, port, 0, model.Locality{}))
+		discovery1.AddInstance(mock.HelloService.Hostname, mock.MakeServiceInstance(mock.HelloService, port, 1, model.Locality{}))
+	}
 
-	discovery2 = mock.NewDiscovery(
-		map[host.Name]*model.Service{
-			mock.WorldService.Hostname:    mock.WorldService,
-			mock.ExtHTTPSService.Hostname: mock.ExtHTTPSService,
-		}, 2)
-
+	discovery2 := memory.NewServiceDiscovery(mock.ReplicatedFooServiceV2.DeepCopy(),
+		mock.WorldService.DeepCopy(),
+		mock.ExtHTTPSService.DeepCopy(),
+	)
+	for _, port := range mock.WorldService.Ports {
+		discovery2.AddInstance(mock.WorldService.Hostname, mock.MakeServiceInstance(mock.WorldService, port, 0, model.Locality{}))
+		discovery2.AddInstance(mock.WorldService.Hostname, mock.MakeServiceInstance(mock.WorldService, port, 1, model.Locality{}))
+	}
 	registry1 := serviceregistry.Simple{
-		ProviderID:       serviceregistry.ProviderID("mockAdapter1"),
+		ProviderID:       provider.ID("mockAdapter1"),
 		ServiceDiscovery: discovery1,
 		Controller:       &mock.Controller{},
 	}
 
 	registry2 := serviceregistry.Simple{
-		ProviderID:       serviceregistry.ProviderID("mockAdapter2"),
+		ProviderID:       provider.ID("mockAdapter2"),
 		ServiceDiscovery: discovery2,
 		Controller:       &mock.Controller{},
 	}
 
-	ctls := NewController()
+	ctls := NewController(Options{&mockMeshConfigHolder{}})
 	ctls.AddRegistry(registry1)
 	ctls.AddRegistry(registry2)
 
 	return ctls
 }
 
-func buildMockControllerForMultiCluster() *Controller {
-	discovery1 = mock.NewDiscovery(
-		map[host.Name]*model.Service{
-			mock.HelloService.Hostname: mock.MakeService("hello.default.svc.cluster.local", "10.1.1.0"),
-		}, 2)
+// return aggregator and cluster1 and cluster2 service discovery
+func buildMockControllerForMultiCluster() (*Controller, *memory.ServiceDiscovery, *memory.ServiceDiscovery) {
+	discovery1 := memory.NewServiceDiscovery(mock.HelloService)
 
-	discovery2 = mock.NewDiscovery(
-		map[host.Name]*model.Service{
-			mock.HelloService.Hostname: mock.MakeService("hello.default.svc.cluster.local", "10.1.2.0"),
-			mock.WorldService.Hostname: mock.WorldService,
-		}, 2)
+	discovery2 := memory.NewServiceDiscovery(mock.MakeService(mock.ServiceArgs{
+		Hostname:        mock.HelloService.Hostname,
+		Address:         "10.1.2.0",
+		ServiceAccounts: []string{},
+		ClusterID:       "cluster-2",
+	}), mock.WorldService)
 
 	registry1 := serviceregistry.Simple{
-		ProviderID:       serviceregistry.ProviderID("mockAdapter1"),
+		ProviderID:       provider.Kubernetes,
 		ClusterID:        "cluster-1",
 		ServiceDiscovery: discovery1,
 		Controller:       &mock.Controller{},
 	}
 
 	registry2 := serviceregistry.Simple{
-		ProviderID:       serviceregistry.ProviderID("mockAdapter2"),
+		ProviderID:       provider.Kubernetes,
 		ClusterID:        "cluster-2",
 		ServiceDiscovery: discovery2,
 		Controller:       &mock.Controller{},
 	}
 
-	ctls := NewController()
+	ctls := NewController(Options{})
 	ctls.AddRegistry(registry1)
 	ctls.AddRegistry(registry2)
 
-	return ctls
+	return ctls, discovery1, discovery2
 }
 
-func TestServicesError(t *testing.T) {
-	aggregateCtl := buildMockController()
-
-	discovery1.ServicesError = errors.New("mock Services() error")
-
-	// List Services from aggregate controller
-	_, err := aggregateCtl.Services()
-	if err == nil {
-		t.Fatal("Aggregate controller should return error if one discovery client experience error")
-	}
-}
 func TestServicesForMultiCluster(t *testing.T) {
-	aggregateCtl := buildMockControllerForMultiCluster()
+	originalHelloService := mock.HelloService.DeepCopy()
+	aggregateCtl, _, registry2 := buildMockControllerForMultiCluster()
 	// List Services from aggregate controller
-	services, err := aggregateCtl.Services()
-	if err != nil {
-		t.Fatalf("Services() encountered unexpected error: %v", err)
-	}
+	services := aggregateCtl.Services()
 
 	// Set up ground truth hostname values
-	serviceMap := map[host.Name]bool{
+	hosts := map[host.Name]bool{
 		mock.HelloService.Hostname: false,
 		mock.WorldService.Hostname: false,
 	}
 
-	svcCount := 0
+	count := 0
 	// Compare return value to ground truth
 	for _, svc := range services {
-		if counted, existed := serviceMap[svc.Hostname]; existed && !counted {
-			svcCount++
-			serviceMap[svc.Hostname] = true
+		if counted, existed := hosts[svc.Hostname]; existed && !counted {
+			count++
+			hosts[svc.Hostname] = true
 		}
 	}
 
-	if svcCount != len(serviceMap) {
-		t.Fatalf("Service map expected size %d, actual %v", svcCount, serviceMap)
+	if count != len(hosts) {
+		t.Fatalf("Cluster local service map expected size %d, actual %v vs %v", count, hosts, services)
 	}
 
-	//Now verify ClusterVIPs for each service
-	ClusterVIPs := map[host.Name]map[string]string{
+	// Now verify ClusterVIPs for each service
+	ClusterVIPs := map[host.Name]map[cluster.ID][]string{
 		mock.HelloService.Hostname: {
-			"cluster-1": "10.1.1.0",
-			"cluster-2": "10.1.2.0",
+			"cluster-1": []string{"10.1.0.0"},
+			"cluster-2": []string{"10.1.2.0"},
 		},
 		mock.WorldService.Hostname: {
-			"cluster-2": "10.2.0.0",
+			"cluster-2": []string{"10.2.0.0"},
 		},
 	}
 	for _, svc := range services {
-		if !reflect.DeepEqual(svc.ClusterVIPs, ClusterVIPs[svc.Hostname]) {
-			t.Fatalf("Service %s ClusterVIPs actual %v, expected %v", svc.Hostname, svc.ClusterVIPs, ClusterVIPs[svc.Hostname])
+		if !reflect.DeepEqual(svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname]) {
+			t.Fatalf("Service %s ClusterVIPs actual %v, expected %v", svc.Hostname,
+				svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname])
 		}
 	}
-	t.Logf("Return service ClusterVIPs match ground truth")
+
+	registry2.RemoveService(mock.HelloService.Hostname)
+	// List Services from aggregate controller
+	services = aggregateCtl.Services()
+	// Now verify ClusterVIPs for each service
+	ClusterVIPs = map[host.Name]map[cluster.ID][]string{
+		mock.HelloService.Hostname: {
+			"cluster-1": []string{"10.1.0.0"},
+		},
+		mock.WorldService.Hostname: {
+			"cluster-2": []string{"10.2.0.0"},
+		},
+	}
+	for _, svc := range services {
+		if !reflect.DeepEqual(svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname]) {
+			t.Fatalf("Service %s ClusterVIPs actual %v, expected %v", svc.Hostname,
+				svc.ClusterVIPs.Addresses, ClusterVIPs[svc.Hostname])
+		}
+	}
+
+	// check HelloService is not mutated
+	if !reflect.DeepEqual(originalHelloService, mock.HelloService) {
+		t.Errorf("Original hello service is mutated")
+	}
 }
 
 func TestServices(t *testing.T) {
 	aggregateCtl := buildMockController()
 	// List Services from aggregate controller
-	services, err := aggregateCtl.Services()
+	services := aggregateCtl.Services()
 
 	// Set up ground truth hostname values
 	serviceMap := map[host.Name]bool{
@@ -162,10 +190,6 @@ func TestServices(t *testing.T) {
 		mock.ExtHTTPService.Hostname:  false,
 		mock.WorldService.Hostname:    false,
 		mock.ExtHTTPSService.Hostname: false,
-	}
-
-	if err != nil {
-		t.Fatalf("Services() encountered unexpected error: %v", err)
 	}
 
 	svcCount := 0
@@ -186,10 +210,7 @@ func TestGetService(t *testing.T) {
 	aggregateCtl := buildMockController()
 
 	// Get service from mockAdapter1
-	svc, err := aggregateCtl.GetService(mock.HelloService.Hostname)
-	if err != nil {
-		t.Fatalf("GetService() encountered unexpected error: %v", err)
-	}
+	svc := aggregateCtl.GetService(mock.HelloService.Hostname)
 	if svc == nil {
 		t.Fatal("Fail to get service")
 	}
@@ -198,39 +219,7 @@ func TestGetService(t *testing.T) {
 	}
 
 	// Get service from mockAdapter2
-	svc, err = aggregateCtl.GetService(mock.WorldService.Hostname)
-	if err != nil {
-		t.Fatalf("GetService() encountered unexpected error: %v", err)
-	}
-	if svc == nil {
-		t.Fatal("Fail to get service")
-	}
-	if svc.Hostname != mock.WorldService.Hostname {
-		t.Fatal("Returned service is incorrect")
-	}
-}
-
-func TestGetServiceError(t *testing.T) {
-	aggregateCtl := buildMockController()
-
-	discovery1.GetServiceError = errors.New("mock GetService() error")
-
-	// Get service from client with error
-	svc, err := aggregateCtl.GetService(mock.HelloService.Hostname)
-	if err == nil {
-		fmt.Println(svc)
-		t.Fatal("Aggregate controller should return error if one discovery client experiences " +
-			"error and no service is found")
-	}
-	if svc != nil {
-		t.Fatal("GetService() should return nil if no service found")
-	}
-
-	// Get service from client without error
-	svc, err = aggregateCtl.GetService(mock.WorldService.Hostname)
-	if err != nil {
-		t.Fatal("Aggregate controller should not return error if service is found")
-	}
+	svc = aggregateCtl.GetService(mock.WorldService.Hostname)
 	if svc == nil {
 		t.Fatal("Fail to get service")
 	}
@@ -243,10 +232,7 @@ func TestGetProxyServiceInstances(t *testing.T) {
 	aggregateCtl := buildMockController()
 
 	// Get Instances from mockAdapter1
-	instances, err := aggregateCtl.GetProxyServiceInstances(&model.Proxy{IPAddresses: []string{mock.HelloInstanceV0}})
-	if err != nil {
-		t.Fatalf("GetProxyServiceInstances() encountered unexpected error: %v", err)
-	}
+	instances := aggregateCtl.GetProxyServiceInstances(&model.Proxy{IPAddresses: []string{mock.HelloInstanceV0}})
 	if len(instances) != 6 {
 		t.Fatalf("Returned GetProxyServiceInstances' amount %d is not correct", len(instances))
 	}
@@ -257,10 +243,7 @@ func TestGetProxyServiceInstances(t *testing.T) {
 	}
 
 	// Get Instances from mockAdapter2
-	instances, err = aggregateCtl.GetProxyServiceInstances(&model.Proxy{IPAddresses: []string{mock.MakeIP(mock.WorldService, 1)}})
-	if err != nil {
-		t.Fatalf("GetProxyServiceInstances() encountered unexpected error: %v", err)
-	}
+	instances = aggregateCtl.GetProxyServiceInstances(&model.Proxy{IPAddresses: []string{mock.MakeIP(mock.WorldService, 1)}})
 	if len(instances) != 6 {
 		t.Fatalf("Returned GetProxyServiceInstances' amount %d is not correct", len(instances))
 	}
@@ -276,42 +259,9 @@ func TestGetProxyWorkloadLabels(t *testing.T) {
 	// This ensures callers can distinguish between no labels, and labels not found.
 	aggregateCtl := buildMockController()
 
-	instances, err := aggregateCtl.GetProxyWorkloadLabels(&model.Proxy{IPAddresses: []string{mock.HelloInstanceV0}})
-	if err != nil {
-		t.Fatalf("GetProxyServiceInstances() encountered unexpected error: %v", err)
-	}
+	instances := aggregateCtl.GetProxyWorkloadLabels(&model.Proxy{IPAddresses: []string{mock.HelloInstanceV0}})
 	if instances != nil {
 		t.Fatalf("expected nil workload labels, got: %v", instances)
-	}
-}
-
-func TestGetProxyServiceInstancesError(t *testing.T) {
-	aggregateCtl := buildMockController()
-
-	discovery1.GetProxyServiceInstancesError = errors.New("mock GetProxyServiceInstances() error")
-
-	// Get Instances from client with error
-	instances, err := aggregateCtl.GetProxyServiceInstances(&model.Proxy{IPAddresses: []string{mock.HelloInstanceV0}})
-	if err == nil {
-		t.Fatal("Aggregate controller should return error if one discovery client experiences " +
-			"error and no instances are found")
-	}
-	if len(instances) != 0 {
-		t.Fatal("GetProxyServiceInstances() should return no instances is client experiences error")
-	}
-
-	// Get Instances from client without error
-	instances, err = aggregateCtl.GetProxyServiceInstances(&model.Proxy{IPAddresses: []string{mock.MakeIP(mock.WorldService, 1)}})
-	if err != nil {
-		t.Fatal("Aggregate controller should not return error if instances are found")
-	}
-	if len(instances) != 6 {
-		t.Fatalf("Returned GetProxyServiceInstances' amount %d is not correct", len(instances))
-	}
-	for _, inst := range instances {
-		if inst.Service.Hostname != mock.WorldService.Hostname {
-			t.Fatal("Returned Instance is incorrect")
-		}
 	}
 }
 
@@ -319,12 +269,7 @@ func TestInstances(t *testing.T) {
 	aggregateCtl := buildMockController()
 
 	// Get Instances from mockAdapter1
-	instances, err := aggregateCtl.InstancesByPort(mock.HelloService,
-		80,
-		labels.Collection{})
-	if err != nil {
-		t.Fatalf("Instances() encountered unexpected error: %v", err)
-	}
+	instances := aggregateCtl.InstancesByPort(mock.HelloService, 80, nil)
 	if len(instances) != 2 {
 		t.Fatal("Returned wrong number of instances from controller")
 	}
@@ -338,12 +283,7 @@ func TestInstances(t *testing.T) {
 	}
 
 	// Get Instances from mockAdapter2
-	instances, err = aggregateCtl.InstancesByPort(mock.WorldService,
-		80,
-		labels.Collection{})
-	if err != nil {
-		t.Fatalf("Instances() encountered unexpected error: %v", err)
-	}
+	instances = aggregateCtl.InstancesByPort(mock.WorldService, 80, nil)
 	if len(instances) != 2 {
 		t.Fatal("Returned wrong number of instances from controller")
 	}
@@ -353,177 +293,218 @@ func TestInstances(t *testing.T) {
 		}
 		if _, ok := instance.Service.Ports.Get(mock.PortHTTPName); !ok {
 			t.Fatal("Returned instance does not contain desired port")
-		}
-	}
-}
-
-func TestInstancesError(t *testing.T) {
-	aggregateCtl := buildMockController()
-
-	discovery1.InstancesError = errors.New("mock Instances() error")
-
-	// Get Instances from client with error
-	instances, err := aggregateCtl.InstancesByPort(mock.HelloService,
-		80,
-		labels.Collection{})
-	if err == nil {
-		t.Fatal("Aggregate controller should return error if one discovery client experiences " +
-			"error and no instances are found")
-	}
-	if len(instances) != 0 {
-		t.Fatal("Returned wrong number of instances from controller")
-	}
-
-	// Get Instances from client without error
-	instances, err = aggregateCtl.InstancesByPort(mock.WorldService,
-		80,
-		labels.Collection{})
-	if err != nil {
-		t.Fatalf("Instances() should not return error is instances are found: %v", err)
-	}
-	if len(instances) != 2 {
-		t.Fatal("Returned wrong number of instances from controller")
-	}
-	for _, instance := range instances {
-		if instance.Service.Hostname != mock.WorldService.Hostname {
-			t.Fatal("Returned instance's hostname does not match desired value")
-		}
-		if _, ok := instance.Service.Ports.Get(mock.PortHTTPName); !ok {
-			t.Fatal("Returned instance does not contain desired port")
-		}
-	}
-}
-
-func TestGetIstioServiceAccounts(t *testing.T) {
-	aggregateCtl := buildMockController()
-
-	// Get accounts from mockAdapter1
-	accounts := aggregateCtl.GetIstioServiceAccounts(mock.HelloService, []int{})
-	expected := make([]string, 0)
-
-	if len(accounts) != len(expected) {
-		t.Fatal("Incorrect account result returned")
-	}
-
-	for i := 0; i < len(accounts); i++ {
-		if accounts[i] != expected[i] {
-			t.Fatal("Returned account result does not match expected one")
-		}
-	}
-
-	// Get accounts from mockAdapter2
-	accounts = aggregateCtl.GetIstioServiceAccounts(mock.WorldService, []int{})
-	expected = []string{
-		"spiffe://cluster.local/ns/default/sa/serviceaccount1",
-		"spiffe://cluster.local/ns/default/sa/serviceaccount2",
-	}
-
-	if len(accounts) != len(expected) {
-		t.Fatal("Incorrect account result returned")
-	}
-
-	for i := 0; i < len(accounts); i++ {
-		if accounts[i] != expected[i] {
-			t.Fatal("Returned account result does not match expected one", accounts[i], expected[i])
 		}
 	}
 }
 
 func TestAddRegistry(t *testing.T) {
-
 	registries := []serviceregistry.Simple{
 		{
-			ProviderID: "registry1",
-			ClusterID:  "cluster1",
+			ProviderID:       "registry1",
+			ClusterID:        "cluster1",
+			Controller:       &mock.Controller{},
+			ServiceDiscovery: memory.NewServiceDiscovery(),
 		},
 		{
-			ProviderID: "registry2",
-			ClusterID:  "cluster2",
+			ProviderID:       "registry2",
+			ClusterID:        "cluster2",
+			Controller:       &mock.Controller{},
+			ServiceDiscovery: memory.NewServiceDiscovery(),
 		},
 	}
-	ctrl := NewController()
+	ctrl := NewController(Options{})
+
+	registry1Counter := atomic.NewInt32(0)
+	registry2Counter := atomic.NewInt32(0)
+
 	for _, r := range registries {
+		clusterID := r.Cluster()
+		counter := registry1Counter
+		if clusterID == "cluster2" {
+			counter = registry2Counter
+		}
+		ctrl.AppendServiceHandlerForCluster(clusterID, func(service *model.Service, event model.Event) {
+			counter.Add(1)
+		})
 		ctrl.AddRegistry(r)
 	}
 	if l := len(ctrl.registries); l != 2 {
 		t.Fatalf("Expected length of the registries slice should be 2, got %d", l)
 	}
-}
 
-func TestDeleteRegistry(t *testing.T) {
-	registries := []serviceregistry.Simple{
-		{
-			ProviderID: "registry1",
-			ClusterID:  "cluster1",
-		},
-		{
-			ProviderID: "registry2",
-			ClusterID:  "cluster2",
-		},
+	registries[0].Controller.(*mock.Controller).OnServiceEvent(mock.HelloService, model.EventAdd)
+	registries[1].Controller.(*mock.Controller).OnServiceEvent(mock.WorldService, model.EventAdd)
+
+	ctrl.DeleteRegistry(registries[1].Cluster(), registries[1].Provider())
+	ctrl.UnRegisterHandlersForCluster(registries[1].Cluster())
+	registries[0].Controller.(*mock.Controller).OnServiceEvent(mock.HelloService, model.EventAdd)
+
+	if registry1Counter.Load() != 3 {
+		t.Errorf("cluster1 expected 3 event, but got %d", registry1Counter.Load())
 	}
-	ctrl := NewController()
-	for _, r := range registries {
-		ctrl.AddRegistry(r)
-	}
-	ctrl.DeleteRegistry(registries[0].ClusterID)
-	if l := len(ctrl.registries); l != 1 {
-		t.Fatalf("Expected length of the registries slice should be 1, got %d", l)
+	if registry2Counter.Load() != 2 {
+		t.Errorf("cluster2 expected 2 event, but got %d", registry2Counter.Load())
 	}
 }
 
-func TestGetRegistries(t *testing.T) {
+func TestGetDeleteRegistry(t *testing.T) {
 	registries := []serviceregistry.Simple{
 		{
-			ProviderID: "registry1",
-			ClusterID:  "cluster1",
+			ProviderID:       "registry1",
+			ClusterID:        "cluster1",
+			Controller:       &mock.Controller{},
+			ServiceDiscovery: memory.NewServiceDiscovery(),
 		},
 		{
-			ProviderID: "registry2",
-			ClusterID:  "cluster2",
+			ProviderID:       "registry2",
+			ClusterID:        "cluster2",
+			Controller:       &mock.Controller{},
+			ServiceDiscovery: memory.NewServiceDiscovery(),
+		},
+		{
+			ProviderID:       "registry3",
+			ClusterID:        "cluster3",
+			Controller:       &mock.Controller{},
+			ServiceDiscovery: memory.NewServiceDiscovery(),
 		},
 	}
-	ctrl := NewController()
+	wrapRegistry := func(r serviceregistry.Instance) serviceregistry.Instance {
+		return &registryEntry{Instance: r}
+	}
+
+	ctrl := NewController(Options{})
 	for _, r := range registries {
 		ctrl.AddRegistry(r)
 	}
+
+	// Test Get
 	result := ctrl.GetRegistries()
-	if len(ctrl.registries) != len(result) {
-		t.Fatal("Length of the original registries slice does not match to returned by GetRegistries.")
+	if l := len(result); l != 3 {
+		t.Fatalf("Expected length of the registries slice should be 3, got %d", l)
 	}
 
-	for i := range result {
-		if !reflect.DeepEqual(result[i], ctrl.registries[i]) {
-			t.Fatal("The original registries slice and resulting slice supposed to be identical.")
-		}
+	// Test Delete cluster2
+	ctrl.DeleteRegistry(registries[1].ClusterID, registries[1].ProviderID)
+	result = ctrl.GetRegistries()
+	if l := len(result); l != 2 {
+		t.Fatalf("Expected length of the registries slice should be 2, got %d", l)
+	}
+	// check left registries are orders as before
+	if !reflect.DeepEqual(result[0], wrapRegistry(registries[0])) || !reflect.DeepEqual(result[1], wrapRegistry(registries[2])) {
+		t.Fatalf("Expected registries order has been changed")
 	}
 }
 
 func TestSkipSearchingRegistryForProxy(t *testing.T) {
-	cases := []struct {
-		node     string
-		registry string
-		self     string
-		want     bool
-	}{
-		{"main", "remote", "main", true},
-		{"remote", "main", "main", true},
-		{"remote", "Kubernetes", "main", true},
+	cluster1 := serviceregistry.Simple{
+		ClusterID:        "cluster-1",
+		ProviderID:       provider.Kubernetes,
+		Controller:       &mock.Controller{},
+		ServiceDiscovery: memory.NewServiceDiscovery(),
+	}
+	cluster2 := serviceregistry.Simple{
+		ClusterID:        "cluster-2",
+		ProviderID:       provider.Kubernetes,
+		Controller:       &mock.Controller{},
+		ServiceDiscovery: memory.NewServiceDiscovery(),
+	}
+	// external registries may eventually be associated with a cluster
+	external := serviceregistry.Simple{
+		ClusterID:        "cluster-1",
+		ProviderID:       provider.External,
+		Controller:       &mock.Controller{},
+		ServiceDiscovery: memory.NewServiceDiscovery(),
+	}
 
-		{"main", "Kubernetes", "main", false},
-		{"main", "main", "main", false},
-		{"remote", "remote", "main", false},
-		{"", "main", "main", false},
-		{"main", "", "main", false},
-		{"main", "Kubernetes", "", false},
-		{"", "", "", false},
+	cases := []struct {
+		nodeClusterID cluster.ID
+		registry      serviceregistry.Instance
+		want          bool
+	}{
+		// matching kube registry
+		{"cluster-1", cluster1, false},
+		// unmatching kube registry
+		{"cluster-1", cluster2, true},
+		// always search external
+		{"cluster-1", external, false},
+		{"cluster-2", external, false},
+		{"", external, false},
+		// always search for empty node cluster id
+		{"", cluster1, false},
+		{"", cluster2, false},
+		{"", external, false},
 	}
 
 	for i, c := range cases {
-		got := skipSearchingRegistryForProxy(c.node, c.registry, c.self)
+		got := skipSearchingRegistryForProxy(c.nodeClusterID, c.registry)
 		if got != c.want {
 			t.Errorf("%s: got %v want %v",
-				fmt.Sprintf("[%v] registry=%v node=%v", i, c.registry, c.node),
+				fmt.Sprintf("[%v] registry=%v node=%v", i, c.registry, c.nodeClusterID),
 				got, c.want)
 		}
 	}
+}
+
+func runnableRegistry(name string) *RunnableRegistry {
+	return &RunnableRegistry{
+		Instance: serviceregistry.Simple{
+			ClusterID: cluster.ID(name), ProviderID: "test",
+			Controller:       &mock.Controller{},
+			ServiceDiscovery: memory.NewServiceDiscovery(),
+		},
+		running: atomic.NewBool(false),
+	}
+}
+
+type RunnableRegistry struct {
+	serviceregistry.Instance
+	running *atomic.Bool
+}
+
+func (rr *RunnableRegistry) Run(stop <-chan struct{}) {
+	if rr.running.Load() {
+		panic("--- registry has been run twice ---")
+	}
+	rr.running.Store(true)
+	<-stop
+}
+
+func expectRunningOrFail(t *testing.T, ctrl *Controller, want bool) {
+	// running gets flipped in a goroutine, retry to avoid race
+	retry.UntilSuccessOrFail(t, func() error {
+		for _, registry := range ctrl.registries {
+			if running := registry.Instance.(*RunnableRegistry).running.Load(); running != want {
+				return fmt.Errorf("%s running is %v but wanted %v", registry.Cluster(), running, want)
+			}
+		}
+		return nil
+	}, retry.Timeout(50*time.Millisecond), retry.Delay(0))
+}
+
+func TestDeferredRun(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+	ctrl := NewController(Options{})
+
+	t.Run("AddRegistry before aggregate Run does not run", func(t *testing.T) {
+		ctrl.AddRegistry(runnableRegistry("earlyAdd"))
+		ctrl.AddRegistryAndRun(runnableRegistry("earlyAddAndRun"), nil)
+		expectRunningOrFail(t, ctrl, false)
+	})
+	t.Run("aggregate Run starts all registries", func(t *testing.T) {
+		go ctrl.Run(stop)
+		expectRunningOrFail(t, ctrl, true)
+		ctrl.DeleteRegistry("earlyAdd", "test")
+		ctrl.DeleteRegistry("earlyAddAndRun", "test")
+	})
+	t.Run("AddRegistry after aggregate Run does not start registry", func(t *testing.T) {
+		ctrl.AddRegistry(runnableRegistry("missed"))
+		expectRunningOrFail(t, ctrl, false)
+		ctrl.DeleteRegistry("missed", "test")
+		expectRunningOrFail(t, ctrl, true)
+	})
+	t.Run("AddRegistryAndRun after aggregate Run starts registry", func(t *testing.T) {
+		ctrl.AddRegistryAndRun(runnableRegistry("late"), nil)
+		expectRunningOrFail(t, ctrl, true)
+	})
 }

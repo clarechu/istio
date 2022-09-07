@@ -43,7 +43,7 @@ func determineLocalHostIPString(t *testing.T) string {
 }
 
 func MockLookupIPAddr(_ context.Context, _ string) ([]net.IPAddr, error) {
-	var ret = []net.IPAddr{
+	ret := []net.IPAddr{
 		{IP: net.ParseIP("2001:db8::68")},
 		{IP: net.IPv4(1, 2, 3, 4)},
 		{IP: net.IPv4(1, 2, 3, 5)},
@@ -52,15 +52,16 @@ func MockLookupIPAddr(_ context.Context, _ string) ([]net.IPAddr, error) {
 }
 
 func MockLookupIPAddrIPv6(_ context.Context, _ string) ([]net.IPAddr, error) {
-	var ret = []net.IPAddr{
+	ret := []net.IPAddr{
 		{IP: net.ParseIP("2001:db8::68")},
 	}
 	return ret, nil
 }
+
 func TestResolveAddr(t *testing.T) {
 	localIP := determineLocalHostIPString(t)
 
-	var testCases = []struct {
+	testCases := []struct {
 		name     string
 		input    string
 		expected string
@@ -178,6 +179,106 @@ func TestResolveAddr(t *testing.T) {
 			} else if actual != tc.expected {
 				t.Errorf("[%s] expected address %q, got %q", tc.name, tc.expected, actual)
 			}
+		}
+	}
+}
+
+func TestAllIPv6(t *testing.T) {
+	tests := []struct {
+		name     string
+		addrs    []string
+		expected bool
+	}{
+		{
+			name:     "ipv4 only",
+			addrs:    []string{"1.1.1.1", "127.0.0.1", "2.2.2.2"},
+			expected: false,
+		},
+		{
+			name:     "ipv6 only",
+			addrs:    []string{"1111:2222::1", "::1", "2222:3333::1"},
+			expected: true,
+		},
+		{
+			name:     "mixed ipv4 and ipv6",
+			addrs:    []string{"1111:2222::1", "::1", "127.0.0.1", "2.2.2.2", "2222:3333::1"},
+			expected: false,
+		},
+		{
+			name:     "test for invalid ip address",
+			addrs:    []string{"invalidip"},
+			expected: true,
+		},
+	}
+	for _, tt := range tests {
+		result := AllIPv6(tt.addrs)
+		if result != tt.expected {
+			t.Errorf("Test %s failed, expected: %t got: %t", tt.name, tt.expected, result)
+		}
+	}
+}
+
+func TestAllIPv4(t *testing.T) {
+	tests := []struct {
+		name     string
+		addrs    []string
+		expected bool
+	}{
+		{
+			name:     "ipv4 only",
+			addrs:    []string{"1.1.1.1", "127.0.0.1", "2.2.2.2"},
+			expected: true,
+		},
+		{
+			name:     "ipv6 only",
+			addrs:    []string{"1111:2222::1", "::1", "2222:3333::1"},
+			expected: false,
+		},
+		{
+			name:     "mixed ipv4 and ipv6",
+			addrs:    []string{"1111:2222::1", "::1", "127.0.0.1", "2.2.2.2", "2222:3333::1"},
+			expected: false,
+		},
+		{
+			name:     "test for invalid ip address",
+			addrs:    []string{"invalidip"},
+			expected: true,
+		},
+	}
+	for _, tt := range tests {
+		result := AllIPv4(tt.addrs)
+		if result != tt.expected {
+			t.Errorf("Test %s failed, expected: %t got: %t", tt.name, tt.expected, result)
+		}
+	}
+}
+
+func TestGlobalUnicastIP(t *testing.T) {
+	tests := []struct {
+		name     string
+		addrs    []string
+		expected string
+	}{
+		{
+			name:     "test for globalunicastip",
+			addrs:    []string{"127.0.0.1", "1.1.1.1"},
+			expected: "1.1.1.1",
+		},
+		{
+			name:     "test for empty value",
+			addrs:    []string{},
+			expected: "",
+		},
+		{
+			name:     "test for invalid ip address",
+			addrs:    []string{"invalidip"},
+			expected: "",
+		},
+	}
+	for _, tt := range tests {
+		result := GlobalUnicastIP(tt.addrs)
+		if result != tt.expected {
+			t.Errorf("Test %s failed, expected: %v got: %v", tt.name, tt.expected, result)
 		}
 	}
 }

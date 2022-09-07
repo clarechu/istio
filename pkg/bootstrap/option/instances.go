@@ -15,19 +15,20 @@
 package option
 
 import (
-	"net"
+	"strings"
 
-	"github.com/gogo/protobuf/types"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	meshAPI "istio.io/api/mesh/v1alpha1"
 	networkingAPI "istio.io/api/networking/v1alpha3"
-
 	"istio.io/istio/pilot/pkg/model"
 )
 
-type LocalhostValue string
-type WildcardValue string
-type DNSLookupFamilyValue string
+type (
+	LocalhostValue       string
+	WildcardValue        string
+	DNSLookupFamilyValue string
+)
 
 const (
 	LocalhostIPv4       LocalhostValue       = "127.0.0.1"
@@ -38,7 +39,7 @@ const (
 	DNSLookupFamilyIPv6 DNSLookupFamilyValue = "AUTO"
 )
 
-func ProxyConfig(value *meshAPI.ProxyConfig) Instance {
+func ProxyConfig(value *model.NodeMetaProxyConfig) Instance {
 	return newOption("config", value)
 }
 
@@ -46,7 +47,7 @@ func PilotSubjectAltName(value []string) Instance {
 	return newOption("pilot_SAN", value).withConvert(sanConverter(value))
 }
 
-func ConnectTimeout(value *types.Duration) Instance {
+func ConnectTimeout(value *durationpb.Duration) Instance {
 	return newDurationOption("connect_timeout", value)
 }
 
@@ -56,6 +57,15 @@ func Cluster(value string) Instance {
 
 func NodeID(value string) Instance {
 	return newOption("nodeID", value)
+}
+
+func NodeType(value string) Instance {
+	ntype := strings.Split(value, "~")[0]
+	return newOption("nodeType", ntype)
+}
+
+func XdsType(value string) Instance {
+	return newOption("xds_type", value)
 }
 
 func Region(value string) Instance {
@@ -70,12 +80,20 @@ func SubZone(value string) Instance {
 	return newOptionOrSkipIfZero("sub_zone", value)
 }
 
-func NodeMetadata(meta *model.BootstrapNodeMetadata, rawMeta map[string]interface{}) Instance {
+func NodeMetadata(meta *model.BootstrapNodeMetadata, rawMeta map[string]any) Instance {
 	return newOptionOrSkipIfZero("meta_json_str", meta).withConvert(nodeMetadataConverter(meta, rawMeta))
+}
+
+func RuntimeFlags(flags map[string]string) Instance {
+	return newOptionOrSkipIfZero("runtime_flags", flags).withConvert(jsonConverter(flags))
 }
 
 func DiscoveryAddress(value string) Instance {
 	return newOption("discovery_address", value)
+}
+
+func XDSRootCert(value string) Instance {
+	return newOption("xds_root_cert", value)
 }
 
 func Localhost(value LocalhostValue) Instance {
@@ -90,34 +108,6 @@ func DNSLookupFamily(value DNSLookupFamilyValue) Instance {
 	return newOption("dns_lookup_family", value)
 }
 
-func PodName(value string) Instance {
-	return newOptionOrSkipIfZero("PodName", value)
-}
-
-func PodNamespace(value string) Instance {
-	return newOptionOrSkipIfZero("PodNamespace", value)
-}
-
-func PodIP(value net.IP) Instance {
-	return newOption("PodIP", value).withConvert(podIPConverter(value))
-}
-
-func ControlPlaneAuth(value bool) Instance {
-	strVal := ""
-	if value {
-		strVal = "enable"
-	}
-	return newOptionOrSkipIfZero("ControlPlaneAuth", strVal)
-}
-
-func DisableReportCalls(value bool) Instance {
-	strVal := ""
-	if value {
-		strVal = "true"
-	}
-	return newOptionOrSkipIfZero("DisableReportCalls", strVal)
-}
-
 func OutlierLogPath(value string) Instance {
 	return newOptionOrSkipIfZero("outlier_log_path", value)
 }
@@ -128,6 +118,15 @@ func LightstepAddress(value string) Instance {
 
 func LightstepToken(value string) Instance {
 	return newOption("lightstepToken", value)
+}
+
+func OpenCensusAgentAddress(value string) Instance {
+	return newOptionOrSkipIfZero("openCensusAgent", value)
+}
+
+func OpenCensusAgentContexts(value []meshAPI.Tracing_OpenCensusAgent_TraceContext) Instance {
+	return newOption("openCensusAgentContexts", value).
+		withConvert(openCensusAgentContextConverter(value))
 }
 
 func StackDriverEnabled(value bool) Instance {
@@ -217,8 +216,12 @@ func EnvoyStatsMatcherInclusionRegexp(value []string) Instance {
 	return newStringArrayOptionOrSkipIfEmpty("inclusionRegexps", value)
 }
 
-func PilotCertProvider(value string) Instance {
-	return newOption("pilot_cert_provider", value)
+func EnvoyStatusPort(value int) Instance {
+	return newOption("envoy_status_port", value)
+}
+
+func EnvoyPrometheusPort(value int) Instance {
+	return newOption("envoy_prometheus_port", value)
 }
 
 func STSPort(value int) Instance {
@@ -227,6 +230,14 @@ func STSPort(value int) Instance {
 
 func GCPProjectID(value string) Instance {
 	return newOption("gcp_project_id", value)
+}
+
+func GCPProjectNumber(value string) Instance {
+	return newOption("gcp_project_number", value)
+}
+
+func Metadata(meta *model.BootstrapNodeMetadata) Instance {
+	return newOption("metadata", meta)
 }
 
 func STSEnabled(value bool) Instance {

@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 //  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,15 +33,13 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// nolint: staticcheck
 	framework.
 		NewSuite(m).
+		RequireSingleCluster().
 		Skip("https://github.com/istio/istio/issues/17933").
 		Label(label.CustomSetup).
-
-		// SDS requires Kubernetes 1.13
-		RequireEnvironmentVersion("1.13").
-		RequireSingleCluster().
-		Setup(istio.Setup(&inst, setupConfig)).
+		Setup(istio.Setup(&inst, nil)).
 		Setup(func(ctx resource.Context) (err error) {
 			if prom, err = prometheus.New(ctx, prometheus.Config{}); err != nil {
 				return err
@@ -46,17 +47,4 @@ func TestMain(m *testing.M) {
 			return nil
 		}).
 		Run()
-
-}
-
-func setupConfig(cfg *istio.Config) {
-	if cfg == nil {
-		return
-	}
-	cfg.ControlPlaneValues = `
-components:
-  gateways:
-    istio-egressgateway:
-      enabled: true
-`
 }

@@ -16,34 +16,34 @@ package istioctl
 
 import (
 	"fmt"
-	"testing"
 
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/resource"
 )
 
 // Instance represents "istioctl"
 type Instance interface {
-	// WaitForConfigs will wait until all passed in config has been distributed
-	WaitForConfigs(defaultNamespace string, configs string) error
+	// WaitForConfig will wait until all passed in config has been distributed
+	WaitForConfig(defaultNamespace string, configs string) error
 
 	// Invoke invokes an istioctl command and returns the output and exception.
 	// stdout and stderr will be returned as different strings
 	Invoke(args []string) (string, string, error)
 
 	// InvokeOrFail calls Invoke and fails tests if it returns en err
-	InvokeOrFail(t *testing.T, args []string) (string, string)
+	InvokeOrFail(t test.Failer, args []string) (string, string)
 }
 
 // Config is structured config for the istioctl component
 type Config struct {
 	// Cluster to be used in a multicluster environment
-	Cluster resource.Cluster
+	Cluster cluster.Cluster
 }
 
 // New returns a new instance of "istioctl".
 func New(ctx resource.Context, cfg Config) (i Instance, err error) {
-	return newKube(ctx, cfg), nil
+	return newKube(ctx, cfg)
 }
 
 // NewOrFail returns a new instance of "istioctl".

@@ -15,17 +15,33 @@
 package endpoint
 
 import (
-	"bytes"
 	"crypto/tls"
-	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"time"
 
-	"istio.io/istio/pkg/test/echo/common/response"
+	"istio.io/pkg/log"
 )
 
-func listenOnPort(port int) (net.Listener, int, error) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+var epLog = log.RegisterScope("endpoint", "echo serverside", 0)
+
+const (
+	requestTimeout = 15 * time.Second
+	idleTimeout    = 5 * time.Second
+)
+
+func listenOnAddress(ip string, port int) (net.Listener, int, error) {
+	parsedIP := net.ParseIP(ip)
+	ipBind := "tcp"
+	if parsedIP != nil {
+		if parsedIP.To4() == nil && parsedIP.To16() != nil {
+			ipBind = "tcp6"
+		} else if parsedIP.To4() != nil {
+			ipBind = "tcp4"
+		}
+	}
+	ln, err := net.Listen(ipBind, net.JoinHostPort(ip, strconv.Itoa(port)))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -34,12 +50,20 @@ func listenOnPort(port int) (net.Listener, int, error) {
 	return ln, port, nil
 }
 
-func listenOnPortTLS(port int, cfg *tls.Config) (net.Listener, int, error) {
-	ln, err := tls.Listen("tcp", fmt.Sprintf(":%d", port), cfg)
+func listenOnAddressTLS(ip string, port int, cfg *tls.Config) (net.Listener, int, error) {
+	ipBind := "tcp"
+	parsedIP := net.ParseIP(ip)
+	if parsedIP != nil {
+		if parsedIP.To4() == nil && parsedIP.To16() != nil {
+			ipBind = "tcp6"
+		} else if parsedIP.To4() != nil {
+			ipBind = "tcp4"
+		}
+	}
+	ln, err := tls.Listen(ipBind, net.JoinHostPort(ip, strconv.Itoa(port)), cfg)
 	if err != nil {
 		return nil, 0, err
 	}
-
 	port = ln.Addr().(*net.TCPAddr).Port
 	return ln, port, nil
 }
@@ -54,7 +78,11 @@ func listenOnUDS(uds string) (net.Listener, error) {
 	return ln, nil
 }
 
-// nolint: interfacer
-func writeField(out *bytes.Buffer, field response.Field, value string) {
-	_, _ = out.WriteString(string(field) + "=" + value + "\n")
+// forceClose the given socket.
+func forceClose(conn net.Conn) error {
+	// Close may be called more than once.
+	defer func() { _ = conn.Close() }()
+
+	// Force the connection closed (should result in sending RST)
+	return conn.(*net.TCPConn).SetLinger(0)
 }

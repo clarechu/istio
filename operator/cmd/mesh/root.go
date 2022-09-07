@@ -20,38 +20,52 @@ import (
 	"github.com/spf13/cobra"
 
 	binversion "istio.io/istio/operator/version"
+	"istio.io/istio/pkg/url"
 	"istio.io/pkg/log"
 	"istio.io/pkg/version"
 )
 
-const (
-	baseVersion    = binversion.OperatorCodeBaseVersion
-	releaseURL     = `https://github.com/istio/istio/releases/download/` + baseVersion + `/istio-` + baseVersion + `-linux-amd64.tar.gz`
+var (
+	baseVersion    = binversion.OperatorVersionString
 	setFlagHelpStr = `Override an IstioOperator value, e.g. to choose a profile
-(--set profile=demo), enable or disable components (--set components.policy.enabled=true), or override Istio
-settings (--set values.grafana.enabled=true). See documentation for more info:
-https://istio.io/docs/reference/config/istio.operator.v1alpha1/#IstioOperatorSpec`
+(--set profile=demo), enable or disable components (--set components.cni.enabled=true), or override Istio
+settings (--set meshConfig.enableTracing=true). See documentation for more info:` + url.IstioOperatorSpec
 	// ManifestsFlagHelpStr is the command line description for --manifests
 	ManifestsFlagHelpStr = `Specify a path to a directory of charts and profiles
 (e.g. ~/Downloads/istio-` + baseVersion + `/manifests)
-or release tar URL (e.g. ` + releaseURL + `).
+or release tar URL (e.g. ` + url.ReleaseTar + `).
 `
+)
+
+const (
 	ChartsDeprecatedStr         = "Deprecated, use --manifests instead."
+	ControlPlaneRevStr          = "Control plane revision"
 	revisionFlagHelpStr         = `Target control plane revision for the command.`
-	skipConfirmationFlagHelpStr = `skipConfirmation determines whether the user is prompted for confirmation.
+	skipConfirmationFlagHelpStr = `The skipConfirmation determines whether the user is prompted for confirmation.
 If set to true, the user is not prompted and a Yes response is assumed in all cases.`
 	filenameFlagHelpStr = `Path to file containing IstioOperator custom resource
 This flag can be specified multiple times to overlay multiple files. Multiple files are overlaid in left to right order.`
 	installationCompleteStr = `Installation complete`
+	ForceFlagHelpStr        = `Proceed even with validation errors.`
+	KubeConfigFlagHelpStr   = `Path to kube config.`
+	ContextFlagHelpStr      = `The name of the kubeconfig context to use.`
+	HubFlagHelpStr          = `The hub for the operator controller image.`
+	TagFlagHelpStr          = `The tag for the operator controller image.`
+	ImagePullSecretsHelpStr = `The imagePullSecrets are used to pull the operator image from the private registry,
+could be secret list separated by comma, eg. '--imagePullSecrets imagePullSecret1,imagePullSecret2'`
+	OperatorNamespaceHelpstr = `The namespace the operator controller is installed into.`
+	OperatorRevFlagHelpStr   = `Target revision for the operator.`
+	ComponentFlagHelpStr     = "Specify which component to generate manifests for."
+	VerifyCRInstallHelpStr   = "Verify the Istio control plane after installation/in-place upgrade"
 )
 
-type rootArgs struct {
-	// Dry run performs all steps except actually applying the manifests or creating output dirs/files.
-	dryRun bool
+type RootArgs struct {
+	// DryRun performs all steps except actually applying the manifests or creating output dirs/files.
+	DryRun bool
 }
 
-func addFlags(cmd *cobra.Command, rootArgs *rootArgs) {
-	cmd.PersistentFlags().BoolVarP(&rootArgs.dryRun, "dry-run", "",
+func addFlags(cmd *cobra.Command, rootArgs *RootArgs) {
+	cmd.PersistentFlags().BoolVarP(&rootArgs.DryRun, "dry-run", "",
 		false, "Console/log output only, make no changes.")
 }
 
@@ -68,12 +82,11 @@ func GetRootCmd(args []string) *cobra.Command {
 	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
 	rootCmd.AddCommand(ManifestCmd(log.DefaultOptions()))
-	rootCmd.AddCommand(ProfileCmd())
+	rootCmd.AddCommand(InstallCmd(log.DefaultOptions()))
+	rootCmd.AddCommand(ProfileCmd(log.DefaultOptions()))
 	rootCmd.AddCommand(OperatorCmd())
 	rootCmd.AddCommand(version.CobraCommand())
-	rootCmd.AddCommand(UpgradeCmd())
-
-	version.Info.Version = binversion.OperatorVersionString
+	rootCmd.AddCommand(UpgradeCmd(log.DefaultOptions()))
 
 	return rootCmd
 }

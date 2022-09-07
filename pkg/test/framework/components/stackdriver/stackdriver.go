@@ -20,7 +20,8 @@ import (
 	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
 
 	"istio.io/istio/pkg/test"
-	edgespb "istio.io/istio/pkg/test/framework/components/stackdriver/edges"
+	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/resource"
 )
 
@@ -29,24 +30,26 @@ type Instance interface {
 	Address() string
 	// Gets the namespace in which stackdriver is deployed.
 	GetStackdriverNamespace() string
-	ListTimeSeries() ([]*monitoringpb.TimeSeries, error)
-	ListLogEntries() ([]*loggingpb.LogEntry, error)
-	ListTrafficAssertions() ([]*edgespb.TrafficAssertion, error)
-	ListTraces() ([]*cloudtracepb.Trace, error)
+	ListTimeSeries(namespace, project string) ([]*monitoringpb.TimeSeries, error)
+	ListLogEntries(lt LogType, namespace, project string) ([]*loggingpb.LogEntry, error)
+	ListTraces(namespace, project string) ([]*cloudtracepb.Trace, error)
 }
 
 type Config struct {
 	// Cluster to be used in a multicluster environment
-	Cluster resource.Cluster
+	Cluster cluster.Cluster
 }
 
 // New returns a new instance of stackdriver.
 func New(ctx resource.Context, c Config) (i Instance, err error) {
+	if UseRealStackdriver() {
+		return newRealStackdriver(ctx, c)
+	}
 	return newKube(ctx, c)
 }
 
 // NewOrFail returns a new Stackdriver instance or fails test.
-func NewOrFail(t test.Failer, ctx resource.Context, c Config) Instance {
+func NewOrFail(t test.Failer, ctx resource.Context, c Config, realSD bool) Instance {
 	t.Helper()
 	i, err := New(ctx, c)
 	if err != nil {
@@ -54,4 +57,10 @@ func NewOrFail(t test.Failer, ctx resource.Context, c Config) Instance {
 	}
 
 	return i
+}
+
+func UseRealStackdriver() bool {
+	// If the framework requests a real backend, honor that request. It is possible
+	// to configure the CA to generate GCP credentials off-GCP.
+	return framework.UseRealStackdriver
 }

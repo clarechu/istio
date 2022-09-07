@@ -21,6 +21,7 @@ metadata:
   name: liveness
   labels:
     app: liveness
+    service: liveness
 spec:
   ports:
   - port: 80
@@ -43,7 +44,7 @@ spec:
     spec:
       containers:
       - name: liveness
-        image: k8s.gcr.io/busybox
+        image: registry.k8s.io/busybox
         args:
         - /bin/sh
         - -c

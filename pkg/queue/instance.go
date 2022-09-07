@@ -18,6 +18,9 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/rand"
+
+	"istio.io/istio/pkg/backoff"
 	"istio.io/pkg/log"
 )
 
@@ -30,32 +33,39 @@ type Instance interface {
 	Push(task Task)
 	// Run the loop until a signal on the channel
 	Run(<-chan struct{})
+
+	// Closed returns a chan that will be signaled when the Instance has stopped processing tasks.
+	Closed() <-chan struct{}
 }
 
 type queueImpl struct {
-	delay time.Duration
-	tasks []Task
-	cond  *sync.Cond
-	// closing indicates whether the queue is being closed
-	closing bool
-
-	mutex sync.RWMutex
-	// closed indicates whether the queue is not run or closed
-	closed bool
+	delay        time.Duration
+	retryBackoff *backoff.ExponentialBackOff
+	tasks        []Task
+	cond         *sync.Cond
+	closing      bool
+	closed       chan struct{}
+	closeOnce    *sync.Once
+	id           string
 }
 
 // NewQueue instantiates a queue with a processing function
 func NewQueue(errorDelay time.Duration) Instance {
+	return NewQueueWithID(errorDelay, rand.String(10))
+}
+
+func NewQueueWithID(errorDelay time.Duration, name string) Instance {
 	return &queueImpl{
-		delay:   errorDelay,
-		tasks:   make([]Task, 0),
-		closing: false,
-		closed:  true,
-		cond:    sync.NewCond(&sync.Mutex{}),
+		delay:     errorDelay,
+		tasks:     make([]Task, 0),
+		closing:   false,
+		closed:    make(chan struct{}),
+		closeOnce: &sync.Once{},
+		cond:      sync.NewCond(&sync.Mutex{}),
+		id:        name,
 	}
 }
 
-// Push enqueues a task
 func (q *queueImpl) Push(item Task) {
 	q.cond.L.Lock()
 	defer q.cond.L.Unlock()
@@ -65,30 +75,57 @@ func (q *queueImpl) Push(item Task) {
 	q.cond.Signal()
 }
 
-// Run start the task handler, which should be in a separate go routine.
-// The queue can be closed via stop channel. However when it is being closed,
-// the left elements in the queue will be processed.
-// Note: The queue can be rerun only after closed.
-func (q *queueImpl) Run(stop <-chan struct{}) {
-	q.mutex.Lock()
-	if !q.closed {
-		q.mutex.Unlock()
-		panic("queue can not be run twice")
-	}
-	q.closed = false
-	q.mutex.Unlock()
+func (q *queueImpl) Closed() <-chan struct{} {
+	return q.closed
+}
 
-	defer func() {
-		q.mutex.Lock()
-		// set closed status
-		q.closed = true
-		q.mutex.Unlock()
-	}()
-
-	// enable rerun the queue
+// get blocks until it can return a task to be processed. If shutdown = true,
+// the processing go routine should stop.
+func (q *queueImpl) get() (task Task, shutdown bool) {
 	q.cond.L.Lock()
-	q.closing = false
-	q.cond.L.Unlock()
+	defer q.cond.L.Unlock()
+	// wait for closing to be set, or a task to be pushed
+	for !q.closing && len(q.tasks) == 0 {
+		q.cond.Wait()
+	}
+
+	if q.closing {
+		// We must be shutting down.
+		return nil, true
+	}
+	task = q.tasks[0]
+	// Slicing will not free the underlying elements of the array, so explicitly clear them out here
+	q.tasks[0] = nil
+	q.tasks = q.tasks[1:]
+	return task, false
+}
+
+func (q *queueImpl) processNextItem() bool {
+	// Wait until there is a new item in the queue
+	task, shuttingdown := q.get()
+	if shuttingdown {
+		return false
+	}
+
+	// Run the task.
+	if err := task(); err != nil {
+		delay := q.delay
+		log.Infof("Work item handle failed (%v), retry after delay %v", err, delay)
+		time.AfterFunc(delay, func() {
+			q.Push(task)
+		})
+	}
+	return true
+}
+
+func (q *queueImpl) Run(stop <-chan struct{}) {
+	log.Debugf("started queue %s", q.id)
+	defer func() {
+		q.closeOnce.Do(func() {
+			log.Debugf("closed queue %s", q.id)
+			close(q.closed)
+		})
+	}()
 	go func() {
 		<-stop
 		q.cond.L.Lock()
@@ -97,6 +134,7 @@ func (q *queueImpl) Run(stop <-chan struct{}) {
 		q.cond.L.Unlock()
 	}()
 
+<<<<<<< HEAD
 	for {
 		q.cond.L.Lock()
 		for !q.closing && len(q.tasks) == 0 {
@@ -120,5 +158,8 @@ func (q *queueImpl) Run(stop <-chan struct{}) {
 				q.Push(task)
 			})
 		}
+=======
+	for q.processNextItem() {
+>>>>>>> 05ba771af6cd839e06483c3157ad910cb664da07
 	}
 }

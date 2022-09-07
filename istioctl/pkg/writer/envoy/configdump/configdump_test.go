@@ -16,12 +16,11 @@ package configdump
 
 import (
 	"bytes"
-	"io/ioutil"
+	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-
 	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 func TestConfigWriter_Prime(t *testing.T) {
@@ -41,7 +40,7 @@ func TestConfigWriter_Prime(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cw := &ConfigWriter{}
-			cd, _ := ioutil.ReadFile(tt.inputFile)
+			cd, _ := os.ReadFile(tt.inputFile)
 			err := cw.Prime(cd)
 			if cw.configDump == nil {
 				if tt.wantConfigs != 0 {
@@ -66,12 +65,11 @@ func TestConfigWriter_PrintBootstrapDump(t *testing.T) {
 		callPrime      bool
 		wantErr        bool
 	}{
-		// TODO: Turn on when protobuf bug is resolved - https://github.com/golang/protobuf/issues/632
-		// {
-		// 	name:           "returns expected bootstrap dump from Envoy onto Stdout",
-		// 	callPrime:      true,
-		// 	wantOutputFile: "testdata/bootstrapdump.json",
-		// },
+		{
+			name:           "returns expected bootstrap dump from Envoy onto Stdout",
+			callPrime:      true,
+			wantOutputFile: "testdata/bootstrapdump.json",
+		},
 		{
 			name:    "errors if config dump is not primed",
 			wantErr: true,
@@ -81,18 +79,56 @@ func TestConfigWriter_PrintBootstrapDump(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			gotOut := &bytes.Buffer{}
 			cw := &ConfigWriter{Stdout: gotOut}
-			cd, _ := ioutil.ReadFile("testdata/configdump.json")
+			cd, _ := os.ReadFile("testdata/configdump.json")
 			if tt.callPrime {
 				cw.Prime(cd)
 			}
-			err := cw.PrintBootstrapDump()
+			err := cw.PrintBootstrapDump("json")
 			if tt.wantOutputFile != "" {
-				util.CompareContent(gotOut.Bytes(), tt.wantOutputFile, t)
+				util.CompareContent(t, gotOut.Bytes(), tt.wantOutputFile)
 			}
 			if err == nil && tt.wantErr {
 				t.Errorf("PrintBootstrapDump (%v) did not produce expected err", tt.name)
 			} else if err != nil && !tt.wantErr {
 				t.Errorf("PrintBootstrapDump (%v) produced unexpected err: %v", tt.name, err)
+			}
+		})
+	}
+}
+
+func TestConfigWriter_PrintVersionSummary(t *testing.T) {
+	tests := []struct {
+		name           string
+		wantOutputFile string
+		callPrime      bool
+		wantErr        bool
+	}{
+		{
+			name:           "returns expected version summary onto Stdout",
+			callPrime:      true,
+			wantOutputFile: "testdata/versionsummary.txt",
+		},
+		{
+			name:    "errors if config dump is not primed",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOut := &bytes.Buffer{}
+			cw := &ConfigWriter{Stdout: gotOut}
+			cd, _ := os.ReadFile("testdata/configdump.json")
+			if tt.callPrime {
+				cw.Prime(cd)
+			}
+			err := cw.PrintVersionSummary()
+			if tt.wantOutputFile != "" {
+				util.CompareContent(t, gotOut.Bytes(), tt.wantOutputFile)
+			}
+			if err == nil && tt.wantErr {
+				t.Errorf("PrintVersionSummary (%v) did not produce expected err", tt.name)
+			} else if err != nil && !tt.wantErr {
+				t.Errorf("PrintVersionSummary (%v) produced unexpected err: %v", tt.name, err)
 			}
 		})
 	}

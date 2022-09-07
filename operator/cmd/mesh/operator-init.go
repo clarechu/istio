@@ -15,6 +15,9 @@
 package mesh
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 
@@ -22,7 +25,10 @@ import (
 	iopv1alpha1 "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/translate"
+	operatorutil "istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/util/clog"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/labels"
 	buildversion "istio.io/pkg/version"
 )
 
@@ -38,58 +44,65 @@ type operatorInitArgs struct {
 	common operatorCommonArgs
 }
 
+// kubeClients is a unit test override variable for client interfaces creation.
+var kubeClients = KubernetesClients
+
 func addOperatorInitFlags(cmd *cobra.Command, args *operatorInitArgs) {
 	hub, tag := buildversion.DockerInfo.Hub, buildversion.DockerInfo.Tag
-	if hub == "" {
-		hub = "gcr.io/istio-testing"
-	}
-	if tag == "" {
-		tag = "latest"
-	}
-	cmd.PersistentFlags().StringVarP(&args.inFilename, "filename", "f", "", "Path to file containing IstioOperator custom resource")
-	cmd.PersistentFlags().StringVarP(&args.kubeConfigPath, "kubeconfig", "c", "", "Path to kube config")
-	cmd.PersistentFlags().StringVar(&args.context, "context", "", "The name of the kubeconfig context to use")
-	cmd.PersistentFlags().StringVar(&args.common.hub, "hub", hub, "The hub for the operator controller image")
-	cmd.PersistentFlags().StringVar(&args.common.tag, "tag", tag, "The tag for the operator controller image")
-	cmd.PersistentFlags().StringVar(&args.common.operatorNamespace, "operatorNamespace", operatorDefaultNamespace,
-		"The namespace the operator controller is installed into")
-	cmd.PersistentFlags().StringVar(&args.common.istioNamespace, "istioNamespace", istioDefaultNamespace,
-		"The namespace Istio is installed into. Deprecated, use '--watchedNamespaces' instead.")
-	cmd.PersistentFlags().StringVar(&args.common.watchedNamespaces, "watchedNamespaces", istioDefaultNamespace,
+
+	cmd.PersistentFlags().StringVarP(&args.inFilename, "filename", "f", "", filenameFlagHelpStr)
+	cmd.PersistentFlags().StringVarP(&args.kubeConfigPath, "kubeconfig", "c", "", KubeConfigFlagHelpStr)
+	cmd.PersistentFlags().StringVar(&args.context, "context", "", ContextFlagHelpStr)
+	cmd.PersistentFlags().StringVar(&args.common.hub, "hub", hub, HubFlagHelpStr)
+	cmd.PersistentFlags().StringVar(&args.common.tag, "tag", tag, TagFlagHelpStr)
+	cmd.PersistentFlags().StringSliceVar(&args.common.imagePullSecrets, "imagePullSecrets", nil, ImagePullSecretsHelpStr)
+	cmd.PersistentFlags().StringVar(&args.common.operatorNamespace, "operatorNamespace", operatorDefaultNamespace, OperatorNamespaceHelpstr)
+	cmd.PersistentFlags().StringVar(&args.common.watchedNamespaces, "watchedNamespaces", constants.IstioSystemNamespace,
 		"The namespaces the operator controller watches, could be namespace list separated by comma, eg. 'ns1,ns2'")
 	cmd.PersistentFlags().StringVarP(&args.common.manifestsPath, "charts", "", "", ChartsDeprecatedStr)
 	cmd.PersistentFlags().StringVarP(&args.common.manifestsPath, "manifests", "d", "", ManifestsFlagHelpStr)
-	cmd.PersistentFlags().StringVarP(&args.common.revision, "revision", "r", "",
-		revisionFlagHelpStr)
+	cmd.PersistentFlags().StringVarP(&args.common.revision, "revision", "r", "", OperatorRevFlagHelpStr)
 }
 
-func operatorInitCmd(rootArgs *rootArgs, oiArgs *operatorInitArgs) *cobra.Command {
+func operatorInitCmd(rootArgs *RootArgs, oiArgs *operatorInitArgs) *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
 		Short: "Installs the Istio operator controller in the cluster.",
 		Long:  "The init subcommand installs the Istio operator controller in the cluster.",
 		Args:  cobra.ExactArgs(0),
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			if !labels.IsDNS1123Label(oiArgs.common.revision) && cmd.PersistentFlags().Changed("revision") {
+				return fmt.Errorf("invalid revision specified: %v", oiArgs.common.revision)
+			}
+			return nil
+		},
 		Run: func(cmd *cobra.Command, args []string) {
 			l := clog.NewConsoleLogger(cmd.OutOrStdout(), cmd.ErrOrStderr(), installerScope)
 			operatorInit(rootArgs, oiArgs, l)
-		}}
+		},
+	}
 }
 
 // operatorInit installs the Istio operator controller into the cluster.
-func operatorInit(args *rootArgs, oiArgs *operatorInitArgs, l clog.Logger) {
+func operatorInit(args *RootArgs, oiArgs *operatorInitArgs, l clog.Logger) {
 	initLogsOrExit(args)
 
-	restConfig, clientset, client, err := K8sConfig(oiArgs.kubeConfigPath, oiArgs.context)
+	kubeClient, client, err := kubeClients(oiArgs.kubeConfigPath, oiArgs.context, l)
 	if err != nil {
 		l.LogAndFatal(err)
 	}
 	// Error here likely indicates Deployment is missing. If some other K8s error, we will hit it again later.
-	already, _ := isControllerInstalled(clientset, oiArgs.common.operatorNamespace, oiArgs.common.revision)
+	already, _ := isControllerInstalled(kubeClient.Kube(), oiArgs.common.operatorNamespace, oiArgs.common.revision)
 	if already {
-		l.LogAndPrintf("Operator controller is already installed in %s namespace, updating.", oiArgs.common.operatorNamespace)
+		l.LogAndPrintf("Operator controller is already installed in %s namespace.", oiArgs.common.operatorNamespace)
+		l.LogAndPrintf("Upgrading operator controller in namespace: %s using image: %s/operator:%s",
+			oiArgs.common.operatorNamespace, oiArgs.common.hub, oiArgs.common.tag)
+	} else {
+		l.LogAndPrintf("Installing operator controller in namespace: %s using image: %s/operator:%s",
+			oiArgs.common.operatorNamespace, oiArgs.common.hub, oiArgs.common.tag)
 	}
 
-	l.LogAndPrintf("Using operator Deployment image: %s/operator:%s", oiArgs.common.hub, oiArgs.common.tag)
+	l.LogAndPrintf("Operator controller will watch namespaces: %s", oiArgs.common.watchedNamespaces)
 
 	vals, mstr, err := renderOperatorManifest(args, &oiArgs.common)
 	if err != nil {
@@ -100,7 +113,7 @@ func operatorInit(args *rootArgs, oiArgs *operatorInitArgs, l clog.Logger) {
 	installerScope.Debugf("Using the following manifest to install operator:\n%s\n", mstr)
 
 	opts := &applyOptions{
-		DryRun:     args.dryRun,
+		DryRun:     args.DryRun,
 		Kubeconfig: oiArgs.kubeConfigPath,
 		Context:    oiArgs.context,
 	}
@@ -119,16 +132,28 @@ func operatorInit(args *rootArgs, oiArgs *operatorInitArgs, l clog.Logger) {
 		}
 	}
 
-	if err := applyManifest(restConfig, client, mstr, name.IstioOperatorComponentName, opts, iop, l); err != nil {
+	if err := operatorutil.CreateNamespace(kubeClient.Kube(), oiArgs.common.operatorNamespace, "", opts.DryRun); err != nil {
+		l.LogAndFatal(err)
+	}
+
+	// create watched namespaces
+	namespaces := strings.Split(oiArgs.common.watchedNamespaces, ",")
+	// if the namespace in the CR is provided, consider creating it too.
+	if istioNamespace != "" {
+		namespaces = append(namespaces, istioNamespace)
+	}
+	for _, ns := range namespaces {
+		if err := operatorutil.CreateNamespace(kubeClient.Kube(), ns, "", opts.DryRun); err != nil {
+			l.LogAndFatal(err)
+		}
+	}
+
+	if err := applyManifest(kubeClient, client, mstr, name.IstioOperatorComponentName, opts, iop, l); err != nil {
 		l.LogAndFatal(err)
 	}
 
 	if customResource != "" {
-		if err := createNamespace(clientset, istioNamespace); err != nil {
-			l.LogAndFatal(err)
-
-		}
-		if err := applyManifest(restConfig, client, customResource, name.IstioOperatorComponentName, opts, iop, l); err != nil {
+		if err := applyManifest(kubeClient, client, customResource, name.IstioOperatorComponentName, opts, iop, l); err != nil {
 			l.LogAndFatal(err)
 		}
 	}

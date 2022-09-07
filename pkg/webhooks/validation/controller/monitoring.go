@@ -20,7 +20,6 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
-
 	kubeMeta "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -28,10 +27,8 @@ const (
 	reason = "reason"
 )
 
-var (
-	// reasonTag holds the error reason for the context.
-	reasonTag tag.Key
-)
+// reasonTag holds the error reason for the context.
+var reasonTag tag.Key
 
 var (
 	metricWebhookConfigurationUpdateError = stats.Int64(

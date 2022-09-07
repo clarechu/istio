@@ -22,11 +22,10 @@ import (
 )
 
 func TestConfigList(t *testing.T) {
-
 	cases := []testCase{
 		{ // case 0
 			args:           strings.Split("experimental config get istioNamespace", " "),
-			expectedRegexp: regexp.MustCompile("Usage:\n  istioctl experimental config"),
+			expectedRegexp: regexp.MustCompile("Examples:\n  # list configuration parameters\n  istioctl config list"),
 			wantException:  false,
 		},
 		{ // case 1
@@ -36,6 +35,7 @@ authority                                default
 cert-dir                                 default
 insecure                                 default
 istioNamespace          istio-system     default
+plaintext                                default
 prefer-experimental                      default
 xds-address                              default
 xds-port                15012            default

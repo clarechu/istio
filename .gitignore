@@ -8,17 +8,19 @@ tools/vagrant/.vagrant/
 # Intellij
 *.iml
 .idea/
+.run/
 # Visual Studio Code
 .vscode/
 # Bazel
 /bazel-*
+# vi swap files
+.*.swp
 # vi backups
 *.bak
+# common backups
+*~
 # python artifacts
 *.pyc
-# Vm setup generated files
-cluster.env
-kubedns
 # pilot
 pilot/pkg/kube/config
 pilot/pkg/proxy/envoy/envoy
@@ -51,4 +53,11 @@ vendor
 out/
 etc/
 var/
-.idea/
+# Go compiled tests
+*.test
+# Profiles
+*.prof
+# MacOS extended attributes
+._*
+# MacOS Desktop Services Store
+.DS_Store

@@ -30,8 +30,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/big"
+	"os"
 	"strings"
 	"time"
 
@@ -97,6 +97,9 @@ type CertOptions struct {
 	// when generating private keys. Currently only ECDSA is supported.
 	// If empty, RSA is used, otherwise ECC is used.
 	ECSigAlg SupportedECSignatureAlgorithms
+
+	// Subjective Alternative Name values.
+	DNSNames string
 }
 
 // GenCertKeyFromOptions generates a X.509 certificate and a private key with the given options.
@@ -131,7 +134,7 @@ func GenCertKeyFromOptions(options CertOptions) (pemCert []byte, pemKey []byte, 
 	return genCert(options, rsaPriv, &rsaPriv.PublicKey)
 }
 
-func genCert(options CertOptions, priv interface{}, key interface{}) ([]byte, []byte, error) {
+func genCert(options CertOptions, priv any, key any) ([]byte, []byte, error) {
 	template, err := genCertTemplateFromOptions(options)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cert generation fails at cert template creation (%v)", err)
@@ -149,7 +152,7 @@ func genCert(options CertOptions, priv interface{}, key interface{}) ([]byte, []
 	return pemCert, pemKey, err
 }
 
-func publicKey(priv interface{}) interface{} {
+func publicKey(priv any) any {
 	switch k := priv.(type) {
 	case *rsa.PrivateKey:
 		return &k.PublicKey
@@ -217,8 +220,9 @@ func MergeCertOptions(defaultOpts, deltaOpts CertOptions) CertOptions {
 }
 
 // GenCertFromCSR generates a X.509 certificate with the given CSR.
-func GenCertFromCSR(csr *x509.CertificateRequest, signingCert *x509.Certificate, publicKey interface{},
-	signingKey crypto.PrivateKey, subjectIDs []string, ttl time.Duration, isCA bool) (cert []byte, err error) {
+func GenCertFromCSR(csr *x509.CertificateRequest, signingCert *x509.Certificate, publicKey any,
+	signingKey crypto.PrivateKey, subjectIDs []string, ttl time.Duration, isCA bool,
+) (cert []byte, err error) {
 	tmpl, err := genCertTemplateFromCSR(csr, subjectIDs, ttl, isCA)
 	if err != nil {
 		return nil, err
@@ -227,15 +231,16 @@ func GenCertFromCSR(csr *x509.CertificateRequest, signingCert *x509.Certificate,
 }
 
 // LoadSignerCredsFromFiles loads the signer cert&key from the given files.
-//   signerCertFile: cert file name
-//   signerPrivFile: private key file name
+//
+//	signerCertFile: cert file name
+//	signerPrivFile: private key file name
 func LoadSignerCredsFromFiles(signerCertFile string, signerPrivFile string) (*x509.Certificate, crypto.PrivateKey, error) {
-	signerCertBytes, err := ioutil.ReadFile(signerCertFile)
+	signerCertBytes, err := os.ReadFile(signerCertFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("certificate file reading failure (%v)", err)
 	}
 
-	signerPrivBytes, err := ioutil.ReadFile(signerPrivFile)
+	signerPrivBytes, err := os.ReadFile(signerPrivFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("private key file reading failure (%v)", err)
 	}
@@ -253,10 +258,15 @@ func LoadSignerCredsFromFiles(signerCertFile string, signerPrivFile string) (*x5
 	return cert, key, nil
 }
 
+// ClockSkewGracePeriod defines the period of time a certificate will be valid before its creation.
+// This is meant to handle cases where we have clock skew between the CA and workloads.
+const ClockSkewGracePeriod = time.Minute * 2
+
 // genCertTemplateFromCSR generates a certificate template with the given CSR.
 // The NotBefore value of the cert is set to current time.
 func genCertTemplateFromCSR(csr *x509.CertificateRequest, subjectIDs []string, ttl time.Duration, isCA bool) (
-	*x509.Certificate, error) {
+	*x509.Certificate, error,
+) {
 	subjectIDsInString := strings.Join(subjectIDs, ",")
 	var keyUsage x509.KeyUsage
 	extKeyUsages := []x509.ExtKeyUsage{}
@@ -295,18 +305,19 @@ func genCertTemplateFromCSR(csr *x509.CertificateRequest, subjectIDs []string, t
 	if err != nil {
 		return nil, err
 	}
-
+	// SignatureAlgorithm will use the default algorithm.
+	// See https://golang.org/src/crypto/x509/x509.go?s=5131:5158#L1965 .
 	return &x509.Certificate{
 		SerialNumber:          serialNum,
 		Subject:               subject,
-		NotBefore:             now,
+		NotBefore:             now.Add(-ClockSkewGracePeriod),
 		NotAfter:              now.Add(ttl),
 		KeyUsage:              keyUsage,
 		ExtKeyUsage:           extKeyUsages,
 		IsCA:                  isCA,
 		BasicConstraintsValid: true,
 		ExtraExtensions:       exts,
-		SignatureAlgorithm:    csr.SignatureAlgorithm}, nil
+	}, nil
 }
 
 // genCertTemplateFromoptions generates a certificate template with the given options.
@@ -360,6 +371,11 @@ func genCertTemplateFromOptions(options CertOptions) (*x509.Certificate, error) 
 		exts = []pkix.Extension{*s}
 	}
 
+	dnsNames := strings.Split(options.DNSNames, ",")
+	if len(dnsNames[0]) == 0 {
+		dnsNames = nil
+	}
+
 	return &x509.Certificate{
 		SerialNumber:          serialNum,
 		Subject:               subject,
@@ -369,7 +385,9 @@ func genCertTemplateFromOptions(options CertOptions) (*x509.Certificate, error) 
 		ExtKeyUsage:           extKeyUsages,
 		IsCA:                  options.IsCA,
 		BasicConstraintsValid: true,
-		ExtraExtensions:       exts}, nil
+		ExtraExtensions:       exts,
+		DNSNames:              dnsNames,
+	}, nil
 }
 
 func genSerialNum() (*big.Int, error) {
@@ -381,8 +399,9 @@ func genSerialNum() (*big.Int, error) {
 	return serialNum, nil
 }
 
-func encodePem(isCSR bool, csrOrCert []byte, priv interface{}, pkcs8 bool) (
-	csrOrCertPem []byte, privPem []byte, err error) {
+func encodePem(isCSR bool, csrOrCert []byte, priv any, pkcs8 bool) (
+	csrOrCertPem []byte, privPem []byte, err error,
+) {
 	encodeMsg := "CERTIFICATE"
 	if isCSR {
 		encodeMsg = "CERTIFICATE REQUEST"

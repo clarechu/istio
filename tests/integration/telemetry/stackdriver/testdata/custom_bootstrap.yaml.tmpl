@@ -8,11 +8,13 @@ data:
     {
       "node": {
         "metadata": {
-          "INSECURE_STACKDRIVER_ENDPOINT": "stackdriver.{{ .StackdriverNamespace }}:8090",
+          {{- if not .UseRealSD }}
+          "INSECURE_STACKDRIVER_ENDPOINT": "{{ .StackdriverAddress }}",
+          {{- end }}
           "STACKDRIVER_MONITORING_EXPORT_INTERVAL_SECS": "10",
-          "MESH_ID": "test-mesh",
+          "MESH_ID": "proj-test-mesh",
         }
-      },
+      }{{- if not .UseRealSD }},
       "tracing": {
         "http": {
           "name": "envoy.tracers.opencensus",
@@ -30,7 +32,7 @@ data:
             "stackdriver_exporter_enabled": true,
             "stackdriver_grpc_service": {
               "google_grpc": {
-                "target_uri": "stackdriver.{{ .StackdriverNamespace }}.svc.cluster.local:8090",
+                "target_uri": "{{ .StackdriverAddress }}",
                 "stat_prefix": "oc_stackdriver_tracer",
               }
             },
@@ -49,5 +51,6 @@ data:
             ]
           }
         }
-      },
+      }
+      {{- end }}
     }

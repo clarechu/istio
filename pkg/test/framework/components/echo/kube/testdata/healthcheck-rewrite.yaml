@@ -7,6 +7,9 @@ metadata:
     app: healthcheck
 spec:
   ports:
+  - name: grpc
+    port: 7070
+    targetPort: 7070
   - name: http-8080
     port: 8080
     targetPort: 8080
@@ -28,29 +31,46 @@ spec:
       labels:
         app: healthcheck
         version: v1
+        test.istio.io/class: standard
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "15014"
         sidecar.istio.io/rewriteAppHTTPProbers: "true"
     spec:
+      imagePullSecrets:
+      - name: myregistrykey
       containers:
+      - name: istio-proxy
+        image: auto
+        imagePullPolicy: Always
+        securityContext: # to allow core dumps
+          readOnlyRootFilesystem: false
       - name: app
         image: testing.hub/app:latest
         imagePullPolicy: Always
+        securityContext:
+          runAsUser: 1338
+          runAsGroup: 1338
         args:
           - --metrics=15014
-          - --cluster
-          - "cluster-0"
-          - --port
-          - "8080"
-          - --port
-          - "3333"
-          - --version
-          - "v1"
+          - --cluster=cluster-0
+          - --grpc=7070
+          - --port=8080
+          - --port=3333
+          - --version=v1
+          - --istio-version=
+          - --crt=/cert.crt
+          - --key=/cert.key
         ports:
+        - containerPort: 7070
         - containerPort: 8080
         - containerPort: 3333
           name: tcp-health-port
+        env:
+        - name: INSTANCE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         readinessProbe:
           httpGet:
             path: /
@@ -63,5 +83,10 @@ spec:
             port: tcp-health-port
           initialDelaySeconds: 10
           periodSeconds: 10
+          failureThreshold: 10
+        startupProbe:
+          tcpSocket:
+            port: tcp-health-port
+          periodSeconds: 1
           failureThreshold: 10
 ---

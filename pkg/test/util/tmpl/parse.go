@@ -15,7 +15,10 @@
 package tmpl
 
 import (
+	"fmt"
 	"text/template"
+
+	"github.com/Masterminds/sprig/v3"
 
 	"istio.io/istio/pkg/test"
 )
@@ -23,7 +26,7 @@ import (
 // Parse the given template content.
 func Parse(tpl string) (*template.Template, error) {
 	t := template.New("test template")
-	return t.Parse(tpl)
+	return t.Funcs(sprig.TxtFuncMap()).Parse(tpl)
 }
 
 // ParseOrFail calls Parse and fails tests if it returns error.
@@ -32,6 +35,15 @@ func ParseOrFail(t test.Failer, tpl string) *template.Template {
 	tpl2, err := Parse(tpl)
 	if err != nil {
 		t.Fatalf("tmpl.ParseOrFail: %v", err)
+	}
+	return tpl2
+}
+
+// MustParse calls Parse and panics if it returns error.
+func MustParse(tpl string) *template.Template {
+	tpl2, err := Parse(tpl)
+	if err != nil {
+		panic(fmt.Sprintf("tmpl.MustParse: %v", err))
 	}
 	return tpl2
 }

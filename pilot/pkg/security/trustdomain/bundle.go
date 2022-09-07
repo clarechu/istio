@@ -18,14 +18,11 @@ import (
 	"fmt"
 	"strings"
 
-	istiolog "istio.io/pkg/log"
-
 	"istio.io/istio/pkg/config/constants"
+	istiolog "istio.io/pkg/log"
 )
 
-var (
-	authzLog = istiolog.RegisterScope("authorization", "Istio Authorization Policy", 0)
-)
+var authzLog = istiolog.RegisterScope("authorization", "Istio Authorization Policy", 0)
 
 type Bundle struct {
 	// Contain the local trust domain and its aliases.
@@ -70,7 +67,7 @@ func (t Bundle) ReplaceTrustDomainAliases(principals []string) []string {
 		// Only generate configuration if the extracted trust domain from the policy is part of the trust domain list,
 		// or if the extracted/existing trust domain is "cluster.local", which is a pointer to the local trust domain
 		// and its aliases.
-		if stringMatch(trustDomainFromPrincipal, t.TrustDomains) || trustDomainFromPrincipal == constants.DefaultKubernetesDomain {
+		if stringMatch(trustDomainFromPrincipal, t.TrustDomains) || trustDomainFromPrincipal == constants.DefaultClusterLocalDomain {
 			// Generate configuration for trust domain and trust domain aliases.
 			principalsIncludingAliases = append(principalsIncludingAliases, t.replaceTrustDomains(principal, trustDomainFromPrincipal)...)
 		} else {
@@ -89,14 +86,19 @@ func (t Bundle) ReplaceTrustDomainAliases(principals []string) []string {
 func (t Bundle) replaceTrustDomains(principal, trustDomainFromPrincipal string) []string {
 	principalsForAliases := []string{}
 	for _, td := range t.TrustDomains {
-		// If the trust domain has a prefix * (e.g. *local from *local/ns/foo/ns/bar), keep the principal
+		// If the trust domain has a prefix * (e.g. *local from *local/ns/foo/sa/bar), keep the principal
 		// as-is for the matched trust domain. For others, replace the trust domain with the new trust domain
 		// or alias.
 		var newPrincipal string
+		var err error
 		if suffixMatch(td, trustDomainFromPrincipal) {
 			newPrincipal = principal
 		} else {
-			newPrincipal = replaceTrustDomainInPrincipal(td, principal)
+			newPrincipal, err = replaceTrustDomainInPrincipal(td, principal)
+			if err != nil {
+				authzLog.Errorf("Failed to replace trust domain with %s from principal %s: %v", td, principal, err)
+				continue
+			}
 		}
 		// Check to make sure we don't generate duplicated principals. This happens when trust domain
 		// has a * prefix. For example, "*-td" can match with "old-td" and "new-td", but we only want
@@ -114,17 +116,14 @@ func (t Bundle) replaceTrustDomains(principal, trustDomainFromPrincipal string) 
 // [SPIFFE-ID](https://github.com/spiffe/spiffe/blob/master/standards/SPIFFE-ID.md#21-trust-domain)
 // In Istio authorization, an identity is presented in the format:
 // <trust-domain>/ns/<some-namespace>/sa/<some-service-account>
-// TODO(pitlv2109): See if we can return an error here instead of empty string.
-// Resolve it in https://github.com/istio/istio/pull/18011
-func replaceTrustDomainInPrincipal(trustDomain string, principal string) string {
+func replaceTrustDomainInPrincipal(trustDomain string, principal string) (string, error) {
 	identityParts := strings.Split(principal, "/")
 	// A valid SPIFFE identity in authorization has no SPIFFE:// prefix.
 	// It is presented as <trust-domain>/ns/<some-namespace>/sa/<some-service-account>
 	if len(identityParts) != 5 {
-		authzLog.Errorf("Wrong SPIFFE format: %s", principal)
-		return ""
+		return "", fmt.Errorf("wrong SPIFFE format: %s", principal)
 	}
-	return fmt.Sprintf("%s/%s", trustDomain, strings.Join(identityParts[1:], "/"))
+	return fmt.Sprintf("%s/%s", trustDomain, strings.Join(identityParts[1:], "/")), nil
 }
 
 // isTrustDomainBeingEnforced checks whether the trust domain is being checked in the filter or not.

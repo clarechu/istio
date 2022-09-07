@@ -11,22 +11,26 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package model
 
 import (
 	"regexp"
 	"strings"
 
-	"github.com/gogo/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	networking "istio.io/api/networking/v1alpha3"
-
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/xds"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // EnvoyFilterWrapper is a wrapper for the EnvoyFilter api object with pre-processed data
 type EnvoyFilterWrapper struct {
+	Name             string
+	Namespace        string
 	workloadSelector labels.Instance
 	Patches          map[networking.EnvoyFilter_ApplyTo][]*EnvoyFilterConfigPatchWrapper
 }
@@ -44,37 +48,60 @@ type EnvoyFilterConfigPatchWrapper struct {
 	// regex match, but as an optimization we can reduce this to a prefix match for common cases.
 	// If this is set, ProxyVersionRegex is ignored.
 	ProxyPrefixMatch string
+	Name             string
+	Namespace        string
 }
 
 // wellKnownVersions defines a mapping of well known regex matches to prefix matches
 // This is done only as an optimization; behavior should remain the same
 // All versions specified by the default installation (Telemetry V2) should be added here.
 var wellKnownVersions = map[string]string{
-	`^1\.4.*`: "1.4",
-	`^1\.5.*`: "1.5",
-	`^1\.6.*`: "1.6",
-	`^1\.7.*`: "1.7",
-	`^1\.8.*`: "1.8",
-	// Hopefully we have a better API by 1.9. If not, add it here
+	`^1\.4.*`:  "1.4",
+	`^1\.5.*`:  "1.5",
+	`^1\.6.*`:  "1.6",
+	`^1\.7.*`:  "1.7",
+	`^1\.8.*`:  "1.8",
+	`^1\.9.*`:  "1.9",
+	`^1\.10.*`: "1.10",
+	`^1\.11.*`: "1.11",
+	`^1\.12.*`: "1.12",
+	`^1\.13.*`: "1.13",
+	`^1\.14.*`: "1.14",
+	`^1\.15.*`: "1.15",
+	`^1\.16.*`: "1.16",
+	`^1\.17.*`: "1.17",
+	`^1\.18.*`: "1.18",
+	`^1\.19.*`: "1.19",
+	// Hopefully we have a better API by 1.19. If not, add it here
 }
 
 // convertToEnvoyFilterWrapper converts from EnvoyFilter config to EnvoyFilterWrapper object
-func convertToEnvoyFilterWrapper(local *Config) *EnvoyFilterWrapper {
+func convertToEnvoyFilterWrapper(local *config.Config) *EnvoyFilterWrapper {
 	localEnvoyFilter := local.Spec.(*networking.EnvoyFilter)
 
-	out := &EnvoyFilterWrapper{}
+	out := &EnvoyFilterWrapper{Name: local.Name, Namespace: local.Namespace}
 	if localEnvoyFilter.WorkloadSelector != nil {
 		out.workloadSelector = localEnvoyFilter.WorkloadSelector.Labels
 	}
 	out.Patches = make(map[networking.EnvoyFilter_ApplyTo][]*EnvoyFilterConfigPatchWrapper)
 	for _, cp := range localEnvoyFilter.ConfigPatches {
+		if cp.Patch == nil {
+			// Should be caught by validation, but sometimes its disabled and we don't want to crash
+			// as a result.
+			log.Debugf("envoyfilter %v/%v discarded due to missing patch", local.Namespace, local.Name)
+			continue
+		}
 		cpw := &EnvoyFilterConfigPatchWrapper{
+			Name:      local.Name,
+			Namespace: local.Namespace,
 			ApplyTo:   cp.ApplyTo,
 			Match:     cp.Match,
 			Operation: cp.Patch.Operation,
 		}
 		var err error
-		cpw.Value, err = xds.BuildXDSObjectFromStruct(cp.ApplyTo, cp.Patch.Value)
+		// Use non-strict building to avoid issues where EnvoyFilter is valid but meant
+		// for a different version of the API than we are built with
+		cpw.Value, err = xds.BuildXDSObjectFromStruct(cp.ApplyTo, cp.Patch.Value, false)
 		// There generally won't be an error here because validation catches mismatched types
 		// Should only happen in tests or without validation
 		if err != nil {
@@ -102,10 +129,11 @@ func convertToEnvoyFilterWrapper(local *Config) *EnvoyFilterWrapper {
 		if cpw.Operation == networking.EnvoyFilter_Patch_INSERT_AFTER ||
 			cpw.Operation == networking.EnvoyFilter_Patch_INSERT_BEFORE ||
 			cpw.Operation == networking.EnvoyFilter_Patch_INSERT_FIRST {
-			// insert_before, after or first is applicable only for network filter and http filter
-			// TODO: insert before/after is also applicable to http_routes
-			// convert the rest to add
-			if cpw.ApplyTo != networking.EnvoyFilter_HTTP_FILTER && cpw.ApplyTo != networking.EnvoyFilter_NETWORK_FILTER {
+			// insert_before, after or first is applicable for network filter,
+			// http filter and http route, convert the rest to add
+			if cpw.ApplyTo != networking.EnvoyFilter_HTTP_FILTER &&
+				cpw.ApplyTo != networking.EnvoyFilter_NETWORK_FILTER &&
+				cpw.ApplyTo != networking.EnvoyFilter_HTTP_ROUTE {
 				cpw.Operation = networking.EnvoyFilter_Patch_ADD
 			}
 		}
@@ -141,4 +169,25 @@ func proxyMatch(proxy *Proxy, cp *EnvoyFilterConfigPatchWrapper) bool {
 		}
 	}
 	return true
+}
+
+// Returns the keys of all the wrapped envoyfilters.
+func (efw *EnvoyFilterWrapper) Keys() []string {
+	if efw == nil {
+		return nil
+	}
+	keys := sets.Set{}
+	for _, patches := range efw.Patches {
+		for _, patch := range patches {
+			keys.Insert(patch.Key())
+		}
+	}
+	return keys.SortedList()
+}
+
+func (cpw *EnvoyFilterConfigPatchWrapper) Key() string {
+	if cpw == nil {
+		return ""
+	}
+	return cpw.Namespace + "/" + cpw.Name
 }

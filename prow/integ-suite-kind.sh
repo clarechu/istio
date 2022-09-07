@@ -29,12 +29,20 @@ set -u
 # Print commands
 set -x
 
-
 # shellcheck source=prow/lib.sh
 source "${ROOT}/prow/lib.sh"
 setup_and_export_git_sha
 
+# shellcheck source=common/scripts/kind_provisioner.sh
+source "${ROOT}/common/scripts/kind_provisioner.sh"
+
 TOPOLOGY=SINGLE_CLUSTER
+NODE_IMAGE="gcr.io/istio-testing/kind-node:v1.25.0"
+KIND_CONFIG=""
+CLUSTER_TOPOLOGY_CONFIG_FILE="${ROOT}/prow/config/topology/multicluster.json"
+
+export FAST_VM_BUILDS=true
+export ISTIO_DOCKER_BUILDER=crane
 
 PARAMS=()
 
@@ -45,6 +53,11 @@ while (( "$#" )); do
     --node-image)
       NODE_IMAGE=$2
       shift 2
+    ;;
+    # Config for enabling different Kubernetes features in KinD (see prow/config{endpointslice.yaml,trustworthy-jwt.yaml}).
+    --kind-config)
+    KIND_CONFIG=$2
+    shift 2
     ;;
     --skip-setup)
       SKIP_SETUP=true
@@ -76,6 +89,10 @@ while (( "$#" )); do
       esac
       shift 2
     ;;
+    --topology-config)
+      CLUSTER_TOPOLOGY_CONFIG_FILE="${ROOT}/${2}"
+      shift 2
+    ;;
     -*)
       echo "Error: Unsupported flag $1" >&2
       exit 1
@@ -87,8 +104,16 @@ while (( "$#" )); do
   esac
 done
 
-# KinD will not have a LoadBalancer, so we need to disable it
-export TEST_ENV=kind
+if [ -f /proc/cpuinfo ]; then
+  echo "Checking CPU..."
+  grep 'model' /proc/cpuinfo || true
+fi
+
+# Default IP family of the cluster is IPv4
+export IP_FAMILY="${IP_FAMILY:-ipv4}"
+
+# LoadBalancer in Kind is supported using metallb
+export TEST_ENV=kind-metallb
 
 # See https://kind.sigs.k8s.io/docs/user/quick-start/#loading-an-image-into-your-cluster
 export PULL_POLICY=IfNotPresent
@@ -104,41 +129,47 @@ export TAG="${TAG:-"istio-testing"}"
 
 # If we're not intending to pull from an actual remote registry, use the local kind registry
 if [[ -z "${SKIP_BUILD:-}" ]]; then
-  HUB="${KIND_REGISTRY}/$(echo "${HUB}" | sed 's/[^\/]*\/\([^\/]*\/\)/\1/')"
+  HUB="${KIND_REGISTRY}"
   export HUB
 fi
-
-# Default IP family of the cluster is IPv4
-export IP_FAMILY="${IP_FAMILY:-ipv4}"
 
 # Setup junit report and verbose logging
 export T="${T:-"-v -count=1"}"
 export CI="true"
 
-make init
+export ARTIFACTS="${ARTIFACTS:-$(mktemp -d)}"
+trace "init" make init
 
 if [[ -z "${SKIP_SETUP:-}" ]]; then
-  if [[ "${TOPOLOGY}" == "SINGLE_CLUSTER" ]]; then
-    time setup_kind_cluster "${IP_FAMILY}" "${NODE_IMAGE:-}"
-  else
-    # TODO: Support IPv6 multicluster
-    time setup_kind_clusters "${TOPOLOGY}" "${NODE_IMAGE:-}"
+  export DEFAULT_CLUSTER_YAML="./prow/config/default.yaml"
+  export METRICS_SERVER_CONFIG_DIR='./prow/config/metrics'
 
-    # KinD will have a LoadBalancer for multicluster
-    export TEST_ENV=kind-metallb
-    # Set the kube configs to point to the clusters.
-    export INTEGRATION_TEST_KUBECONFIG="${CLUSTER1_KUBECONFIG},${CLUSTER2_KUBECONFIG},${CLUSTER3_KUBECONFIG},${CLUSTER4_KUBECONFIG},${CLUSTER5_KUBECONFIG}"
-    # 3 clusters on one network, 2 on the other
-    export INTEGRATION_TEST_NETWORKS="0:test-network-0,1:test-network-0,2:test-network-0,3:test-network-1,4:test-network-1"
-    # Cluster 0, 1 and 4 share cluster 0's control plane
-    # Clusters 2 and 3 control themselves
-    export INTEGRATION_TEST_CONTROLPLANE_TOPOLOGY="0:0,1:0,2:2,3:3,4:0"
+  if [[ "${TOPOLOGY}" == "SINGLE_CLUSTER" ]]; then
+    trace "setup kind cluster" setup_kind_cluster_retry "istio-testing" "${NODE_IMAGE}" "${KIND_CONFIG}"
+  else
+    trace "load cluster topology" load_cluster_topology "${CLUSTER_TOPOLOGY_CONFIG_FILE}"
+    trace "setup kind clusters" setup_kind_clusters "${NODE_IMAGE}" "${IP_FAMILY}"
+
+    TOPOLOGY_JSON=$(cat "${CLUSTER_TOPOLOGY_CONFIG_FILE}")
+    for i in $(seq 0 $((${#CLUSTER_NAMES[@]} - 1))); do
+      CLUSTER="${CLUSTER_NAMES[i]}"
+      KCONFIG="${KUBECONFIGS[i]}"
+      TOPOLOGY_JSON=$(set_topology_value "${TOPOLOGY_JSON}" "${CLUSTER}" "meta.kubeconfig" "${KCONFIG}")
+    done
+    RUNTIME_TOPOLOGY_CONFIG_FILE="${ARTIFACTS}/topology-config.json"
+    echo "${TOPOLOGY_JSON}" > "${RUNTIME_TOPOLOGY_CONFIG_FILE}"
+
+    export INTEGRATION_TEST_TOPOLOGY_FILE
+    INTEGRATION_TEST_TOPOLOGY_FILE="${RUNTIME_TOPOLOGY_CONFIG_FILE}"
+
+    export INTEGRATION_TEST_KUBECONFIG
+    INTEGRATION_TEST_KUBECONFIG=NONE
   fi
 fi
 
 if [[ -z "${SKIP_BUILD:-}" ]]; then
-  time setup_kind_registry
-  time build_images "${PARAMS[*]}"
+  trace "setup kind registry" setup_kind_registry
+  trace "build images" build_images "${PARAMS[*]}"
 fi
 
 # If a variant is defined, update the tag accordingly
@@ -148,7 +179,7 @@ fi
 
 # Run the test target if provided.
 if [[ -n "${PARAMS:-}" ]]; then
-  make "${PARAMS[*]}"
+  trace "test" make "${PARAMS[*]}"
 fi
 
 # Check if the user is running the clusters in manual mode.

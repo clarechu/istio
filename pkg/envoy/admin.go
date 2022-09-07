@@ -22,9 +22,9 @@ import (
 	"strings"
 
 	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/pkg/log"
 )
 
@@ -36,8 +36,14 @@ func Shutdown(adminPort uint32) error {
 
 // DrainListeners drains inbound listeners of Envoy so that inflight requests
 // can gracefully finish and even continue making outbound calls as needed.
-func DrainListeners(adminPort uint32) error {
-	res, err := doEnvoyPost("drain_listeners?inboundonly", "", "", adminPort)
+func DrainListeners(adminPort uint32, inboundonly bool) error {
+	var drainURL string
+	if inboundonly {
+		drainURL = "drain_listeners?inboundonly&graceful"
+	} else {
+		drainURL = "drain_listeners?graceful"
+	}
+	res, err := doEnvoyPost(drainURL, "", "", adminPort)
 	log.Debugf("Drain listener endpoint response : %s", res.String())
 	return err
 }
@@ -72,7 +78,7 @@ func GetConfigDump(adminPort uint32) (*envoyAdmin.ConfigDump, error) {
 }
 
 func doEnvoyGet(path string, adminPort uint32) (*bytes.Buffer, error) {
-	requestURL := fmt.Sprintf("http://127.0.0.1:%d/%s", adminPort, path)
+	requestURL := fmt.Sprintf("http://localhost:%d/%s", adminPort, path)
 	buffer, err := doHTTPGet(requestURL)
 	if err != nil {
 		return nil, err
@@ -81,7 +87,7 @@ func doEnvoyGet(path string, adminPort uint32) (*bytes.Buffer, error) {
 }
 
 func doEnvoyPost(path, contentType, body string, adminPort uint32) (*bytes.Buffer, error) {
-	requestURL := fmt.Sprintf("http://127.0.0.1:%d/%s", adminPort, path)
+	requestURL := fmt.Sprintf("http://localhost:%d/%s", adminPort, path)
 	buffer, err := doHTTPPost(requestURL, contentType, body)
 	if err != nil {
 		return nil, err
@@ -96,7 +102,7 @@ func doHTTPGet(requestURL string) (*bytes.Buffer, error) {
 	}
 	defer func() { _ = response.Body.Close() }()
 
-	if response.StatusCode != 200 {
+	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status %d", response.StatusCode)
 	}
 
@@ -122,8 +128,5 @@ func doHTTPPost(requestURL, contentType, body string) (*bytes.Buffer, error) {
 }
 
 func unmarshal(jsonString string, msg proto.Message) error {
-	u := jsonpb.Unmarshaler{
-		AllowUnknownFields: true,
-	}
-	return u.Unmarshal(strings.NewReader(jsonString), msg)
+	return protomarshal.UnmarshalAllowUnknown([]byte(jsonString), msg)
 }

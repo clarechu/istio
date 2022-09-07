@@ -6,4 +6,6 @@
 *.pb.go linguist-generated=true
 *.gen.go linguist-generated=true
 *.gen.yaml linguist-generated=true
+*.gen.json linguist-generated=true
 *_pb2.py linguist-generated=true
+go.sum merge=union

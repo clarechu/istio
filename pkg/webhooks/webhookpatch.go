@@ -17,167 +17,173 @@ package webhooks
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"time"
+	"strings"
 
-	kubeApiAdmission "k8s.io/api/admissionregistration/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/api/admissionregistration/v1"
+	kubeErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	admissioninformer "k8s.io/client-go/informers/admissionregistration/v1"
 	"k8s.io/client-go/kubernetes"
 	admissionregistrationv1client "k8s.io/client-go/kubernetes/typed/admissionregistration/v1"
 	"k8s.io/client-go/tools/cache"
 
-	"istio.io/istio/pkg/kube"
-	"istio.io/istio/pkg/webhooks/validation/controller"
-
+	"istio.io/api/label"
+	"istio.io/istio/pilot/pkg/keycertbundle"
+	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/webhooks/util"
 	"istio.io/pkg/log"
 )
 
-// patchMutatingWebhookConfig patches a CA bundle into the specified webhook config.
-func patchMutatingWebhookConfig(client admissionregistrationv1client.MutatingWebhookConfigurationInterface,
-	webhookConfigName, webhookName string, caBundle []byte) error {
-	config, err := client.Get(context.TODO(), webhookConfigName, metav1.GetOptions{})
-	if err != nil {
-		return err
+var (
+	errWrongRevision     = errors.New("webhook does not belong to target revision")
+	errNotFound          = errors.New("webhook not found")
+	errNoWebhookWithName = errors.New("webhook configuration did not contain webhook with target name")
+)
+
+// WebhookCertPatcher listens for webhooks on specified revision and patches their CA bundles
+type WebhookCertPatcher struct {
+	client kubernetes.Interface
+
+	// revision to patch webhooks for
+	revision    string
+	webhookName string
+
+	queue controllers.Queue
+
+	// File path to the x509 certificate bundle used by the webhook server
+	// and patched into the webhook config.
+	CABundleWatcher *keycertbundle.Watcher
+
+	informer cache.SharedIndexInformer
+}
+
+// NewWebhookCertPatcher creates a WebhookCertPatcher
+func NewWebhookCertPatcher(
+	client kubelib.Client,
+	revision, webhookName string, caBundleWatcher *keycertbundle.Watcher,
+) (*WebhookCertPatcher, error) {
+	p := &WebhookCertPatcher{
+		client:          client.Kube(),
+		revision:        revision,
+		webhookName:     webhookName,
+		CABundleWatcher: caBundleWatcher,
 	}
-	prev, err := json.Marshal(config)
-	if err != nil {
-		return err
-	}
-	found := false
-	for i, w := range config.Webhooks {
-		if w.Name == webhookName {
-			config.Webhooks[i].ClientConfig.CABundle = caBundle
-			found = true
-			break
-		}
-	}
-	if !found {
-		return apierrors.NewInternalError(fmt.Errorf(
-			"webhook entry %q not found in config %q", webhookName, webhookConfigName))
-	}
-	curr, err := json.Marshal(config)
-	if err != nil {
-		return err
-	}
-	patch, err := strategicpatch.CreateTwoWayMergePatch(prev, curr, kubeApiAdmission.MutatingWebhookConfiguration{})
-	if err != nil {
-		return err
+	p.queue = controllers.NewQueue("webhook patcher",
+		controllers.WithReconciler(p.webhookPatchTask),
+		controllers.WithMaxAttempts(5))
+	informer := admissioninformer.NewFilteredMutatingWebhookConfigurationInformer(client.Kube(), 0, cache.Indexers{}, func(options *metav1.ListOptions) {
+		options.LabelSelector = fmt.Sprintf("%s=%s", label.IoIstioRev.Name, revision)
+	})
+	p.informer = informer
+	informer.AddEventHandler(controllers.ObjectHandler(p.queue.AddObject))
+
+	return p, nil
+}
+
+// Run runs the WebhookCertPatcher
+func (w *WebhookCertPatcher) Run(stopChan <-chan struct{}) {
+	go w.informer.Run(stopChan)
+	go w.startCaBundleWatcher(stopChan)
+	w.queue.Run(stopChan)
+}
+
+func (w *WebhookCertPatcher) HasSynced() bool {
+	return w.informer.HasSynced() && w.queue.HasSynced()
+}
+
+// webhookPatchTask takes the result of patchMutatingWebhookConfig and modifies the result for use in task queue
+func (w *WebhookCertPatcher) webhookPatchTask(o types.NamespacedName) error {
+	reportWebhookPatchAttempts(o.Name)
+	err := w.patchMutatingWebhookConfig(
+		w.client.AdmissionregistrationV1().MutatingWebhookConfigurations(),
+		o.Name)
+
+	// do not want to retry the task if these errors occur, they indicate that
+	// we should no longer be patching the given webhook
+	if kubeErrors.IsNotFound(err) || errors.Is(err, errWrongRevision) || errors.Is(err, errNoWebhookWithName) || errors.Is(err, errNotFound) {
+		return nil
 	}
 
-	if string(patch) != "{}" {
-		_, err = client.Patch(context.TODO(), webhookConfigName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		log.Errorf("patching webhook %s failed: %v", o.Name, err)
+		reportWebhookPatchRetry(o.Name)
 	}
+
 	return err
 }
 
-const delayedRetryTime = time.Second
+// patchMutatingWebhookConfig takes a webhookConfigName and patches the CA bundle for that webhook configuration
+func (w *WebhookCertPatcher) patchMutatingWebhookConfig(
+	client admissionregistrationv1client.MutatingWebhookConfigurationInterface,
+	webhookConfigName string,
+) error {
+	raw, _, err := w.informer.GetIndexer().GetByKey(webhookConfigName)
+	if raw == nil || err != nil {
+		reportWebhookPatchFailure(webhookConfigName, reasonWebhookConfigNotFound)
+		return errNotFound
+	}
+	config := raw.(*v1.MutatingWebhookConfiguration)
+	// prevents a race condition between multiple istiods when the revision is changed or modified
+	v, ok := config.Labels[label.IoIstioRev.Name]
+	if v != w.revision || !ok {
+		reportWebhookPatchFailure(webhookConfigName, reasonWrongRevision)
+		return errWrongRevision
+	}
 
-// Moved out of injector main. Changes:
-// - pass the existing k8s client
-// - use the K8S root instead of citadel root CA
-// - removed the watcher - the k8s CA is already mounted at startup, no more delay waiting for it
-func PatchCertLoop(injectionWebhookConfigName, webhookName, caBundlePath string, client kubernetes.Interface, stopCh <-chan struct{}) {
-	// K8S own CA
-	caCertPem, err := ioutil.ReadFile(caBundlePath)
+	found := false
+	updated := false
+	caCertPem, err := util.LoadCABundle(w.CABundleWatcher)
 	if err != nil {
-		log.Errorf("Skipping webhook patch, missing CA path %v", caBundlePath)
-		return
+		log.Errorf("Failed to load CA bundle: %v", err)
+		reportWebhookPatchFailure(webhookConfigName, reasonLoadCABundleFailure)
+		return err
 	}
-
-	var retry bool
-	if err = patchMutatingWebhookConfig(client.AdmissionregistrationV1().MutatingWebhookConfigurations(),
-		injectionWebhookConfigName, webhookName, caCertPem); err != nil {
-		log.Warna("Error patching Webhook ", err)
-		retry = true
-	}
-
-	shouldPatch := make(chan struct{})
-
-	watchlist := cache.NewListWatchFromClient(
-		client.AdmissionregistrationV1().RESTClient(),
-		"mutatingwebhookconfigurations",
-		"",
-		fields.ParseSelectorOrDie(fmt.Sprintf("metadata.name=%s", injectionWebhookConfigName)))
-
-	_, controller := cache.NewInformer(
-		watchlist,
-		&kubeApiAdmission.MutatingWebhookConfiguration{},
-		0,
-		cache.ResourceEventHandlerFuncs{
-			UpdateFunc: func(oldObj, newObj interface{}) {
-				oldConfig := oldObj.(*kubeApiAdmission.MutatingWebhookConfiguration)
-				newConfig := newObj.(*kubeApiAdmission.MutatingWebhookConfiguration)
-
-				if oldConfig.ResourceVersion != newConfig.ResourceVersion {
-					for i, w := range newConfig.Webhooks {
-						if w.Name == webhookName && !bytes.Equal(newConfig.Webhooks[i].ClientConfig.CABundle, caCertPem) {
-							log.Infof("Detected a change in CABundle, patching MutatingWebhookConfiguration again")
-							shouldPatch <- struct{}{}
-							break
-						}
-					}
-				}
-			},
-		},
-	)
-	go controller.Run(stopCh)
-
-	go func() {
-		var delayedRetryC <-chan time.Time
-		if retry {
-			delayedRetryC = time.After(delayedRetryTime)
-		}
-
-		for {
-			select {
-			case <-delayedRetryC:
-				if retry := doPatch(client, injectionWebhookConfigName, webhookName, caCertPem); retry {
-					delayedRetryC = time.After(delayedRetryTime)
-				} else {
-					log.Infof("Retried patch succeeded")
-					delayedRetryC = nil
-				}
-			case <-shouldPatch:
-				if retry := doPatch(client, injectionWebhookConfigName, webhookName, caCertPem); retry {
-					if delayedRetryC == nil {
-						delayedRetryC = time.After(delayedRetryTime)
-					}
-				} else {
-					delayedRetryC = nil
-				}
+	for i, wh := range config.Webhooks {
+		if strings.HasSuffix(wh.Name, w.webhookName) {
+			if !bytes.Equal(caCertPem, config.Webhooks[i].ClientConfig.CABundle) {
+				updated = true
 			}
+			config.Webhooks[i].ClientConfig.CABundle = caCertPem
+			found = true
 		}
-	}()
+	}
+	if !found {
+		reportWebhookPatchFailure(webhookConfigName, reasonWebhookEntryNotFound)
+		return errNoWebhookWithName
+	}
+
+	if updated {
+		_, err = client.Update(context.Background(), config, metav1.UpdateOptions{})
+		if err != nil {
+			reportWebhookPatchFailure(webhookConfigName, reasonWebhookUpdateFailure)
+		}
+	}
+
+	return err
 }
 
-func doPatch(cs kubernetes.Interface, webhookConfigName, webhookName string, caCertPem []byte) (retry bool) {
-	client := cs.AdmissionregistrationV1().MutatingWebhookConfigurations()
-	if err := patchMutatingWebhookConfig(client, webhookConfigName, webhookName, caCertPem); err != nil {
-		log.Errorf("Patch webhook failed: %v", err)
-		return true
+// startCaBundleWatcher listens for updates to the CA bundle and patches the webhooks.
+func (w *WebhookCertPatcher) startCaBundleWatcher(stop <-chan struct{}) {
+	id, watchCh := w.CABundleWatcher.AddWatcher()
+	defer w.CABundleWatcher.RemoveWatcher(id)
+	for {
+		select {
+		case <-watchCh:
+			lists := w.informer.GetStore().List()
+			for _, list := range lists {
+				mutatingWebhookConfig := list.(*v1.MutatingWebhookConfiguration)
+				if mutatingWebhookConfig == nil {
+					continue
+				}
+				log.Debugf("updating caBundle for webhook %q", mutatingWebhookConfig.Name)
+				w.queue.Add(types.NamespacedName{Name: mutatingWebhookConfig.Name})
+			}
+		case <-stop:
+			return
+		}
 	}
-	log.Infof("Patched webhook %s", webhookName)
-	return false
-}
-
-func CreateValidationWebhookController(client kube.Client,
-	webhookConfigName, ns, caBundlePath string, remote bool) *controller.Controller {
-	o := controller.Options{
-		WatchedNamespace:    ns,
-		CAPath:              caBundlePath,
-		WebhookConfigName:   webhookConfigName,
-		ServiceName:         "istiod",
-		RemoteWebhookConfig: remote,
-	}
-	whController, err := controller.New(o, client)
-	if err != nil {
-		log.Errorf("failed to create validationWebhookController controller: %v", err)
-	}
-	return whController
 }

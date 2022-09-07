@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@ package repair
 import (
 	v1 "k8s.io/api/core/v1"
 	v12 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
 
 type makePodArgs struct {
@@ -77,7 +79,7 @@ func makePod(args makePodArgs) *v1.Pod {
 // Container specs
 var (
 	brokenInitContainerWaiting = v1.ContainerStatus{
-		Name: ValidationContainerName,
+		Name: constants.ValidationContainerName,
 		State: v1.ContainerState{
 			Waiting: &v1.ContainerStateWaiting{
 				Reason:  "CrashLoopBackOff",
@@ -86,7 +88,7 @@ var (
 		},
 		LastTerminationState: v1.ContainerState{
 			Terminated: &v1.ContainerStateTerminated{
-				ExitCode: 126,
+				ExitCode: constants.ValidationErrorCode,
 				Reason:   "Error",
 				Message:  "Died for some reason",
 			},
@@ -94,17 +96,17 @@ var (
 	}
 
 	brokenInitContainerTerminating = v1.ContainerStatus{
-		Name: ValidationContainerName,
+		Name: constants.ValidationContainerName,
 		State: v1.ContainerState{
 			Terminated: &v1.ContainerStateTerminated{
-				ExitCode: 126,
+				ExitCode: constants.ValidationErrorCode,
 				Reason:   "Error",
 				Message:  "Died for some reason",
 			},
 		},
 		LastTerminationState: v1.ContainerState{
 			Terminated: &v1.ContainerStateTerminated{
-				ExitCode: 126,
+				ExitCode: constants.ValidationErrorCode,
 				Reason:   "Error",
 				Message:  "Died for some reason",
 			},
@@ -112,7 +114,7 @@ var (
 	}
 
 	workingInitContainerDiedPreviously = v1.ContainerStatus{
-		Name: ValidationContainerName,
+		Name: constants.ValidationContainerName,
 		State: v1.ContainerState{
 			Terminated: &v1.ContainerStateTerminated{
 				ExitCode: 0,
@@ -129,7 +131,7 @@ var (
 	}
 
 	workingInitContainer = v1.ContainerStatus{
-		Name: ValidationContainerName,
+		Name: constants.ValidationContainerName,
 		State: v1.ContainerState{
 			Terminated: &v1.ContainerStateTerminated{
 				ExitCode: 0,
@@ -158,6 +160,7 @@ var (
 		Annotations: map[string]string{
 			"sidecar.istio.io/status": "something",
 		},
+		NodeName:            "TestNode",
 		InitContainerStatus: &brokenInitContainerWaiting,
 	})
 

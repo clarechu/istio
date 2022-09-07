@@ -15,6 +15,7 @@
 package util
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"sort"
@@ -27,25 +28,25 @@ import (
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	http_conn "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/conversion"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
-	"github.com/gogo/protobuf/types"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/any"
-	"github.com/golang/protobuf/ptypes/duration"
-	pstruct "github.com/golang/protobuf/ptypes/struct"
-	"github.com/golang/protobuf/ptypes/wrappers"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
-	"istio.io/pkg/log"
-
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/serviceregistry"
-	"istio.io/istio/pkg/config/host"
+	istionetworking "istio.io/istio/pilot/pkg/networking"
+	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/proto/merge"
 	"istio.io/istio/pkg/util/strcase"
+	"istio.io/pkg/log"
 )
 
 const (
@@ -65,9 +66,6 @@ const (
 	// Inbound pass through cluster need to the bind the loopback ip address for the security and loop avoidance.
 	InboundPassthroughClusterIpv4 = "InboundPassthroughClusterIpv4"
 	InboundPassthroughClusterIpv6 = "InboundPassthroughClusterIpv6"
-	// 6 is the magical number for inbound: 15006, 127.0.0.6, ::6
-	InboundPassthroughBindIpv4 = "127.0.0.6"
-	InboundPassthroughBindIpv6 = "::6"
 
 	// SniClusterFilter is the name of the sni_cluster envoy filter
 	SniClusterFilter = "envoy.filters.network.sni_cluster"
@@ -80,20 +78,8 @@ const (
 	// which determines the endpoint level transport socket configuration.
 	EnvoyTransportSocketMetadataKey = "envoy.transport_socket_match"
 
-	// EnvoyRawBufferSocketName matched with hardcoded built-in Envoy transport name which determines
-	// endpoint level plantext transport socket configuration
-	EnvoyRawBufferSocketName = wellknown.TransportSocketRawBuffer
-
-	// EnvoyTLSSocketName matched with hardcoded built-in Envoy transport name which determines endpoint
-	// level tls transport socket configuration
-	EnvoyTLSSocketName = wellknown.TransportSocketTls
-
-	// StatName patterns
-	serviceStatPattern         = "%SERVICE%"
-	serviceFQDNStatPattern     = "%SERVICE_FQDN%"
-	servicePortStatPattern     = "%SERVICE_PORT%"
-	servicePortNameStatPattern = "%SERVICE_PORT_NAME%"
-	subsetNameStatPattern      = "%SUBSET_NAME%"
+	// Well-known header names
+	AltSvcHeader = "alt-svc"
 )
 
 // ALPNH2Only advertises that Proxy is going to use HTTP/2 when talking to the cluster.
@@ -121,25 +107,14 @@ var ALPNInMeshWithMxc = []string{"istio-peer-exchange", "istio"}
 // ALPNHttp advertises that Proxy is going to talking either http2 or http 1.1.
 var ALPNHttp = []string{"h2", "http/1.1"}
 
-// ALPNDownstream advertises that Proxy is going to talking either tcp(for metadata exchange), http2 or http 1.1.
-var ALPNDownstream = []string{"istio-peer-exchange", "h2", "http/1.1"}
+// ALPNHttp3OverQUIC advertises that Proxy is going to talk HTTP/3 over QUIC
+var ALPNHttp3OverQUIC = []string{"h3"}
 
-// FallThroughFilterChainBlackHoleService is the blackhole service used for fall though
-// filter chain
-var FallThroughFilterChainBlackHoleService = &model.Service{
-	Hostname: host.Name(BlackHoleCluster),
-	Attributes: model.ServiceAttributes{
-		Name: BlackHoleCluster,
-	},
-}
+// ALPNDownstreamWithMxc advertises that Proxy is going to talk either tcp(for metadata exchange), http2 or http 1.1.
+var ALPNDownstreamWithMxc = []string{"istio-peer-exchange", "h2", "http/1.1"}
 
-// FallThroughFilterChainPassthroughService is the passthrough service used for fall though
-var FallThroughFilterChainPassthroughService = &model.Service{
-	Hostname: host.Name(PassthroughCluster),
-	Attributes: model.ServiceAttributes{
-		Name: PassthroughCluster,
-	},
-}
+// RegexEngine is the default google RE2 regex engine.
+var RegexEngine = &matcher.RegexMatcher_GoogleRe2{GoogleRe2: &matcher.RegexMatcher_GoogleRE2{}}
 
 func getMaxCidrPrefix(addr string) uint32 {
 	ip := net.ParseIP(addr)
@@ -151,6 +126,15 @@ func getMaxCidrPrefix(addr string) uint32 {
 	return 32
 }
 
+func ListContains(haystack []string, needle string) bool {
+	for _, n := range haystack {
+		if needle == n {
+			return true
+		}
+	}
+	return false
+}
+
 // ConvertAddressToCidr converts from string to CIDR proto
 func ConvertAddressToCidr(addr string) *core.CidrRange {
 	if len(addr) == 0 {
@@ -159,7 +143,7 @@ func ConvertAddressToCidr(addr string) *core.CidrRange {
 
 	cidr := &core.CidrRange{
 		AddressPrefix: addr,
-		PrefixLen: &wrappers.UInt32Value{
+		PrefixLen: &wrapperspb.UInt32Value{
 			Value: getMaxCidrPrefix(addr),
 		},
 	}
@@ -175,17 +159,9 @@ func ConvertAddressToCidr(addr string) *core.CidrRange {
 
 // BuildAddress returns a SocketAddress with the given ip and port or uds.
 func BuildAddress(bind string, port uint32) *core.Address {
-	if port != 0 {
-		return &core.Address{
-			Address: &core.Address_SocketAddress{
-				SocketAddress: &core.SocketAddress{
-					Address: bind,
-					PortSpecifier: &core.SocketAddress_PortValue{
-						PortValue: port,
-					},
-				},
-			},
-		}
+	address := BuildNetworkAddress(bind, port, istionetworking.TransportProtocolTCP)
+	if address != nil {
+		return address
 	}
 
 	return &core.Address{
@@ -197,53 +173,21 @@ func BuildAddress(bind string, port uint32) *core.Address {
 	}
 }
 
-// MessageToAnyWithError converts from proto message to proto Any
-func MessageToAnyWithError(msg proto.Message) (*any.Any, error) {
-	b := proto.NewBuffer(nil)
-	b.SetDeterministic(true)
-	err := b.Marshal(msg)
-	if err != nil {
-		return nil, err
-	}
-	return &any.Any{
-		// nolint: staticcheck
-		TypeUrl: "type.googleapis.com/" + proto.MessageName(msg),
-		Value:   b.Bytes(),
-	}, nil
-}
-
-// MessageToAny converts from proto message to proto Any
-func MessageToAny(msg proto.Message) *any.Any {
-	out, err := MessageToAnyWithError(msg)
-	if err != nil {
-		log.Error(fmt.Sprintf("error marshaling Any %s: %v", msg.String(), err))
+func BuildNetworkAddress(bind string, port uint32, transport istionetworking.TransportProtocol) *core.Address {
+	if port == 0 {
 		return nil
 	}
-	return out
-}
-
-// MessageToStruct converts from proto message to proto Struct
-func MessageToStruct(msg proto.Message) *pstruct.Struct {
-	s, err := conversion.MessageToStruct(msg)
-	if err != nil {
-		log.Error(err.Error())
-		return &pstruct.Struct{}
+	return &core.Address{
+		Address: &core.Address_SocketAddress{
+			SocketAddress: &core.SocketAddress{
+				Address:  bind,
+				Protocol: transport.ToEnvoySocketProtocol(),
+				PortSpecifier: &core.SocketAddress_PortValue{
+					PortValue: port,
+				},
+			},
+		},
 	}
-	return s
-}
-
-// GogoDurationToDuration converts from gogo proto duration to time.duration
-func GogoDurationToDuration(d *types.Duration) *duration.Duration {
-	if d == nil {
-		return nil
-	}
-	dur, err := types.DurationFromProto(d)
-	if err != nil {
-		// TODO(mostrowski): add error handling instead.
-		log.Warnf("error converting duration %#v, using 0: %v", d, err)
-		return nil
-	}
-	return ptypes.DurationProto(dur)
 }
 
 // SortVirtualHosts sorts a slice of virtual hosts by name.
@@ -259,16 +203,22 @@ func SortVirtualHosts(hosts []*route.VirtualHost) {
 	})
 }
 
-// IsIstioVersionGE15 checks whether the given Istio version is greater than or equals 1.5.
-func IsIstioVersionGE15(node *model.Proxy) bool {
-	return node.IstioVersion == nil ||
-		node.IstioVersion.Compare(&model.IstioVersion{Major: 1, Minor: 5, Patch: -1}) >= 0
+// IsIstioVersionGE114 checks whether the given Istio version is greater than or equals 1.14.
+func IsIstioVersionGE114(version *model.IstioVersion) bool {
+	return version == nil ||
+		version.Compare(&model.IstioVersion{Major: 1, Minor: 14, Patch: -1}) >= 0
 }
 
-// IsIstioVersionGE17 checks whether the given Istio version is greater than or equals 1.7.
-func IsIstioVersionGE17(node *model.Proxy) bool {
-	return node.IstioVersion == nil ||
-		node.IstioVersion.Compare(&model.IstioVersion{Major: 1, Minor: 7, Patch: -1}) >= 0
+// IsIstioVersionGE115 checks whether the given Istio version is greater than or equals 1.15.
+func IsIstioVersionGE115(version *model.IstioVersion) bool {
+	return version == nil ||
+		version.Compare(&model.IstioVersion{Major: 1, Minor: 15, Patch: -1}) >= 0
+}
+
+// IsIstioVersionGE116 checks whether the given Istio version is greater than or equals 1.16.
+func IsIstioVersionGE116(version *model.IstioVersion) bool {
+	return version == nil ||
+		version.Compare(&model.IstioVersion{Major: 1, Minor: 16, Patch: -1}) >= 0
 }
 
 func IsProtocolSniffingEnabledForPort(port *model.Port) bool {
@@ -289,7 +239,7 @@ func ConvertLocality(locality string) *core.Locality {
 		return &core.Locality{}
 	}
 
-	region, zone, subzone := SplitLocality(locality)
+	region, zone, subzone := model.SplitLocalityLabel(locality)
 	return &core.Locality{
 		Region:  region,
 		Zone:    zone,
@@ -297,7 +247,7 @@ func ConvertLocality(locality string) *core.Locality {
 	}
 }
 
-// ConvertLocality converts '/' separated locality string to Locality struct.
+// LocalityToString converts Locality struct to '/' separated locality string.
 func LocalityToString(l *core.Locality) string {
 	if l == nil {
 		return ""
@@ -314,6 +264,18 @@ func LocalityToString(l *core.Locality) string {
 	return resp
 }
 
+// GetFailoverPriorityLabels returns a byte array which contains failover priorities of the proxy.
+func GetFailoverPriorityLabels(proxyLabels map[string]string, priorities []string) []byte {
+	var b bytes.Buffer
+	for _, key := range priorities {
+		b.WriteString(key)
+		b.WriteRune(':')
+		b.WriteString(proxyLabels[key])
+		b.WriteRune(' ')
+	}
+	return b.Bytes()
+}
+
 // IsLocalityEmpty checks if a locality is empty (checking region is good enough, based on how its initialized)
 func IsLocalityEmpty(locality *core.Locality) bool {
 	if locality == nil || (len(locality.GetRegion()) == 0) {
@@ -323,7 +285,7 @@ func IsLocalityEmpty(locality *core.Locality) bool {
 }
 
 func LocalityMatch(proxyLocality *core.Locality, ruleLocality string) bool {
-	ruleRegion, ruleZone, ruleSubzone := SplitLocality(ruleLocality)
+	ruleRegion, ruleZone, ruleSubzone := model.SplitLocalityLabel(ruleLocality)
 	regionMatch := ruleRegion == "*" || proxyLocality.GetRegion() == ruleRegion
 	zoneMatch := ruleZone == "*" || ruleZone == "" || proxyLocality.GetZone() == ruleZone
 	subzoneMatch := ruleSubzone == "*" || ruleSubzone == "" || proxyLocality.GetSubZone() == ruleSubzone
@@ -332,18 +294,6 @@ func LocalityMatch(proxyLocality *core.Locality, ruleLocality string) bool {
 		return true
 	}
 	return false
-}
-
-func SplitLocality(locality string) (region, zone, subzone string) {
-	items := strings.Split(locality, "/")
-	switch len(items) {
-	case 1:
-		return items[0], "", ""
-	case 2:
-		return items[0], items[1], ""
-	default:
-		return items[0], items[1], items[2]
-	}
 }
 
 func LbPriority(proxyLocality, endpointsLocality *core.Locality) int {
@@ -377,58 +327,68 @@ func CloneClusterLoadAssignment(original *endpoint.ClusterLoadAssignment) *endpo
 func cloneLocalityLbEndpoints(endpoints []*endpoint.LocalityLbEndpoints) []*endpoint.LocalityLbEndpoints {
 	out := make([]*endpoint.LocalityLbEndpoints, 0, len(endpoints))
 	for _, ep := range endpoints {
-		clone := &endpoint.LocalityLbEndpoints{}
-		clone.Locality = ep.Locality
-		clone.LbEndpoints = ep.LbEndpoints
-		clone.Proximity = ep.Proximity
-		clone.Priority = ep.Priority
-		if ep.LoadBalancingWeight != nil {
-			clone.LoadBalancingWeight = &wrappers.UInt32Value{
-				Value: ep.GetLoadBalancingWeight().GetValue(),
-			}
-		}
+		clone := CloneLocalityLbEndpoint(ep)
 		out = append(out, clone)
 	}
 	return out
 }
 
-// BuildConfigInfoMetadata builds core.Metadata struct containing the
-// name.namespace of the config, the type, etc.
-func BuildConfigInfoMetadata(config model.ConfigMeta) *core.Metadata {
-	s := "/apis/" + config.GroupVersionKind.Group + "/" + config.GroupVersionKind.Version + "/namespaces/" + config.Namespace + "/" +
-		strcase.CamelCaseToKebabCase(config.GroupVersionKind.Kind) + "/" + config.Name
-	return &core.Metadata{
-		FilterMetadata: map[string]*pstruct.Struct{
-			IstioMetadataKey: {
-				Fields: map[string]*pstruct.Value{
-					"config": {
-						Kind: &pstruct.Value_StringValue{
-							StringValue: s,
-						},
-					},
-				},
-			},
-		},
+// return a shallow copy of LocalityLbEndpoints
+func CloneLocalityLbEndpoint(ep *endpoint.LocalityLbEndpoints) *endpoint.LocalityLbEndpoints {
+	clone := &endpoint.LocalityLbEndpoints{}
+	clone.Locality = ep.Locality
+	clone.LbEndpoints = ep.LbEndpoints
+	clone.Proximity = ep.Proximity
+	clone.Priority = ep.Priority
+	if ep.LoadBalancingWeight != nil {
+		clone.LoadBalancingWeight = &wrapperspb.UInt32Value{
+			Value: ep.GetLoadBalancingWeight().GetValue(),
+		}
 	}
+	return clone
 }
 
-// AddSubsetToMetadata will build a new core.Metadata struct containing the
-// subset name supplied. This is used for telemetry reporting. A new core.Metadata
-// is created to prevent modification to shared base Metadata across subsets, etc.
-// This should be called after the initial "istio" metadata has been created for the
-// cluster. If the "istio" metadata field is not already defined, the subset information will
-// not be added (to prevent adding this information where not needed).
-func AddSubsetToMetadata(md *core.Metadata, subset string) *core.Metadata {
-	updatedMeta := &core.Metadata{}
-	proto.Merge(updatedMeta, md)
-	if istioMeta, ok := updatedMeta.FilterMetadata[IstioMetadataKey]; ok {
-		istioMeta.Fields["subset"] = &pstruct.Value{
-			Kind: &pstruct.Value_StringValue{
+// BuildConfigInfoMetadata builds core.Metadata struct containing the
+// name.namespace of the config, the type, etc.
+func BuildConfigInfoMetadata(config config.Meta) *core.Metadata {
+	return AddConfigInfoMetadata(nil, config)
+}
+
+// AddConfigInfoMetadata adds name.namespace of the config, the type, etc
+// to the given core.Metadata struct, if metadata is not initialized, build a new metadata.
+func AddConfigInfoMetadata(metadata *core.Metadata, config config.Meta) *core.Metadata {
+	if metadata == nil {
+		metadata = &core.Metadata{
+			FilterMetadata: map[string]*structpb.Struct{},
+		}
+	}
+	s := "/apis/" + config.GroupVersionKind.Group + "/" + config.GroupVersionKind.Version + "/namespaces/" + config.Namespace + "/" +
+		strcase.CamelCaseToKebabCase(config.GroupVersionKind.Kind) + "/" + config.Name
+	if _, ok := metadata.FilterMetadata[IstioMetadataKey]; !ok {
+		metadata.FilterMetadata[IstioMetadataKey] = &structpb.Struct{
+			Fields: map[string]*structpb.Value{},
+		}
+	}
+	metadata.FilterMetadata[IstioMetadataKey].Fields["config"] = &structpb.Value{
+		Kind: &structpb.Value_StringValue{
+			StringValue: s,
+		},
+	}
+	return metadata
+}
+
+// AddSubsetToMetadata will insert the subset name supplied. This should be called after the initial
+// "istio" metadata has been created for the cluster. If the "istio" metadata field is not already
+// defined, the subset information will not be added (to prevent adding this information where not
+// needed). This is used for telemetry reporting.
+func AddSubsetToMetadata(md *core.Metadata, subset string) {
+	if istioMeta, ok := md.FilterMetadata[IstioMetadataKey]; ok {
+		istioMeta.Fields["subset"] = &structpb.Value{
+			Kind: &structpb.Value_StringValue{
 				StringValue: subset,
 			},
 		}
 	}
-	return updatedMeta
 }
 
 // IsHTTPFilterChain returns true if the filter chain contains a HTTP connection manager filter
@@ -441,94 +401,125 @@ func IsHTTPFilterChain(filterChain *listener.FilterChain) bool {
 	return false
 }
 
-// MergeAnyWithStruct merges a given struct into the given Any typed message by dynamically inferring the
-// type of Any, converting the struct into the inferred type, merging the two messages, and then
-// marshaling the merged message back into Any.
-func MergeAnyWithStruct(a *any.Any, pbStruct *pstruct.Struct) (*any.Any, error) {
-	// Assuming that Pilot is compiled with this type [which should always be the case]
-	var err error
-	var x ptypes.DynamicAny
-
-	// First get an object of type used by this message
-	if err = ptypes.UnmarshalAny(a, &x); err != nil {
-		return nil, err
-	}
-
-	// Create a typed copy. We will convert the user's struct to this type
-	temp := proto.Clone(x.Message)
-	temp.Reset()
-	if err = conversion.StructToMessage(pbStruct, temp); err != nil {
-		return nil, err
-	}
-
-	// Merge the two typed protos
-	proto.Merge(x.Message, temp)
-	var retVal *any.Any
-	// Convert the merged proto back to any
-	if retVal, err = ptypes.MarshalAny(x.Message); err != nil {
-		return nil, err
-	}
-
-	return retVal, nil
-}
-
 // MergeAnyWithAny merges a given any typed message into the given Any typed message by dynamically inferring the
 // type of Any
-func MergeAnyWithAny(dst *any.Any, src *any.Any) (*any.Any, error) {
+func MergeAnyWithAny(dst *anypb.Any, src *anypb.Any) (*anypb.Any, error) {
 	// Assuming that Pilot is compiled with this type [which should always be the case]
 	var err error
-	var dstX, srcX ptypes.DynamicAny
 
 	// get an object of type used by this message
-	if err = ptypes.UnmarshalAny(dst, &dstX); err != nil {
+	dstX, err := dst.UnmarshalNew()
+	if err != nil {
 		return nil, err
 	}
 
 	// get an object of type used by this message
-	if err = ptypes.UnmarshalAny(src, &srcX); err != nil {
+	srcX, err := src.UnmarshalNew()
+	if err != nil {
 		return nil, err
 	}
 
 	// Merge the two typed protos
-	proto.Merge(dstX.Message, srcX.Message)
-	var retVal *any.Any
+	merge.Merge(dstX, srcX)
+
 	// Convert the merged proto back to dst
-	if retVal, err = ptypes.MarshalAny(dstX.Message); err != nil {
-		return nil, err
-	}
+	retVal := protoconv.MessageToAny(dstX)
 
 	return retVal, nil
 }
 
 // BuildLbEndpointMetadata adds metadata values to a lb endpoint
-func BuildLbEndpointMetadata(network string, tlsMode string, push *model.PushContext) *core.Metadata {
-	if network == "" && tlsMode == model.DisabledTLSModeLabel {
+func BuildLbEndpointMetadata(networkID network.ID, tlsMode, workloadname, namespace string,
+	clusterID cluster.ID, labels labels.Instance,
+) *core.Metadata {
+	if networkID == "" && (tlsMode == "" || tlsMode == model.DisabledTLSModeLabel) &&
+		(!features.EndpointTelemetryLabel || !features.EnableTelemetryLabel) {
 		return nil
 	}
 
 	metadata := &core.Metadata{
-		FilterMetadata: map[string]*pstruct.Struct{},
+		FilterMetadata: map[string]*structpb.Struct{},
 	}
 
-	if network != "" {
-		metadata.FilterMetadata[IstioMetadataKey] = &pstruct.Struct{
-			Fields: map[string]*pstruct.Value{},
-		}
-
-		if network != "" {
-			metadata.FilterMetadata[IstioMetadataKey].Fields["network"] = &pstruct.Value{Kind: &pstruct.Value_StringValue{StringValue: network}}
-		}
-	}
-
-	if tlsMode != "" {
-		metadata.FilterMetadata[EnvoyTransportSocketMetadataKey] = &pstruct.Struct{
-			Fields: map[string]*pstruct.Value{
-				model.TLSModeLabelShortname: {Kind: &pstruct.Value_StringValue{StringValue: tlsMode}},
+	if tlsMode != "" && tlsMode != model.DisabledTLSModeLabel {
+		metadata.FilterMetadata[EnvoyTransportSocketMetadataKey] = &structpb.Struct{
+			Fields: map[string]*structpb.Value{
+				model.TLSModeLabelShortname: {Kind: &structpb.Value_StringValue{StringValue: tlsMode}},
 			},
 		}
 	}
 
+	// Add compressed telemetry metadata. Note this is a short term solution to make server workload metadata
+	// available at client sidecar, so that telemetry filter could use for metric labels. This is useful for two cases:
+	// server does not have sidecar injected, and request fails to reach server and thus metadata exchange does not happen.
+	// Due to performance concern, telemetry metadata is compressed into a semicolon separted string:
+	// workload-name;namespace;canonical-service-name;canonical-service-revision;cluster-id.
+	if features.EndpointTelemetryLabel {
+		var sb strings.Builder
+		sb.WriteString(workloadname)
+		sb.WriteString(";")
+		sb.WriteString(namespace)
+		sb.WriteString(";")
+		if csn, ok := labels[model.IstioCanonicalServiceLabelName]; ok {
+			sb.WriteString(csn)
+		}
+		sb.WriteString(";")
+		if csr, ok := labels[model.IstioCanonicalServiceRevisionLabelName]; ok {
+			sb.WriteString(csr)
+		}
+		sb.WriteString(";")
+		sb.WriteString(clusterID.String())
+		addIstioEndpointLabel(metadata, "workload", &structpb.Value{Kind: &structpb.Value_StringValue{StringValue: sb.String()}})
+	}
+
 	return metadata
+}
+
+// MaybeApplyTLSModeLabel may or may not update the metadata for the Envoy transport socket matches for auto mTLS.
+func MaybeApplyTLSModeLabel(ep *endpoint.LbEndpoint, tlsMode string) (*endpoint.LbEndpoint, bool) {
+	if ep == nil || ep.Metadata == nil {
+		return nil, false
+	}
+	epTLSMode := ""
+	if ep.Metadata.FilterMetadata != nil {
+		if v, ok := ep.Metadata.FilterMetadata[EnvoyTransportSocketMetadataKey]; ok {
+			epTLSMode = v.Fields[model.TLSModeLabelShortname].GetStringValue()
+		}
+	}
+	// Normalize the tls label name before comparison. This ensure we won't falsely cloning
+	// the endpoint when they are "" and model.DisabledTLSModeLabel.
+	if epTLSMode == model.DisabledTLSModeLabel {
+		epTLSMode = ""
+	}
+	if tlsMode == model.DisabledTLSModeLabel {
+		tlsMode = ""
+	}
+	if epTLSMode == tlsMode {
+		return nil, false
+	}
+	// We make a copy instead of modifying on existing endpoint pointer directly to avoid data race.
+	// See https://github.com/istio/istio/issues/34227 for details.
+	newEndpoint := proto.Clone(ep).(*endpoint.LbEndpoint)
+	if tlsMode != "" && tlsMode != model.DisabledTLSModeLabel {
+		newEndpoint.Metadata.FilterMetadata[EnvoyTransportSocketMetadataKey] = &structpb.Struct{
+			Fields: map[string]*structpb.Value{
+				model.TLSModeLabelShortname: {Kind: &structpb.Value_StringValue{StringValue: tlsMode}},
+			},
+		}
+	} else {
+		delete(newEndpoint.Metadata.FilterMetadata, EnvoyTransportSocketMetadataKey)
+	}
+	return newEndpoint, true
+}
+
+func addIstioEndpointLabel(metadata *core.Metadata, key string, val *structpb.Value) {
+	if _, ok := metadata.FilterMetadata[IstioMetadataKey]; !ok {
+		metadata.FilterMetadata[IstioMetadataKey] = &structpb.Struct{
+			Fields: map[string]*structpb.Value{},
+		}
+	}
+
+	metadata.FilterMetadata[IstioMetadataKey].Fields[key] = val
 }
 
 // IsAllowAnyOutbound checks if allow_any is enabled for outbound traffic
@@ -536,25 +527,6 @@ func IsAllowAnyOutbound(node *model.Proxy) bool {
 	return node.SidecarScope != nil &&
 		node.SidecarScope.OutboundTrafficPolicy != nil &&
 		node.SidecarScope.OutboundTrafficPolicy.Mode == networking.OutboundTrafficPolicy_ALLOW_ANY
-}
-
-// BuildStatPrefix builds a stat prefix based on the stat pattern.
-func BuildStatPrefix(statPattern string, host string, subset string, port *model.Port, attributes model.ServiceAttributes) string {
-	prefix := strings.ReplaceAll(statPattern, serviceStatPattern, shortHostName(host, attributes))
-	prefix = strings.ReplaceAll(prefix, serviceFQDNStatPattern, host)
-	prefix = strings.ReplaceAll(prefix, subsetNameStatPattern, subset)
-	prefix = strings.ReplaceAll(prefix, servicePortStatPattern, strconv.Itoa(port.Port))
-	prefix = strings.ReplaceAll(prefix, servicePortNameStatPattern, port.Name)
-	return prefix
-}
-
-// shortHostName constructs the name from kubernetes hosts based on attributes (name and namespace).
-// For other hosts like VMs, this method does not do any thing - just returns the passed in host as is.
-func shortHostName(host string, attributes model.ServiceAttributes) string {
-	if attributes.ServiceRegistry == string(serviceregistry.Kubernetes) {
-		return attributes.Name + "." + attributes.Namespace
-	}
-	return host
 }
 
 func StringToExactMatch(in []string) []*matcher.StringMatcher {
@@ -568,6 +540,50 @@ func StringToExactMatch(in []string) []*matcher.StringMatcher {
 		})
 	}
 	return res
+}
+
+func StringToPrefixMatch(in []string) []*matcher.StringMatcher {
+	if len(in) == 0 {
+		return nil
+	}
+	res := make([]*matcher.StringMatcher, 0, len(in))
+	for _, s := range in {
+		res = append(res, &matcher.StringMatcher{
+			MatchPattern: &matcher.StringMatcher_Prefix{Prefix: s},
+		})
+	}
+	return res
+}
+
+func ConvertToEnvoyMatches(in []*networking.StringMatch) []*matcher.StringMatcher {
+	res := make([]*matcher.StringMatcher, 0, len(in))
+
+	for _, im := range in {
+		if em := ConvertToEnvoyMatch(im); em != nil {
+			res = append(res, em)
+		}
+	}
+
+	return res
+}
+
+func ConvertToEnvoyMatch(in *networking.StringMatch) *matcher.StringMatcher {
+	switch m := in.MatchType.(type) {
+	case *networking.StringMatch_Exact:
+		return &matcher.StringMatcher{MatchPattern: &matcher.StringMatcher_Exact{Exact: m.Exact}}
+	case *networking.StringMatch_Prefix:
+		return &matcher.StringMatcher{MatchPattern: &matcher.StringMatcher_Prefix{Prefix: m.Prefix}}
+	case *networking.StringMatch_Regex:
+		return &matcher.StringMatcher{
+			MatchPattern: &matcher.StringMatcher_SafeRegex{
+				SafeRegex: &matcher.RegexMatcher{
+					EngineType: RegexEngine,
+					Regex:      m.Regex,
+				},
+			},
+		}
+	}
+	return nil
 }
 
 func StringSliceEqual(a, b []string) bool {
@@ -604,7 +620,15 @@ func CidrRangeSliceEqual(a, b []*core.CidrRange) bool {
 	}
 
 	for i := range a {
-		if a[i].GetAddressPrefix() != b[i].GetAddressPrefix() || a[i].GetPrefixLen().GetValue() != b[i].GetPrefixLen().GetValue() {
+		netA, err := toIPNet(a[i])
+		if err != nil {
+			return false
+		}
+		netB, err := toIPNet(b[i])
+		if err != nil {
+			return false
+		}
+		if netA.IP.String() != netB.IP.String() {
 			return false
 		}
 	}
@@ -612,8 +636,45 @@ func CidrRangeSliceEqual(a, b []*core.CidrRange) bool {
 	return true
 }
 
+func toIPNet(c *core.CidrRange) (*net.IPNet, error) {
+	_, cA, err := net.ParseCIDR(c.AddressPrefix + "/" + strconv.Itoa(int(c.PrefixLen.GetValue())))
+	if err != nil {
+		log.Errorf("failed to parse CidrRange %v as IPNet: %v", c, err)
+	}
+	return cA, err
+}
+
 // meshconfig ForwardClientCertDetails and the Envoy config enum are off by 1
 // due to the UNDEFINED in the meshconfig ForwardClientCertDetails
 func MeshConfigToEnvoyForwardClientCertDetails(c meshconfig.Topology_ForwardClientCertDetails) http_conn.HttpConnectionManager_ForwardClientCertDetails {
 	return http_conn.HttpConnectionManager_ForwardClientCertDetails(c - 1)
+}
+
+// ByteCount returns a human readable byte format
+// Inspired by https://yourbasic.org/golang/formatting-byte-size-to-human-readable-format/
+func ByteCount(b int) string {
+	const unit = 1000
+	if b < unit {
+		return fmt.Sprintf("%dB", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB",
+		float64(b)/float64(div), "kMGTPE"[exp])
+}
+
+// IPv6Compliant encloses ipv6 addresses in square brackets followed by port number in Host header/URIs
+func IPv6Compliant(host string) string {
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+// DomainName builds the domain name for a given host and port
+func DomainName(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }

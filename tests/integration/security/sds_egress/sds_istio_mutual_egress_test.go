@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 //  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,19 +19,19 @@ package sdsegress
 
 import (
 	"context"
-	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
-	"istio.io/istio/pkg/test/echo/common/response"
 	epb "istio.io/istio/pkg/test/echo/proto"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/components/echo/echoboot"
+	"istio.io/istio/pkg/test/framework/components/echo/check"
+	"istio.io/istio/pkg/test/framework/components/echo/deployment"
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/components/prometheus"
-	"istio.io/istio/pkg/test/util/file"
+	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/tests/integration/security/util"
 )
 
@@ -50,47 +53,48 @@ func TestSdsEgressGatewayIstioMutual(t *testing.T) {
 	// Turn it back on once issue is fixed.
 	t.Skip("https://github.com/istio/istio/issues/17933")
 	framework.NewTest(t).
-		Run(func(ctx framework.TestContext) {
-			istioCfg := istio.DefaultConfigOrFail(t, ctx)
+		Features("security.egress.mtls.sds").
+		Run(func(t framework.TestContext) {
+			istioCfg := istio.DefaultConfigOrFail(t, t)
 
-			namespace.ClaimOrFail(t, ctx, istioCfg.SystemNamespace)
-			ns := namespace.NewOrFail(t, ctx, namespace.Config{
+			namespace.ClaimOrFail(t, t, istioCfg.SystemNamespace)
+			ns := namespace.NewOrFail(t, t, namespace.Config{
 				Prefix: "sds-egress-gateway-workload",
 				Inject: true,
 			})
-			applySetupConfig(ctx, ns)
+			applySetupConfig(t, ns)
 
 			testCases := map[string]struct {
 				configPath string
-				response   string
+				code       int
 			}{
 				"ISTIO_MUTUAL TLS mode requests are routed through egress succeed": {
 					configPath: istioMutualTLSGatewayConfig,
-					response:   response.StatusCodeOK,
+					code:       http.StatusOK,
 				},
 				"SIMPLE TLS mode requests are routed through gateway but fail with 503": {
 					configPath: simpleTLSGatewayConfig,
-					response:   response.StatusCodeUnavailable,
+					code:       http.StatusServiceUnavailable,
 				},
 			}
 
 			for name, tc := range testCases {
-				ctx.NewSubTest(name).
-					Run(func(ctx framework.TestContext) {
-						doIstioMutualTest(ctx, ns, tc.configPath, tc.response)
+				t.NewSubTest(name).
+					Run(func(t framework.TestContext) {
+						doIstioMutualTest(t, ns, tc.configPath, tc.code)
 					})
 			}
 		})
 }
 
 func doIstioMutualTest(
-	ctx framework.TestContext, ns namespace.Instance, configPath, expectedResp string) {
+	ctx framework.TestContext, ns namespace.Instance, configPath string, expectedCode int,
+) {
 	var client echo.Instance
-	echoboot.NewBuilder(ctx).
-		With(&client, util.EchoConfig("client", ns, false, nil)).
+	deployment.New(ctx).
+		With(&client, util.EchoConfig("client", false, nil)).
 		BuildOrFail(ctx)
-	ctx.Config().ApplyYAMLOrFail(ctx, ns.Name(), file.AsStringOrFail(ctx, configPath))
-	defer ctx.Config().DeleteYAMLOrFail(ctx, ns.Name(), file.AsStringOrFail(ctx, configPath))
+	ctx.ConfigIstio().File(ns.Name(), configPath).ApplyOrFail(ctx)
 
 	// give the configuration a moment to kick in
 	time.Sleep(time.Second * 20)
@@ -102,18 +106,16 @@ func doIstioMutualTest(
 			Url:   externalURL,
 			Count: 1,
 		})
-		if err != nil {
-			ctx.Fatalf("failed to make request from echo instance to %s: %v", externalURL, err)
-		}
-		if len(responses) < 1 {
-			ctx.Fatalf("received no responses from request to %s", externalURL)
-		}
-		resp := responses[0]
 
-		if expectedResp != resp.Code {
-			ctx.Errorf("expected status %s but got %s", expectedResp, resp.Code)
+		if err := check.And(
+			check.NoError(),
+			check.Status(expectedCode)).Check(echo.CallResult{
+			From:      client,
+			Opts:      echo.CallOptions{},
+			Responses: responses,
+		}, err); err != nil {
+			ctx.Fatal(err)
 		}
-
 	}
 
 	// give prometheus some time to ingest the metrics
@@ -136,41 +138,23 @@ func applySetupConfig(ctx framework.TestContext, ns namespace.Instance) {
 	}
 
 	for _, c := range configFiles {
-		if err := ctx.Config().ApplyYAML(ns.Name(), file.AsStringOrFail(ctx, c)); err != nil {
+		if err := ctx.ConfigIstio().File(ns.Name(), c).Apply(); err != nil {
 			ctx.Fatalf("failed to apply configuration file %s; err: %v", c, err)
 		}
 	}
 }
 
-func getMetric(ctx framework.TestContext, prometheus prometheus.Instance, query string) (float64, error) {
-	ctx.Helper()
+func getEgressRequestCountOrFail(t framework.TestContext, ns namespace.Instance, prom prometheus.Instance) int {
+	t.Helper()
 
-	value, err := prometheus.WaitForQuiesce(query)
-	if err != nil {
-		return 0, fmt.Errorf("failed to retrieve metric from prom with err: %v", err)
-	}
-
-	metric, err := prometheus.Sum(value, nil)
-	if err != nil {
-		ctx.Logf("value: %s", value.String())
-		return 0, fmt.Errorf("could not find metric value: %v", err)
-	}
-
-	return metric, nil
-}
-
-func getEgressRequestCountOrFail(ctx framework.TestContext, ns namespace.Instance, prom prometheus.Instance) int {
-	query := fmt.Sprintf("istio_requests_total{destination_app=\"%s\",source_workload_namespace=\"%s\"}",
-		egressName, ns.Name())
-	ctx.Helper()
-
-	reqCount, err := getMetric(ctx, prom, query)
-	if err != nil {
-		// assume that if the request failed, it was because there was no metric ingested
-		// if this is not the case, the test will fail down the road regardless
-		// checking for error based on string match could lead to future failure
-		reqCount = 0
-	}
-
-	return int(reqCount)
+	var res int
+	retry.UntilSuccessOrFail(t, func() error {
+		r, err := prom.QuerySum(t.Clusters().Default(), prometheus.Query{Metric: "istio_requests_total", Labels: map[string]string{
+			"destination_app":           egressName,
+			"source_workload_namespace": ns.Name(),
+		}})
+		res = int(r)
+		return err
+	})
+	return res
 }

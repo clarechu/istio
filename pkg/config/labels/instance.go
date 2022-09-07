@@ -54,17 +54,25 @@ var (
 // have labels name=kittyCat,region=us-east.
 type Instance map[string]string
 
-// SubsetOf is true if the label has identical values for the keys
+// SubsetOf is true if the label has same values for the keys
 func (i Instance) SubsetOf(that Instance) bool {
-	for k, v := range i {
-		if that[k] != v {
+	if len(i) == 0 {
+		return true
+	}
+
+	if len(that) == 0 || len(that) < len(i) {
+		return false
+	}
+
+	for k, v1 := range i {
+		if v2, ok := that[k]; !ok || v1 != v2 {
 			return false
 		}
 	}
 	return true
 }
 
-// Equals returns true if the labels are identical
+// Equals returns true if the labels are equal.
 func (i Instance) Equals(that Instance) bool {
 	if i == nil {
 		return that == nil
@@ -72,7 +80,10 @@ func (i Instance) Equals(that Instance) bool {
 	if that == nil {
 		return i == nil
 	}
-	return i.SubsetOf(that) && that.SubsetOf(i)
+	if len(i) != len(that) {
+		return false
+	}
+	return i.SubsetOf(that)
 }
 
 // Validate ensures tag is well-formed
@@ -137,7 +148,7 @@ func (i Instance) String() string {
 	sort.Strings(labels)
 
 	var buffer bytes.Buffer
-	var first = true
+	first := true
 	for _, label := range labels {
 		if !first {
 			buffer.WriteString(",")

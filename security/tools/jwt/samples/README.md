@@ -5,8 +5,8 @@ This folder contains sample data to setup end-user authentication with Istio aut
 ## Example end-user authentication policy using the mock jwks.json data
 
 ```yaml
-apiVersion: "security.istio.io/v1beta1"
-kind: "RequestAuthentication"
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
 metadata:
   name: "jwt-example"
 spec:
@@ -43,7 +43,7 @@ Alternatively, you can use the `gen-jwt.py` script to create new test token:
 TOKEN=$(./gen-jwt.py key.pem --expire=300 --iss "new-issuer@secure.istio.io")
 ```
 
-> Before you start, run the following command to install python dependences.
+> Before you start, run the following command to install python dependencies.
 
 ```bash
 pip install jwcrypto

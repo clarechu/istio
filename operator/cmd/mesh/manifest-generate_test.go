@@ -15,18 +15,23 @@
 package mesh
 
 import (
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
+	v1 "k8s.io/api/admissionregistration/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	klabels "k8s.io/apimachinery/pkg/labels"
 
 	"istio.io/istio/operator/pkg/compare"
 	"istio.io/istio/operator/pkg/helm"
+	"istio.io/istio/operator/pkg/helmreconciler"
 	"istio.io/istio/operator/pkg/manifest"
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/object"
@@ -34,13 +39,16 @@ import (
 	"istio.io/istio/operator/pkg/util/clog"
 	"istio.io/istio/operator/pkg/util/httpserver"
 	"istio.io/istio/operator/pkg/util/tgz"
+	tutil "istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/pkg/version"
 )
 
 const (
-	istioTestVersion = "istio-1.7.0"
-	testTGZFilename  = istioTestVersion + "-linux.tar.gz"
+	istioTestVersion            = "istio-1.7.0"
+	testTGZFilename             = istioTestVersion + "-linux.tar.gz"
+	testIstioDiscoveryChartPath = "charts/istio-control/istio-discovery/templates"
 )
 
 // chartSourceType defines where charts used in the test come from.
@@ -53,9 +61,23 @@ var (
 	testDataDir = filepath.Join(operatorRootDir, "cmd/mesh/testdata/manifest-generate")
 
 	// Snapshot charts are in testdata/manifest-generate/data-snapshot
-	snapshotCharts = chartSourceType(filepath.Join(testDataDir, "data-snapshot"))
+	snapshotCharts = func() chartSourceType {
+		d, err := os.MkdirTemp("", "data-snapshot-*")
+		if err != nil {
+			panic(fmt.Errorf("failed to make temp dir: %v", err))
+		}
+		f, err := os.Open("testdata/manifest-generate/data-snapshot.tar.gz")
+		if err != nil {
+			panic(fmt.Errorf("failed to read data snapshot: %v", err))
+		}
+		if err := tgz.Extract(f, d); err != nil {
+			panic(fmt.Errorf("failed to extract data snapshot: %v", err))
+		}
+		return chartSourceType(filepath.Join(d, "manifests"))
+	}()
 	// Compiled in charts come from assets.gen.go
 	compiledInCharts chartSourceType = "COMPILED"
+	_                                = compiledInCharts
 	// Live charts come from manifests/
 	liveCharts = chartSourceType(filepath.Join(env.IstioSrc, helm.OperatorSubdirFilePath))
 )
@@ -72,15 +94,23 @@ type testGroup []struct {
 	flags                       string
 	noInput                     bool
 	outputDir                   string
+	fileSelect                  []string
 	diffSelect                  string
 	diffIgnore                  string
 	chartSource                 chartSourceType
 }
 
+func TestMain(m *testing.M) {
+	code := m.Run()
+	// Cleanup uncompress snapshot charts
+	os.RemoveAll(string(snapshotCharts))
+	os.Exit(code)
+}
+
 func TestManifestGenerateComponentHubTag(t *testing.T) {
 	g := NewWithT(t)
 
-	objs, err := runManifestCommands("component_hub_tag", "", liveCharts)
+	objs, err := runManifestCommands("component_hub_tag", "", liveCharts, []string{"templates/deployment.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +150,7 @@ func TestManifestGenerateGateways(t *testing.T) {
 	flags := "-s components.ingressGateways.[0].k8s.resources.requests.memory=999Mi " +
 		"-s components.ingressGateways.[name:user-ingressgateway].k8s.resources.requests.cpu=555m"
 
-	objss, err := runManifestCommands("gateways", flags, liveCharts)
+	objss, err := runManifestCommands("gateways", flags, liveCharts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,10 +199,61 @@ func TestManifestGenerateGateways(t *testing.T) {
 	}
 }
 
+func TestManifestGenerateWithDuplicateMutatingWebhookConfig(t *testing.T) {
+	testResourceFile := "duplicate_mwc"
+
+	testCases := []struct {
+		name       string
+		force      bool
+		assertFunc func(g *WithT, objs *ObjectSet, err error)
+	}{
+		{
+			name:  "Duplicate MutatingWebhookConfiguration should be allowed when --force is enabled",
+			force: true,
+			assertFunc: func(g *WithT, objs *ObjectSet, err error) {
+				g.Expect(err).Should(BeNil())
+				g.Expect(objs.kind(name.MutatingWebhookConfigurationStr).size()).Should(Equal(2))
+			},
+		},
+		{
+			name:  "Duplicate MutatingWebhookConfiguration should not be allowed when --force is disabled",
+			force: false,
+			assertFunc: func(g *WithT, objs *ObjectSet, err error) {
+				g.Expect(err.Error()).To(ContainSubstring("Webhook overlaps with others"))
+				g.Expect(objs).Should(BeNil())
+			},
+		},
+	}
+
+	recreateSimpleTestEnv()
+
+	rs, err := readFile(filepath.Join(testDataDir, "input-extra-resources", testResourceFile+".yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = writeFile(filepath.Join(env.IstioSrc, helm.OperatorSubdirFilePath+"/"+testIstioDiscoveryChartPath+"/"+testResourceFile+".yaml"), []byte(rs))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		removeFile(filepath.Join(env.IstioSrc, helm.OperatorSubdirFilePath+"/"+testIstioDiscoveryChartPath+"/"+testResourceFile+".yaml"))
+	})
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			objs, err := fakeControllerReconcile(testResourceFile, liveCharts, &helmreconciler.Options{Force: tc.force, SkipPrune: true})
+			tc.assertFunc(g, objs, err)
+		})
+	}
+}
+
 func TestManifestGenerateIstiodRemote(t *testing.T) {
 	g := NewWithT(t)
 
-	objss, err := runManifestCommands("istiod_remote", "", liveCharts)
+	objss, err := runManifestCommands("istiod_remote", "", liveCharts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,12 +264,12 @@ func TestManifestGenerateIstiodRemote(t *testing.T) {
 		g.Expect(objs.kind(name.CRDStr).nameEquals("gateways.networking.istio.io")).Should(Not(BeNil()))
 		g.Expect(objs.kind(name.CRDStr).nameEquals("sidecars.networking.istio.io")).Should(Not(BeNil()))
 		g.Expect(objs.kind(name.CRDStr).nameEquals("virtualservices.networking.istio.io")).Should(Not(BeNil()))
-		g.Expect(objs.kind(name.CRDStr).nameEquals("adapters.config.istio.io")).Should(Not(BeNil()))
+		g.Expect(objs.kind(name.CRDStr).nameEquals("adapters.config.istio.io")).Should(BeNil())
 		g.Expect(objs.kind(name.CRDStr).nameEquals("authorizationpolicies.security.istio.io")).Should(Not(BeNil()))
 
 		g.Expect(objs.kind(name.ClusterRoleStr).nameEquals("istiod-istio-system")).Should(Not(BeNil()))
 		g.Expect(objs.kind(name.ClusterRoleStr).nameEquals("istio-reader-istio-system")).Should(Not(BeNil()))
-		g.Expect(objs.kind(name.ClusterRoleBindingStr).nameEquals("istiod-pilot-istio-system")).Should(Not(BeNil()))
+		g.Expect(objs.kind(name.ClusterRoleBindingStr).nameEquals("istiod-istio-system")).Should(Not(BeNil()))
 		g.Expect(objs.kind(name.ClusterRoleBindingStr).nameEquals("istio-reader-istio-system")).Should(Not(BeNil()))
 		g.Expect(objs.kind(name.CMStr).nameEquals("istio-sidecar-injector")).Should(Not(BeNil()))
 		g.Expect(objs.kind(name.ServiceStr).nameEquals("istiod")).Should(Not(BeNil()))
@@ -196,13 +277,9 @@ func TestManifestGenerateIstiodRemote(t *testing.T) {
 		g.Expect(objs.kind(name.SAStr).nameEquals("istiod-service-account")).Should(Not(BeNil()))
 
 		mwc := mustGetMutatingWebhookConfiguration(g, objs, "istio-sidecar-injector").Unstructured()
-		g.Expect(mwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.url", "https://xxx:15017/inject/cluster/remote0/net/network2"}))
-		g.Expect(mwc).Should(HavePathValueContain(PathValue{"webhooks.[0].namespaceSelector.matchLabels", toMap("istio-injection:enabled")}))
+		g.Expect(mwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.url", "https://xxx:15017/inject"}))
 
-		vwc := mustGetValidatingWebhookConfiguration(g, objs, "istiod-istio-system").Unstructured()
-		g.Expect(vwc).Should(HavePathValueEqual(PathValue{"webhooks.[0].clientConfig.url", "https://xxx:15017/validate"}))
-
-		ep := mustGetEndpoint(g, objs, "istiod").Unstructured()
+		ep := mustGetEndpoint(g, objs, "istiod-remote").Unstructured()
 		g.Expect(ep).Should(HavePathValueEqual(PathValue{"subsets.[0].addresses.[0]", endpointSubsetAddressVal("", "169.10.112.88", "")}))
 		g.Expect(ep).Should(HavePathValueContain(PathValue{"subsets.[0].ports.[0]", portVal("tcp-istiod", 15012, -1)}))
 
@@ -212,7 +289,7 @@ func TestManifestGenerateIstiodRemote(t *testing.T) {
 
 func TestManifestGenerateAllOff(t *testing.T) {
 	g := NewWithT(t)
-	m, _, err := generateManifest("all_off", "", liveCharts)
+	m, _, err := generateManifest("all_off", "", liveCharts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +303,7 @@ func TestManifestGenerateAllOff(t *testing.T) {
 func TestManifestGenerateFlagsMinimalProfile(t *testing.T) {
 	g := NewWithT(t)
 	// Change profile from empty to minimal using flag.
-	m, _, err := generateManifest("empty", "-s profile=minimal", liveCharts)
+	m, _, err := generateManifest("empty", "-s profile=minimal", liveCharts, []string{"templates/deployment.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +317,7 @@ func TestManifestGenerateFlagsMinimalProfile(t *testing.T) {
 
 func TestManifestGenerateFlagsSetHubTag(t *testing.T) {
 	g := NewWithT(t)
-	m, _, err := generateManifest("minimal", "-s hub=foo -s tag=bar", liveCharts)
+	m, _, err := generateManifest("minimal", "-s hub=foo -s tag=bar", liveCharts, []string{"templates/deployment.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +334,8 @@ func TestManifestGenerateFlagsSetHubTag(t *testing.T) {
 
 func TestManifestGenerateFlagsSetValues(t *testing.T) {
 	g := NewWithT(t)
-	m, _, err := generateManifest("default", "-s values.global.proxy.image=myproxy -s values.global.proxy.includeIPRanges=172.30.0.0/16,172.21.0.0/16", liveCharts)
+	m, _, err := generateManifest("default", "-s values.global.proxy.image=myproxy -s values.global.proxy.includeIPRanges=172.30.0.0/16,172.21.0.0/16", liveCharts,
+		[]string{"templates/deployment.yaml", "templates/istiod-injector-configmap.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +365,7 @@ func TestManifestGenerateFlags(t *testing.T) {
 		{
 			desc:       "flag_values_enable_egressgateway",
 			diffSelect: "Service:*:istio-egressgateway",
+			fileSelect: []string{"templates/service.yaml"},
 			flags:      "--set values.gateways.istio-egressgateway.enabled=true",
 			noInput:    true,
 		},
@@ -294,18 +373,21 @@ func TestManifestGenerateFlags(t *testing.T) {
 			desc:       "flag_output",
 			flags:      "-o " + flagOutputDir,
 			diffSelect: "Deployment:*:istiod",
+			fileSelect: []string{"templates/deployment.yaml"},
 			outputDir:  flagOutputDir,
 		},
 		{
 			desc:       "flag_output_set_values",
 			diffSelect: "Deployment:*:istio-ingressgateway",
 			flags:      "-s values.global.proxy.image=mynewproxy -o " + flagOutputValuesDir,
+			fileSelect: []string{"templates/deployment.yaml"},
 			outputDir:  flagOutputValuesDir,
 			noInput:    true,
 		},
 		{
 			desc:       "flag_force",
 			diffSelect: "no:resources:selected",
+			fileSelect: []string{""},
 			flags:      "--force",
 		},
 	})
@@ -322,20 +404,36 @@ func TestManifestGeneratePilot(t *testing.T) {
 		{
 			desc:       "pilot_k8s_settings",
 			diffSelect: "Deployment:*:istiod,HorizontalPodAutoscaler:*:istiod",
+			fileSelect: []string{"templates/deployment.yaml", "templates/autoscale.yaml"},
 		},
 		{
 			desc:       "pilot_override_values",
 			diffSelect: "Deployment:*:istiod,HorizontalPodAutoscaler:*:istiod",
+			fileSelect: []string{"templates/deployment.yaml", "templates/autoscale.yaml"},
 		},
 		{
 			desc:       "pilot_override_kubernetes",
 			diffSelect: "Deployment:*:istiod, Service:*:istiod,MutatingWebhookConfiguration:*:istio-sidecar-injector,ClusterRoleBinding::istio-reader-istio-system",
+			fileSelect: []string{
+				"templates/deployment.yaml", "templates/mutatingwebhook.yaml",
+				"templates/service.yaml", "templates/reader-clusterrolebinding.yaml", "templates/clusterrolebinding.yaml",
+			},
 		},
 		// TODO https://github.com/istio/istio/issues/22347 this is broken for overriding things to default value
 		// This can be seen from REGISTRY_ONLY not applying
 		{
 			desc:       "pilot_merge_meshconfig",
 			diffSelect: "ConfigMap:*:istio$",
+			fileSelect: []string{"templates/configmap.yaml"},
+		},
+		{
+			desc:       "pilot_disable_tracing",
+			diffSelect: "ConfigMap:*:istio$",
+		},
+		{
+			desc:       "deprecated_autoscaling_k8s_spec",
+			diffSelect: "HorizontalPodAutoscaler:*:istiod,HorizontalPodAutoscaler:*:istio-ingressgateway",
+			fileSelect: []string{"templates/autoscale.yaml"},
 		},
 	})
 }
@@ -364,11 +462,11 @@ func TestManifestGenerateOrdered(t *testing.T) {
 	// Since this is testing the special case of stable YAML output order, it
 	// does not use the established test group pattern
 	inPath := filepath.Join(testDataDir, "input/all_on.yaml")
-	got1, err := runManifestGenerate([]string{inPath}, "", snapshotCharts)
+	got1, err := runManifestGenerate([]string{inPath}, "", snapshotCharts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got2, err := runManifestGenerate([]string{inPath}, "", snapshotCharts)
+	got2, err := runManifestGenerate([]string{inPath}, "", snapshotCharts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,13 +476,14 @@ func TestManifestGenerateOrdered(t *testing.T) {
 		t.Errorf("stable_manifest: Manifest generation is not producing stable text output.")
 	}
 }
+
 func TestManifestGenerateFlagAliases(t *testing.T) {
 	inPath := filepath.Join(testDataDir, "input/all_on.yaml")
-	gotSet, err := runManifestGenerate([]string{inPath}, "--set revision=foo", snapshotCharts)
+	gotSet, err := runManifestGenerate([]string{inPath}, "--set revision=foo", snapshotCharts, []string{"templates/deployment.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotAlias, err := runManifestGenerate([]string{inPath}, "--revision=foo --manifests="+filepath.Join(testDataDir, "data-snapshot"), compiledInCharts)
+	gotAlias, err := runManifestGenerate([]string{inPath}, "--revision=foo", snapshotCharts, []string{"templates/deployment.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +497,7 @@ func TestManifestGenerateFlagAliases(t *testing.T) {
 func TestMultiICPSFiles(t *testing.T) {
 	inPathBase := filepath.Join(testDataDir, "input/all_off.yaml")
 	inPathOverride := filepath.Join(testDataDir, "input/helm_values_enablement.yaml")
-	got, err := runManifestGenerate([]string{inPathBase, inPathOverride}, "", snapshotCharts)
+	got, err := runManifestGenerate([]string{inPathBase, inPathOverride}, "", snapshotCharts, []string{"templates/deployment.yaml", "templates/service.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,9 +520,17 @@ func TestMultiICPSFiles(t *testing.T) {
 
 func TestBareSpec(t *testing.T) {
 	inPathBase := filepath.Join(testDataDir, "input/bare_spec.yaml")
-	_, err := runManifestGenerate([]string{inPathBase}, "", liveCharts)
+	_, err := runManifestGenerate([]string{inPathBase}, "", liveCharts, []string{"templates/deployment.yaml"})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMultipleSpecOneFile(t *testing.T) {
+	inPathBase := filepath.Join(testDataDir, "input/multiple_iops.yaml")
+	_, err := runManifestGenerate([]string{inPathBase}, "", liveCharts, []string{"templates/deployment.yaml"})
+	if !strings.Contains(err.Error(), "contains multiple IstioOperator CRs, only one per file is supported") {
+		t.Fatalf("got %v, expected error for file with multiple IOPs", err)
 	}
 }
 
@@ -432,23 +539,19 @@ func TestBareValues(t *testing.T) {
 	// As long as the generate doesn't panic, we pass it.  bare_values.yaml doesn't
 	// overlay well because JSON doesn't handle null values, and our charts
 	// don't expect values to be blown away.
-	_, _ = runManifestGenerate([]string{inPathBase}, "", liveCharts)
+	_, _ = runManifestGenerate([]string{inPathBase}, "", liveCharts, []string{"templates/deployment.yaml"})
 }
 
 func TestBogusControlPlaneSec(t *testing.T) {
 	inPathBase := filepath.Join(testDataDir, "input/bogus_cps.yaml")
-	_, err := runManifestGenerate([]string{inPathBase}, "", liveCharts)
+	_, err := runManifestGenerate([]string{inPathBase}, "", liveCharts, []string{"templates/deployment.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestInstallPackagePath(t *testing.T) {
-	serverDir, err := ioutil.TempDir(os.TempDir(), "istio-test-server-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(serverDir)
+	serverDir := t.TempDir()
 	if err := tgz.Create(string(liveCharts), filepath.Join(serverDir, testTGZFilename)); err != nil {
 		t.Fatal(err)
 	}
@@ -474,21 +577,20 @@ func TestInstallPackagePath(t *testing.T) {
 			flags:      "--force --set installPackagePath=" + srv.URL() + "/" + testTGZFilename,
 		},
 	})
-
 }
 
 // TestTrailingWhitespace ensures there are no trailing spaces in the manifests
 // This is important because `kubectl edit` and other commands will get escaped if they are present
 // making it hard to read/edit
 func TestTrailingWhitespace(t *testing.T) {
-	got, err := runManifestGenerate([]string{}, "", liveCharts)
+	got, err := runManifestGenerate([]string{}, "--set values.gateways.istio-egressgateway.enabled=true", liveCharts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(got, "\n")
 	for i, l := range lines {
 		if strings.HasSuffix(l, " ") {
-			t.Errorf("Line %v has a trailing space: [%v]. Context: %v", i, l, strings.Join(lines[i-5:i+5], ","))
+			t.Errorf("Line %v has a trailing space: [%v]. Context: %v", i, l, strings.Join(lines[i-25:i+25], "\n"))
 		}
 	}
 }
@@ -521,7 +623,14 @@ func validateReferentialIntegrity(t *testing.T, objs object.K8sObjects, cname st
 
 // This test enforces that objects that reference other objects do so properly, such as Service selecting deployment
 func TestConfigSelectors(t *testing.T) {
-	got, err := runManifestGenerate([]string{}, "--set values.gateways.istio-egressgateway.enabled=true", liveCharts)
+	selectors := []string{
+		"templates/deployment.yaml",
+		"templates/service.yaml",
+		"templates/poddisruptionbudget.yaml",
+		"templates/autoscale.yaml",
+		"templates/serviceaccount.yaml",
+	}
+	got, err := runManifestGenerate([]string{}, "--set values.gateways.istio-egressgateway.enabled=true", liveCharts, selectors)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -529,7 +638,7 @@ func TestConfigSelectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotRev, e := runManifestGenerate([]string{}, "--set revision=canary", liveCharts)
+	gotRev, e := runManifestGenerate([]string{}, "--set revision=canary", liveCharts, selectors)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -572,6 +681,7 @@ func TestConfigSelectors(t *testing.T) {
 		// Next we fetch all the objects for a revision install
 		nameRev := "istiod-canary"
 		deploymentRev := mustFindObject(t, objsRev, nameRev, name.DeploymentStr)
+		hpaRev := mustFindObject(t, objsRev, nameRev, name.HPAStr)
 		serviceRev := mustFindObject(t, objsRev, nameRev, name.ServiceStr)
 		pdbRev := mustFindObject(t, objsRev, nameRev, name.PDBStr)
 		podLabelsRev := mustGetLabels(t, deploymentRev, "spec.template.metadata.labels")
@@ -581,6 +691,11 @@ func TestConfigSelectors(t *testing.T) {
 		mustNotSelect(t, mustGetLabels(t, service, "spec.selector"), podLabelsRev)
 		mustNotSelect(t, mustGetLabels(t, pdbRev, "spec.selector.matchLabels"), podLabels)
 		mustNotSelect(t, mustGetLabels(t, pdb, "spec.selector.matchLabels"), podLabelsRev)
+
+		// Make sure the scaleTargetRef points to the correct Deployment
+		if hpaName := mustGetPath(t, hpaRev, "spec.scaleTargetRef.name"); nameRev != hpaName {
+			t.Fatalf("HPA does not match deployment: %v != %v", nameRev, hpaName)
+		}
 
 		// Check selection of previous versions . This only matters for in place upgrade (non revision)
 		podLabels15 := map[string]string{
@@ -605,18 +720,20 @@ func TestLDFlags(t *testing.T) {
 	version.DockerInfo.Hub = "testHub"
 	version.DockerInfo.Tag = "testTag"
 	l := clog.NewConsoleLogger(os.Stdout, os.Stderr, installerScope)
-	_, iops, err := manifest.GenerateConfig(nil, []string{"installPackagePath=" + string(liveCharts)}, true, nil, l)
+	_, iop, err := manifest.GenerateConfig(nil, []string{"installPackagePath=" + string(liveCharts)}, true, nil, l)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if iops.Hub != version.DockerInfo.Hub || iops.Tag != version.DockerInfo.Tag {
-		t.Fatalf("DockerInfoHub, DockerInfoTag got: %s,%s, want: %s, %s", iops.Hub, iops.Tag, version.DockerInfo.Hub, version.DockerInfo.Tag)
+	if iop.Spec.Hub != version.DockerInfo.Hub || iop.Spec.Tag.GetStringValue() != version.DockerInfo.Tag {
+		t.Fatalf("DockerInfoHub, DockerInfoTag got: %s,%s, want: %s, %s", iop.Spec.Hub, iop.Spec.Tag, version.DockerInfo.Hub, version.DockerInfo.Tag)
 	}
 }
 
 func runTestGroup(t *testing.T, tests testGroup) {
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
 			inPath := filepath.Join(testDataDir, "input", tt.desc+".yaml")
 			outputSuffix := goldenFileSuffixHideChangesInReview
 			if tt.showOutputFileInPullRequest {
@@ -633,7 +750,7 @@ func runTestGroup(t *testing.T, tests testGroup) {
 			if tt.chartSource != "" {
 				csource = tt.chartSource
 			}
-			got, err := runManifestGenerate(filenames, tt.flags, csource)
+			got, err := runManifestGenerate(filenames, tt.flags, csource, tt.fileSelect)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -656,37 +773,32 @@ func runTestGroup(t *testing.T, tests testGroup) {
 				}
 			}
 
-			if refreshGoldenFiles() {
-				t.Logf("Refreshing golden file for %s", outPath)
-				if err := ioutil.WriteFile(outPath, []byte(got), 0644); err != nil {
-					t.Error(err)
-				}
-			}
+			tutil.RefreshGoldenFile(t, []byte(got), outPath)
 
 			want, err := readFile(outPath)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			for _, v := range []bool{true, false} {
+			if got != want {
 				diff, err := compare.ManifestDiffWithRenameSelectIgnore(got, want,
-					"", diffSelect, tt.diffIgnore, v)
+					"", diffSelect, tt.diffIgnore, false)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if diff != "" {
-					t.Errorf("%s: got:\n%s\nwant:\n%s\n(-got, +want)\n%s\n", tt.desc, "", "", diff)
+					t.Fatalf("%s: got:\n%s\nwant:\n%s\n(-got, +want)\n%s\n", tt.desc, "", "", diff)
 				}
+				t.Fatalf(cmp.Diff(got, want))
 			}
-
 		})
 	}
 }
 
 // nolint: unparam
-func generateManifest(inFile, flags string, chartSource chartSourceType) (string, object.K8sObjects, error) {
+func generateManifest(inFile, flags string, chartSource chartSourceType, fileSelect []string) (string, object.K8sObjects, error) {
 	inPath := filepath.Join(testDataDir, "input", inFile+".yaml")
-	manifest, err := runManifestGenerate([]string{inPath}, flags, chartSource)
+	manifest, err := runManifestGenerate([]string{inPath}, flags, chartSource, fileSelect)
 	if err != nil {
 		return "", nil, fmt.Errorf("error %s: %s", err, manifest)
 	}
@@ -696,6 +808,307 @@ func generateManifest(inFile, flags string, chartSource chartSourceType) (string
 
 // runManifestGenerate runs the manifest generate command. If filenames is set, passes the given filenames as -f flag,
 // flags is passed to the command verbatim. If you set both flags and path, make sure to not use -f in flags.
-func runManifestGenerate(filenames []string, flags string, chartSource chartSourceType) (string, error) {
-	return runManifestCommand("generate", filenames, flags, chartSource)
+func runManifestGenerate(filenames []string, flags string, chartSource chartSourceType, fileSelect []string) (string, error) {
+	return runManifestCommand("generate", filenames, flags, chartSource, fileSelect)
+}
+
+func mustGetWebhook(t test.Failer, obj object.K8sObject) []v1.MutatingWebhook {
+	t.Helper()
+	path := mustGetPath(t, obj, "webhooks")
+	by, err := json.Marshal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mwh []v1.MutatingWebhook
+	if err := json.Unmarshal(by, &mwh); err != nil {
+		t.Fatal(err)
+	}
+	return mwh
+}
+
+func getWebhooks(t *testing.T, setFlags string, webhookName string) []v1.MutatingWebhook {
+	t.Helper()
+	got, err := runManifestGenerate([]string{}, setFlags, liveCharts, []string{"templates/mutatingwebhook.yaml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs, err := object.ParseK8sObjectsFromYAMLManifest(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mustGetWebhook(t, mustFindObject(t, objs, webhookName, name.MutatingWebhookConfigurationStr))
+}
+
+func getWebhooksFromYaml(t *testing.T, yml string) []v1.MutatingWebhook {
+	t.Helper()
+	objs, err := object.ParseK8sObjectsFromYAMLManifest(yml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 1 {
+		t.Fatal("expected one webhook")
+	}
+	return mustGetWebhook(t, *objs[0])
+}
+
+type LabelSet struct {
+	namespace, pod klabels.Set
+}
+
+func mergeWebhooks(whs ...[]v1.MutatingWebhook) []v1.MutatingWebhook {
+	res := []v1.MutatingWebhook{}
+	for _, wh := range whs {
+		res = append(res, wh...)
+	}
+	return res
+}
+
+const (
+	// istioctl manifest generate --set values.sidecarInjectorWebhook.useLegacySelectors=true
+	legacyDefaultInjector = `
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: istio-sidecar-injector
+webhooks:
+- name: sidecar-injector.istio.io
+  clientConfig:
+    service:
+      name: istiod
+      namespace: istio-system
+      path: "/inject"
+  sideEffects: None
+  rules:
+  - operations: [ "CREATE" ]
+    apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+  failurePolicy: Fail
+  admissionReviewVersions: ["v1beta1", "v1"]
+  namespaceSelector:
+    matchLabels:
+      istio-injection: enabled
+  objectSelector:
+    matchExpressions:
+    - key: "sidecar.istio.io/inject"
+      operator: NotIn
+      values:
+      - "false"
+`
+
+	// istioctl manifest generate --set values.sidecarInjectorWebhook.useLegacySelectors=true --set revision=canary
+	legacyRevisionInjector = `
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: istio-sidecar-injector-canary
+webhooks:
+- name: sidecar-injector.istio.io
+  clientConfig:
+    service:
+      name: istiod-canary
+      namespace: istio-system
+      path: "/inject"
+  sideEffects: None
+  rules:
+  - operations: [ "CREATE" ]
+    apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+  failurePolicy: Fail
+  admissionReviewVersions: ["v1beta1", "v1"]
+  namespaceSelector:
+    matchExpressions:
+    - key: istio-injection
+      operator: DoesNotExist
+    - key: istio.io/rev
+      operator: In
+      values:
+      - canary
+  objectSelector:
+    matchExpressions:
+    - key: "sidecar.istio.io/inject"
+      operator: NotIn
+      values:
+      - "false"
+`
+)
+
+// This test checks the mutating webhook selectors behavior, especially with interaction with revisions
+func TestWebhookSelector(t *testing.T) {
+	// Setup various labels to be tested
+	empty := klabels.Set{}
+	revLabel := klabels.Set{"istio.io/rev": "canary"}
+	legacyAndRevLabel := klabels.Set{"istio-injection": "enabled", "istio.io/rev": "canary"}
+	legacyDisabledAndRevLabel := klabels.Set{"istio-injection": "disabled", "istio.io/rev": "canary"}
+	legacyLabel := klabels.Set{"istio-injection": "enabled"}
+	legacyLabelDisabled := klabels.Set{"istio-injection": "disabled"}
+
+	objEnabled := klabels.Set{"sidecar.istio.io/inject": "true"}
+	objDisable := klabels.Set{"sidecar.istio.io/inject": "false"}
+	objEnabledAndRev := klabels.Set{"sidecar.istio.io/inject": "true", "istio.io/rev": "canary"}
+	objDisableAndRev := klabels.Set{"sidecar.istio.io/inject": "false", "istio.io/rev": "canary"}
+
+	defaultWebhook := getWebhooks(t, "", "istio-sidecar-injector")
+	revWebhook := getWebhooks(t, "--set revision=canary", "istio-sidecar-injector-canary")
+	autoWebhook := getWebhooks(t, "--set values.sidecarInjectorWebhook.enableNamespacesByDefault=true", "istio-sidecar-injector")
+	legacyWebhook := getWebhooksFromYaml(t, legacyDefaultInjector)
+	legacyRevWebhook := getWebhooksFromYaml(t, legacyRevisionInjector)
+
+	// predicate is used to filter out "obvious" test cases, to avoid enumerating all cases
+	// nolint: unparam
+	predicate := func(ls LabelSet) (string, bool) {
+		if ls.namespace.Get("istio-injection") == "disabled" {
+			return "", true
+		}
+		if ls.pod.Get("sidecar.istio.io/inject") == "false" {
+			return "", true
+		}
+		return "", false
+	}
+
+	// We test the cross product namespace and pod labels:
+	// 1. revision label (istio.io/rev)
+	// 2. inject label true (istio-injection on namespace, sidecar.istio.io/inject on pod)
+	// 3. inject label false
+	// 4. inject label true and revision label
+	// 5. inject label false and revision label
+	// 6. no label
+	// However, we filter out all the disable cases, leaving us with a reasonable number of cases
+	testLabels := []LabelSet{}
+	for _, namespaceLabel := range []klabels.Set{empty, revLabel, legacyLabel, legacyLabelDisabled, legacyAndRevLabel, legacyDisabledAndRevLabel} {
+		for _, podLabel := range []klabels.Set{empty, revLabel, objEnabled, objDisable, objEnabledAndRev, objDisableAndRev} {
+			testLabels = append(testLabels, LabelSet{namespaceLabel, podLabel})
+		}
+	}
+	type assertion struct {
+		namespaceLabel klabels.Set
+		objectLabel    klabels.Set
+		match          string
+	}
+	baseAssertions := []assertion{
+		{empty, empty, ""},
+		{empty, revLabel, "istiod-canary"},
+		{empty, objEnabled, "istiod"},
+		{empty, objEnabledAndRev, "istiod-canary"},
+		{revLabel, empty, "istiod-canary"},
+		{revLabel, revLabel, "istiod-canary"},
+		{revLabel, objEnabled, "istiod-canary"},
+		{revLabel, objEnabledAndRev, "istiod-canary"},
+		{legacyLabel, empty, "istiod"},
+		{legacyLabel, objEnabled, "istiod"},
+		{legacyAndRevLabel, empty, "istiod"},
+		{legacyAndRevLabel, objEnabled, "istiod"},
+
+		// The behavior of these is a bit odd; they are explicitly selecting a revision but getting
+		// the default Unfortunately, the legacy webhook selectors would select these, cause
+		// duplicate injection, so we defer to the namespace label.
+		{legacyLabel, revLabel, "istiod"},
+		{legacyAndRevLabel, revLabel, "istiod"},
+		{legacyLabel, objEnabledAndRev, "istiod"},
+		{legacyAndRevLabel, objEnabledAndRev, "istiod"},
+	}
+	cases := []struct {
+		name     string
+		webhooks []v1.MutatingWebhook
+		checks   []assertion
+	}{
+		{
+			name:     "base",
+			webhooks: mergeWebhooks(defaultWebhook, revWebhook),
+			checks:   baseAssertions,
+		},
+		{
+			// This is exactly the same as above, but empty/empty matches
+			name:     "auto injection",
+			webhooks: mergeWebhooks(autoWebhook, revWebhook),
+			checks:   append([]assertion{{empty, empty, "istiod"}}, baseAssertions...),
+		},
+		{
+			// Upgrade from a legacy webhook to a new revision based
+			// Note: we don't need non revision legacy -> non revision, since it will overwrite the webhook
+			name:     "revision upgrade",
+			webhooks: mergeWebhooks(legacyWebhook, revWebhook),
+			checks: append([]assertion{
+				{empty, objEnabled, ""}, // Legacy one requires namespace label
+			}, baseAssertions...),
+		},
+		{
+			// Use new default webhook, while we still have a legacy revision one around.
+			name:     "inplace upgrade",
+			webhooks: mergeWebhooks(defaultWebhook, legacyRevWebhook),
+			checks: append([]assertion{
+				{empty, revLabel, ""},         // Legacy one requires namespace label
+				{empty, objEnabledAndRev, ""}, // Legacy one requires namespace label
+			}, baseAssertions...),
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			whs := tt.webhooks
+			for _, s := range testLabels {
+				t.Run(fmt.Sprintf("ns:%v pod:%v", s.namespace, s.pod), func(t *testing.T) {
+					found := ""
+					match := 0
+					for i, wh := range whs {
+						sn := wh.ClientConfig.Service.Name
+						matches := selectorMatches(t, wh.NamespaceSelector, s.namespace) && selectorMatches(t, wh.ObjectSelector, s.pod)
+						if matches && found != "" {
+							// There must be exactly one match, or we will double inject.
+							t.Fatalf("matched multiple webhooks. Had %v, matched %v", found, sn)
+						}
+						if matches {
+							found = sn
+							match = i
+						}
+					}
+					// If our predicate can tell us the expected match, use that
+					if want, ok := predicate(s); ok {
+						if want != found {
+							t.Fatalf("expected webhook to go to service %q, found %q", want, found)
+						}
+						return
+					}
+					// Otherwise, look through our assertions for a matching one, and check that
+					for _, w := range tt.checks {
+						if w.namespaceLabel.String() == s.namespace.String() && w.objectLabel.String() == s.pod.String() {
+							if found != w.match {
+								if found != "" {
+									t.Fatalf("expected webhook to go to service %q, found %q (from match %d)\nNamespace selector: %v\nObject selector: %v)",
+										w.match, found, match, whs[match].NamespaceSelector.MatchExpressions, whs[match].ObjectSelector.MatchExpressions)
+								} else {
+									t.Fatalf("expected webhook to go to service %q, found %q", w.match, found)
+								}
+							}
+							return
+						}
+					}
+					// If none match, a test case is missing for the label set.
+					t.Fatalf("no assertion for namespace=%v pod=%v", s.namespace, s.pod)
+				})
+			}
+		})
+	}
+}
+
+func selectorMatches(t *testing.T, selector *metav1.LabelSelector, labels klabels.Set) bool {
+	t.Helper()
+	// From webhook spec: "Default to the empty LabelSelector, which matches everything."
+	if selector == nil {
+		return true
+	}
+	s, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Matches(labels)
+}
+
+func TestSidecarTemplate(t *testing.T) {
+	runTestGroup(t, testGroup{
+		{
+			desc:       "sidecar_template",
+			diffSelect: "ConfigMap:*:istio-sidecar-injector",
+		},
+	})
 }

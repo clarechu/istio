@@ -16,14 +16,25 @@ package gateway
 
 import (
 	"istio.io/api/networking/v1alpha3"
-
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config/protocol"
 )
 
-// IsTLSServer returns true if this server is non HTTP, with some TLS settings for termination/passthrough
-func IsTLSServer(server *v1alpha3.Server) bool {
+// IsNonHTTPTLSServer returns true if this server is non HTTP, but with some TLS settings for termination/passthrough
+func IsNonHTTPTLSServer(server *v1alpha3.Server) bool {
 	if server.Tls != nil && !protocol.Parse(server.Port.Protocol).IsHTTP() {
 		return true
+	}
+	return false
+}
+
+// IsHTTPSServerWithTLSTermination returns true if the server is HTTPS with TLS termination
+func IsHTTPSServerWithTLSTermination(server *v1alpha3.Server) bool {
+	if server.Tls != nil {
+		p := protocol.Parse(server.Port.Protocol)
+		if p == protocol.HTTPS && !IsPassThroughServer(server) {
+			return true
+		}
 	}
 	return false
 }
@@ -42,6 +53,17 @@ func IsHTTPServer(server *v1alpha3.Server) bool {
 	return false
 }
 
+// IsEligibleForHTTP3Upgrade returns true if we can create an HTTP/3 server
+// listening of QUIC for the given server. It must be a TLS non-passthrough
+// as TLS is mandatory for QUIC
+func IsEligibleForHTTP3Upgrade(server *v1alpha3.Server) bool {
+	if !features.EnableQUICListeners {
+		return false
+	}
+	p := protocol.Parse(server.Port.Protocol)
+	return p == protocol.HTTPS && server.Tls != nil && !IsPassThroughServer(server)
+}
+
 // IsPassThroughServer returns true if this server does TLS passthrough (auto or manual)
 func IsPassThroughServer(server *v1alpha3.Server) bool {
 	if server.Tls == nil {
@@ -53,5 +75,16 @@ func IsPassThroughServer(server *v1alpha3.Server) bool {
 		return true
 	}
 
+	return false
+}
+
+// IsTCPServerWithTLSTermination returns true if this server is TCP(non-HTTP) server with some TLS settings for termination
+func IsTCPServerWithTLSTermination(server *v1alpha3.Server) bool {
+	if server.Tls != nil && !IsPassThroughServer(server) {
+		p := protocol.Parse(server.Port.Protocol)
+		if !p.IsHTTP() && !p.IsHTTPS() {
+			return true
+		}
+	}
 	return false
 }

@@ -20,15 +20,14 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"istio.io/pkg/version"
-
 	"istio.io/istio/pkg/cmd"
 	"istio.io/istio/security/pkg/testing/sdsc"
 	"istio.io/pkg/env"
+	"istio.io/pkg/version"
 )
 
 var (
-	sdsServerUdsPath = env.RegisterStringVar(
+	sdsServerUdsPath = env.Register(
 		"CITADEL_AGENT_TESTING_UDS_PATH", "unix:///var/run/sds/uds_path",
 		"The server unix domain socket path").Get()
 	rootCmd = &cobra.Command{

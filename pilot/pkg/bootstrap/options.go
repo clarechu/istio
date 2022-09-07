@@ -15,15 +15,16 @@
 package bootstrap
 
 import (
+	"crypto/tls"
+	"fmt"
 	"time"
-
-	"istio.io/pkg/ctrlz"
-	"istio.io/pkg/env"
 
 	"istio.io/istio/pilot/pkg/features"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/keepalive"
+	"istio.io/pkg/ctrlz"
+	"istio.io/pkg/env"
 )
 
 // RegistryOptions provide configuration options for the configuration controller. If FileDir is set, that directory will
@@ -59,10 +60,9 @@ type PilotArgs struct {
 	NetworksConfigFile string
 	RegistryOptions    RegistryOptions
 	CtrlZOptions       *ctrlz.Options
-	Plugins            []string
-	MCPOptions         MCPOptions
 	KeepaliveOptions   *keepalive.Options
 	ShutdownDuration   time.Duration
+	JwtRule            string
 }
 
 // DiscoveryServerOptions contains options for create a new discovery server instance.
@@ -73,6 +73,9 @@ type DiscoveryServerOptions struct {
 
 	// The listening address for HTTPS (webhooks). If the port in the address is empty or "0" (as in "127.0.0.1:" or "[::1]:0")
 	// a port number is automatically chosen.
+	// If the address is empty, the secure port is disabled, and the
+	// webhooks are registered on the HTTP port - a gateway in front will
+	// terminate TLS instead.
 	HTTPSAddr string
 
 	// The listening address for gRPC. If the port in the address is empty or "0" (as in "127.0.0.1:" or "[::1]:0")
@@ -98,25 +101,25 @@ type InjectionOptions struct {
 	InjectionDirectory string
 }
 
-type MCPOptions struct {
-	MaxMessageSize        int
-	InitialWindowSize     int
-	InitialConnWindowSize int
-}
-
-// Optional TLS parameters for Istiod server.
+// TLSOptions is optional TLS parameters for Istiod server.
 type TLSOptions struct {
-	CaCertFile string
-	CertFile   string
-	KeyFile    string
+	CaCertFile      string
+	CertFile        string
+	KeyFile         string
+	TLSCipherSuites []string
+	CipherSuits     []uint16 // This is the parsed cipher suites
 }
 
-var PodNamespaceVar = env.RegisterStringVar("POD_NAMESPACE", constants.IstioSystemNamespace, "")
-var podNameVar = env.RegisterStringVar("POD_NAME", "", "")
+var (
+	PodNamespace = env.Register("POD_NAMESPACE", constants.IstioSystemNamespace, "").Get()
+	PodName      = env.Register("POD_NAME", "", "").Get()
+	JwtRule      = env.Register("JWT_RULE", "",
+		"The JWT rule used by istiod authentication").Get()
+)
 
-// RevisionVar is the value of the Istio control plane revision, e.g. "canary",
+// Revision is the value of the Istio control plane revision, e.g. "canary",
 // and is the value used by the "istio.io/rev" label.
-var RevisionVar = env.RegisterStringVar("REVISION", "", "")
+var Revision = env.Register("REVISION", "", "").Get()
 
 // NewPilotArgs constructs pilotArgs with default values.
 func NewPilotArgs(initFuncs ...func(*PilotArgs)) *PilotArgs {
@@ -130,22 +133,54 @@ func NewPilotArgs(initFuncs ...func(*PilotArgs)) *PilotArgs {
 		fn(p)
 	}
 
-	// Set the ClusterRegistries namespace based on the selected namespace.
-	if p.Namespace != "" {
-		p.RegistryOptions.ClusterRegistriesNamespace = p.Namespace
-	} else {
-		p.RegistryOptions.ClusterRegistriesNamespace = constants.IstioSystemNamespace
-	}
-
 	return p
 }
 
 // Apply default value to PilotArgs
 func (p *PilotArgs) applyDefaults() {
-	p.Namespace = PodNamespaceVar.Get()
-	p.PodName = podNameVar.Get()
-	p.Revision = RevisionVar.Get()
+	p.Namespace = PodNamespace
+	p.PodName = PodName
+	p.Revision = Revision
+	p.JwtRule = JwtRule
 	p.KeepaliveOptions = keepalive.DefaultOption()
 	p.RegistryOptions.DistributionTrackingEnabled = features.EnableDistributionTracking
 	p.RegistryOptions.DistributionCacheRetention = features.DistributionHistoryRetention
+	p.RegistryOptions.ClusterRegistriesNamespace = p.Namespace
+}
+
+func (p *PilotArgs) Complete() error {
+	cipherSuits, err := TLSCipherSuites(p.ServerOptions.TLSOptions.TLSCipherSuites)
+	if err != nil {
+		return err
+	}
+	p.ServerOptions.TLSOptions.CipherSuits = cipherSuits
+	return nil
+}
+
+func allCiphers() map[string]uint16 {
+	acceptedCiphers := make(map[string]uint16, len(tls.CipherSuites())+len(tls.InsecureCipherSuites()))
+	for _, cipher := range tls.InsecureCipherSuites() {
+		acceptedCiphers[cipher.Name] = cipher.ID
+	}
+	for _, cipher := range tls.CipherSuites() {
+		acceptedCiphers[cipher.Name] = cipher.ID
+	}
+	return acceptedCiphers
+}
+
+// TLSCipherSuites returns a list of cipher suite IDs from the cipher suite names passed.
+func TLSCipherSuites(cipherNames []string) ([]uint16, error) {
+	if len(cipherNames) == 0 {
+		return nil, nil
+	}
+	ciphersIntSlice := make([]uint16, 0)
+	possibleCiphers := allCiphers()
+	for _, cipher := range cipherNames {
+		intValue, ok := possibleCiphers[cipher]
+		if !ok {
+			return nil, fmt.Errorf("cipher suite %s not supported or doesn't exist", cipher)
+		}
+		ciphersIntSlice = append(ciphersIntSlice, intValue)
+	}
+	return ciphersIntSlice, nil
 }

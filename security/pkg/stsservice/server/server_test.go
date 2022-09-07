@@ -19,7 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -65,7 +65,8 @@ func TestStsService(t *testing.T) {
 	mockToken := &stsservice.TokenInfo{
 		TokenType:  "type",
 		IssueTime:  time.Now(),
-		ExpireTime: time.Now().Add(1 * time.Hour)}
+		ExpireTime: time.Now().Add(1 * time.Hour),
+	}
 	testCases := map[string]struct {
 		genTokenError        error
 		dumpTokenError       error
@@ -182,7 +183,7 @@ func sendStsRequestWithRetry(client *http.Client, req *http.Request) (resp *http
 	for i := 0; i < 10; i++ {
 		resp, err = client.Do(req)
 		if err == nil {
-			return resp, err
+			return resp, nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -201,9 +202,9 @@ func verifyResponse(t *testing.T, tCase string, respType stsRespType, resp, expe
 		}
 	}
 	defer resp.Body.Close()
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	defer expectedResp.Body.Close()
-	expectedBody, _ := ioutil.ReadAll(expectedResp.Body)
+	expectedBody, _ := io.ReadAll(expectedResp.Body)
 	if respType == successStsResp {
 		verifyResponseBody(t, tCase, body, expectedBody)
 	} else if respType == validationFailure || respType == tokenGenerationFailure {
@@ -309,7 +310,8 @@ func genStsRequest(reqType stsReqType, serverAddr string) (req *http.Request) {
 }
 
 func genStsResponse(respType stsRespType, param stsservice.StsResponseParameters,
-	serverErr error, tokenInfo *stsservice.TokenInfo) (resp *http.Response) {
+	serverErr error, tokenInfo *stsservice.TokenInfo,
+) (resp *http.Response) {
 	resp = &http.Response{
 		Header: make(http.Header),
 	}
@@ -318,7 +320,7 @@ func genStsResponse(respType stsRespType, param stsservice.StsResponseParameters
 		resp.StatusCode = http.StatusOK
 		resp.Status = http.StatusText(http.StatusOK)
 		stsJSON, _ := json.MarshalIndent(param, "", "  ")
-		resp.Body = ioutil.NopCloser(bytes.NewBuffer(stsJSON))
+		resp.Body = io.NopCloser(bytes.NewBuffer(stsJSON))
 	} else if respType == tokenGenerationFailure {
 		resp.StatusCode = http.StatusInternalServerError
 		resp.Status = http.StatusText(http.StatusInternalServerError)
@@ -327,7 +329,7 @@ func genStsResponse(respType stsRespType, param stsservice.StsResponseParameters
 			ErrorDescription: serverErr.Error(),
 		}
 		errRespJSON, _ := json.MarshalIndent(errResp, "", "  ")
-		resp.Body = ioutil.NopCloser(bytes.NewBuffer(errRespJSON))
+		resp.Body = io.NopCloser(bytes.NewBuffer(errRespJSON))
 	} else if respType == validationFailure {
 		resp.StatusCode = http.StatusBadRequest
 		resp.Status = http.StatusText(http.StatusBadRequest)
@@ -336,7 +338,7 @@ func genStsResponse(respType stsRespType, param stsservice.StsResponseParameters
 			ErrorDescription: serverErr.Error(),
 		}
 		errRespJSON, _ := json.MarshalIndent(errResp, "", "  ")
-		resp.Body = ioutil.NopCloser(bytes.NewBuffer(errRespJSON))
+		resp.Body = io.NopCloser(bytes.NewBuffer(errRespJSON))
 	} else if respType == StatusDumpSuccess {
 		resp.StatusCode = http.StatusOK
 		resp.Status = http.StatusText(http.StatusOK)
@@ -344,12 +346,12 @@ func genStsResponse(respType stsRespType, param stsservice.StsResponseParameters
 		tokenStatus = append(tokenStatus, *tokenInfo)
 		td := stsservice.TokensDump{Tokens: tokenStatus}
 		statusJSON, _ := json.MarshalIndent(td, "", " ")
-		resp.Body = ioutil.NopCloser(bytes.NewBuffer(statusJSON))
+		resp.Body = io.NopCloser(bytes.NewBuffer(statusJSON))
 	} else if respType == StatusDumpFailure {
 		resp.StatusCode = http.StatusInternalServerError
 		resp.Status = http.StatusText(http.StatusInternalServerError)
 		resp.Header.Set("Content-Type", "text/plain")
-		resp.Body = ioutil.NopCloser(bytes.NewBufferString("failure in dumping STS server status: " + serverErr.Error()))
+		resp.Body = io.NopCloser(bytes.NewBufferString("failure in dumping STS server status: " + serverErr.Error()))
 	}
 	respDump, _ := httputil.DumpResponse(resp, true)
 	log.Infof("Dump response: %s", string(respDump))

@@ -15,96 +15,95 @@
 package env
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
-
 	"runtime"
 
 	"istio.io/pkg/log"
 )
 
 var (
-	// ISTIO_OUT environment variable
-	// nolint: golint, stylecheck
-	ISTIO_OUT Variable = "ISTIO_OUT"
+	// TARGET_OUT environment variable
+	// nolint: revive, stylecheck
+	TARGET_OUT Variable = "TARGET_OUT"
 
 	// LOCAL_OUT environment variable
-	// nolint: golint, stylecheck
+	// nolint: revive, stylecheck
 	LOCAL_OUT Variable = "LOCAL_OUT"
 
 	// REPO_ROOT environment variable
-	// nolint: golint, stylecheck
+	// nolint: revive, stylecheck
 	REPO_ROOT Variable = "REPO_ROOT"
 
 	// HUB is the Docker hub to be used for images.
-	// nolint: golint, stylecheck
+	// nolint: revive, stylecheck
 	HUB Variable = "HUB"
 
 	// TAG is the Docker tag to be used for images.
-	// nolint: golint, stylecheck
+	// nolint: revive, stylecheck
 	TAG Variable = "TAG"
 
-	// BITNAMIHUB is the Docker registry to be used for the bitnami images.
-	// nolint: golint
-	BITNAMIHUB Variable = "BITNAMIHUB"
-
 	// PULL_POLICY is the image pull policy to use when rendering templates.
-	// nolint: golint, stylecheck
+	// nolint: revive, stylecheck
 	PULL_POLICY Variable = "PULL_POLICY"
 
-	// ISTIO_TEST_KUBE_CONFIG is the Kubernetes configuration file to use for testing. If a configuration file
-	// is specified on the command-line, that takes precedence.
-	// nolint: golint, stylecheck
-	ISTIO_TEST_KUBE_CONFIG Variable = "ISTIO_TEST_KUBE_CONFIG"
+	// ECHO_IMAGE is the image to use when deploying echo services.
+	// nolint: golint, revive, stylecheck
+	ECHO_IMAGE Variable = "ECHO_IMAGE"
+
+	// GRPC_ECHO_IMAGE is the image to use for a separate gRPC-only container in echo Pods.
+	// nolint: golint, revive, stylecheck
+	GRPC_ECHO_IMAGE Variable = "GRPC_ECHO_IMAGE"
+
+	// KUBECONFIG is the list of Kubernetes configuration files. If configuration files are specified on
+	// the command-line, that takes precedence.
+	// nolint: revive, stylecheck
+	KUBECONFIG Variable = "KUBECONFIG"
 
 	// IstioSrc is the location of istio source ($TOP/src/istio.io/istio
 	IstioSrc = REPO_ROOT.ValueOrDefaultFunc(getDefaultIstioSrc)
 
 	// IstioOut is the location of the output directory ($TOP/out)
-	IstioOut = verifyFile(ISTIO_OUT, ISTIO_OUT.ValueOrDefaultFunc(getDefaultIstioOut))
+	IstioOut = verifyFile(TARGET_OUT, TARGET_OUT.ValueOrDefaultFunc(getDefaultIstioOut))
 
 	// LocalOut is the location of the output directory for the OS we are running in,
 	// not necessarily the OS we are building for
 	LocalOut = verifyFile(LOCAL_OUT, LOCAL_OUT.ValueOrDefaultFunc(getDefaultIstioOut))
 
-	// TODO: Some of these values are overlapping. We should re-align them.
-
-	// ChartsDir is the Kubernetes Helm chart directory in the repository
-	ChartsDir = path.Join(IstioSrc, "install/kubernetes/helm")
-
-	// BookInfoRoot is the root folder for the bookinfo samples
-	BookInfoRoot = path.Join(IstioSrc, "samples/bookinfo")
-
-	// BookInfoKube is the book info folder that contains Yaml deployment files.
-	BookInfoKube = path.Join(BookInfoRoot, "platform/kube")
-
-	// ServiceAccountFilePath is the helm service account file.
-	ServiceAccountFilePath = path.Join(IstioSrc, "pkg/test/framework/components/redis/service_account.yaml")
-
-	// RedisInstallFilePath is the redis installation file.
-	RedisInstallFilePath = path.Join(IstioSrc, "pkg/test/framework/components/redis/redis.yaml")
+	// OtelCollectorInstallFilePath is the OpenTelemetry installation file.
+	OtelCollectorInstallFilePath = path.Join(IstioSrc, getSampleFile("open-telemetry/otel.yaml"))
 
 	// StackdriverInstallFilePath is the stackdriver installation file.
-	StackdriverInstallFilePath = path.Join(IstioSrc, "pkg/test/framework/components/stackdriver/stackdriver.yaml")
+	StackdriverInstallFilePath = path.Join(IstioSrc, getInstallationFile("stackdriver/stackdriver.yaml"))
 
 	// GCEMetadataServerInstallFilePath is the GCE Metadata Server installation file.
-	GCEMetadataServerInstallFilePath = path.Join(IstioSrc, "pkg/test/framework/components/gcemetadata/gce_metadata_server.yaml")
+	GCEMetadataServerInstallFilePath = path.Join(IstioSrc, getInstallationFile("gcemetadata/gce_metadata_server.yaml"))
+
+	// RegistryRedirectorServerInstallFilePath is the registry redirector installation file.
+	RegistryRedirectorServerInstallFilePath = path.Join(IstioSrc, getInstallationFile("registryredirector/registry_redirector_server.yaml"))
+)
+
+var (
+	_, b, _, _ = runtime.Caller(0)
+
+	// Root folder of this project
+	// This relies on the fact this file is 3 levels up from the root; if this changes, adjust the path below
+	Root = filepath.Join(filepath.Dir(b), "../../..")
 )
 
 func getDefaultIstioSrc() string {
-	// Assume it is run inside istio.io/istio
-	current, err := os.Getwd()
-	if err != nil {
-		panic(err)
-	}
-	idx := strings.Index(current, filepath.Join("/src", "istio.io", "istio"))
-	if idx > 0 {
-		return filepath.Join(current[0:idx], "/src", "istio.io", "istio")
-	}
-	return current // launching from GOTOP (for example in goland)
+	return Root
+}
+
+func getSampleFile(p string) string {
+	return fmt.Sprintf("samples/%s", p)
+}
+
+func getInstallationFile(p string) string {
+	return fmt.Sprintf("pkg/test/framework/components/%s", p)
 }
 
 func getDefaultIstioOut() string {
@@ -128,4 +127,26 @@ func CheckFileExists(path string) error {
 		return err
 	}
 	return nil
+}
+
+func ReadProxySHA() (string, error) {
+	type DepsFile struct {
+		Name          string `json:"name"`
+		LastStableSHA string `json:"lastStableSHA"`
+	}
+	f := filepath.Join(IstioSrc, "istio.deps")
+	depJSON, err := os.ReadFile(f)
+	if err != nil {
+		return "", err
+	}
+	var deps []DepsFile
+	if err := json.Unmarshal(depJSON, &deps); err != nil {
+		return "", err
+	}
+	for _, d := range deps {
+		if d.Name == "PROXY_REPO_SHA" {
+			return d.LastStableSHA, nil
+		}
+	}
+	return "", fmt.Errorf("PROXY_REPO_SHA not found")
 }

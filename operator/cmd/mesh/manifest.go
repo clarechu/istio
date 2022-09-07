@@ -25,15 +25,15 @@ func ManifestCmd(logOpts *log.Options) *cobra.Command {
 	mc := &cobra.Command{
 		Use:   "manifest",
 		Short: "Commands related to Istio manifests",
-		Long:  "The manifest subcommand generates, applies, diffs or migrates Istio manifests.",
+		Long:  "The manifest command generates and diffs Istio manifests.",
 	}
 
-	mgcArgs := &manifestGenerateArgs{}
+	mgcArgs := &ManifestGenerateArgs{}
 	mdcArgs := &manifestDiffArgs{}
 
-	args := &rootArgs{}
+	args := &RootArgs{}
 
-	mgc := manifestGenerateCmd(args, mgcArgs, logOpts)
+	mgc := ManifestGenerateCmd(args, mgcArgs, logOpts)
 	mdc := manifestDiffCmd(args, mdcArgs)
 	ic := InstallCmd(logOpts)
 

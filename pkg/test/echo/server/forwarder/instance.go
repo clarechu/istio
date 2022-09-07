@@ -16,113 +16,71 @@ package forwarder
 
 import (
 	"context"
+	"fmt"
 	"io"
-	"net/http"
-	"time"
 
-	"github.com/golang/sync/errgroup"
-
-	"istio.io/istio/pkg/test/echo/common"
+	"istio.io/istio/pkg/test/echo/common/scheme"
 	"istio.io/istio/pkg/test/echo/proto"
-	"istio.io/pkg/log"
 )
 
 var _ io.Closer = &Instance{}
 
-// Config for a forwarder Instance.
-type Config struct {
-	Request *proto.ForwardEchoRequest
-	UDS     string
-	TLSCert string
-	Dialer  common.Dialer
-}
-
-func (c Config) fillInDefaults() Config {
-	c.Dialer = c.Dialer.FillInDefaults()
-	common.FillInDefaults(c.Request)
-	return c
-}
-
-// Instance processes a single proto.ForwardEchoRequest, sending individual echo requests to the destination URL.
+// Instance is a client for forwarding requests to echo servers.
 type Instance struct {
-	p       protocol
-	url     string
-	timeout time.Duration
-	count   int
-	qps     int
-	header  http.Header
-	message string
+	e           *executor
+	protocolMap map[scheme.Instance]protocol
+	protocols   []protocol
 }
 
 // New creates a new forwarder Instance.
-func New(cfg Config) (*Instance, error) {
-	cfg = cfg.fillInDefaults()
-
-	p, err := newProtocol(cfg)
-	if err != nil {
-		return nil, err
+func New() *Instance {
+	var protocols []protocol
+	add := func(p protocol) protocol {
+		protocols = append(protocols, p)
+		return p
 	}
+
+	// Create the protocols and populate the map.
+	e := newExecutor()
+	protocolMap := make(map[scheme.Instance]protocol)
+	h := add(newHTTPProtocol(e))
+	protocolMap[scheme.HTTP] = h
+	protocolMap[scheme.HTTPS] = h
+	protocolMap[scheme.DNS] = add(newDNSProtocol(e))
+	protocolMap[scheme.GRPC] = add(newGRPCProtocol(e))
+	protocolMap[scheme.WebSocket] = add(newWebsocketProtocol(e))
+	protocolMap[scheme.TLS] = add(newTLSProtocol(e))
+	protocolMap[scheme.XDS] = add(newXDSProtocol(e))
+	protocolMap[scheme.TCP] = add(newTCPProtocol(e))
 
 	return &Instance{
-		p:       p,
-		url:     cfg.Request.Url,
-		timeout: common.GetTimeout(cfg.Request),
-		count:   common.GetCount(cfg.Request),
-		qps:     int(cfg.Request.Qps),
-		header:  common.GetHeaders(cfg.Request),
-		message: cfg.Request.Message,
-	}, nil
+		e:           e,
+		protocolMap: protocolMap,
+		protocols:   protocols,
+	}
 }
 
-// Run the forwarder and collect the responses.
-func (i *Instance) Run(ctx context.Context) (*proto.ForwardEchoResponse, error) {
-	g, _ := errgroup.WithContext(context.Background())
-	responses := make([]string, i.count)
-
-	var throttle *time.Ticker
-
-	if i.qps > 0 {
-		sleepTime := time.Second / time.Duration(i.qps)
-		log.Debugf("Sleeping %v between requests", sleepTime)
-		throttle = time.NewTicker(sleepTime)
-	}
-
-	for reqIndex := 0; reqIndex < i.count; reqIndex++ {
-		r := request{
-			RequestID: reqIndex,
-			URL:       i.url,
-			Message:   i.message,
-			Header:    i.header,
-			Timeout:   i.timeout,
-		}
-
-		if throttle != nil {
-			<-throttle.C
-		}
-
-		// TODO(nmittler): Refactor this to limit the number of go routines.
-		g.Go(func() error {
-			resp, err := i.p.makeRequest(ctx, &r)
-			if err != nil {
-				return err
-			}
-			responses[r.RequestID] = resp
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
+// ForwardEcho sends the requests and collect the responses.
+func (i *Instance) ForwardEcho(ctx context.Context, cfg *Config) (*proto.ForwardEchoResponse, error) {
+	if err := cfg.fillDefaults(); err != nil {
 		return nil, err
 	}
 
-	return &proto.ForwardEchoResponse{
-		Output: responses,
-	}, nil
+	// Lookup the protocol.
+	p := i.protocolMap[cfg.scheme]
+	if p == nil {
+		return nil, fmt.Errorf("no protocol handler found for scheme %s", cfg.scheme)
+	}
+
+	return p.ForwardEcho(ctx, cfg)
 }
 
 func (i *Instance) Close() error {
-	if i != nil && i.p != nil {
-		return i.p.Close()
+	i.e.Close()
+
+	for _, p := range i.protocols {
+		_ = p.Close()
 	}
+
 	return nil
 }

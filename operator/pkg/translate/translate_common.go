@@ -17,8 +17,9 @@ package translate
 import (
 	"fmt"
 
-	"istio.io/api/operator/v1alpha1"
+	"github.com/golang/protobuf/ptypes/wrappers"
 
+	"istio.io/api/operator/v1alpha1"
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/tpath"
 	"istio.io/istio/operator/pkg/util"
@@ -36,7 +37,7 @@ func IsComponentEnabledInSpec(componentName name.ComponentName, controlPlaneSpec
 	if !found || componentNodeI == nil {
 		return false, nil
 	}
-	componentNode, ok := componentNodeI.(*v1alpha1.BoolValueForPB)
+	componentNode, ok := componentNodeI.(*wrappers.BoolValue)
 	if !ok {
 		return false, fmt.Errorf("component %s enabled has bad type %T, expect *v1alpha1.BoolValueForPB", componentName, componentNodeI)
 	}
@@ -48,7 +49,7 @@ func IsComponentEnabledInSpec(componentName name.ComponentName, controlPlaneSpec
 
 // IsComponentEnabledFromValue get whether component is enabled in helm value.yaml tree.
 // valuePath points to component path in the values tree.
-func IsComponentEnabledFromValue(cn name.ComponentName, valueSpec map[string]interface{}) (enabled bool, pathExist bool, err error) {
+func IsComponentEnabledFromValue(cn name.ComponentName, valueSpec map[string]any) (enabled bool, pathExist bool, err error) {
 	t := NewTranslator()
 	cnMap, ok := t.ComponentMaps[cn]
 	if !ok {
@@ -87,4 +88,34 @@ func OverlayValuesEnablement(baseYAML, fileOverlayYAML, setOverlayYAML string) (
 	}
 
 	return YAMLTree(overlayYAML, baseYAML, name.ValuesEnablementPathMap)
+}
+
+// GetEnabledComponents get all the enabled components from the given istio operator spec
+func GetEnabledComponents(iopSpec *v1alpha1.IstioOperatorSpec) ([]string, error) {
+	var enabledComponents []string
+	if iopSpec.Components != nil {
+		for _, c := range name.AllCoreComponentNames {
+			enabled, err := IsComponentEnabledInSpec(c, iopSpec)
+			if err != nil {
+				return nil, fmt.Errorf("failed to check if component: %s is enabled or not: %v", string(c), err)
+			}
+			if enabled {
+				enabledComponents = append(enabledComponents, string(c))
+			}
+		}
+		for _, c := range iopSpec.Components.IngressGateways {
+			if c.Enabled.GetValue() {
+				enabledComponents = append(enabledComponents, string(name.IngressComponentName))
+				break
+			}
+		}
+		for _, c := range iopSpec.Components.EgressGateways {
+			if c.Enabled.GetValue() {
+				enabledComponents = append(enabledComponents, string(name.EgressComponentName))
+				break
+			}
+		}
+	}
+
+	return enabledComponents, nil
 }

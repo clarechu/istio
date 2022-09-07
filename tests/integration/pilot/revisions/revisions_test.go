@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,13 +22,16 @@ import (
 	"time"
 
 	"istio.io/istio/pkg/config/protocol"
-
-	"istio.io/istio/pkg/test/framework/components/istio"
-
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/components/echo/echoboot"
+	"istio.io/istio/pkg/test/framework/components/echo/check"
+	"istio.io/istio/pkg/test/framework/components/echo/deployment"
+	"istio.io/istio/pkg/test/framework/components/echo/echotest"
+	"istio.io/istio/pkg/test/framework/components/echo/match"
+	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/components/namespace"
+	"istio.io/istio/pkg/test/framework/label"
+	"istio.io/istio/pkg/test/framework/resource"
 	"istio.io/istio/pkg/test/util/retry"
 )
 
@@ -33,15 +39,18 @@ import (
 // If a test requires a custom install it should go into its own package, otherwise it should go
 // here to reuse a single install across tests.
 func TestMain(m *testing.M) {
+	// nolint: staticcheck
 	framework.
 		NewSuite(m).
-		RequireSingleCluster().
-		Setup(istio.Setup(nil, func(cfg *istio.Config) {
+		RequireMultiPrimary().
+		// Requires two CPs with specific names to be configured.
+		Label(label.CustomSetup).
+		Setup(istio.Setup(nil, func(_ resource.Context, cfg *istio.Config) {
 			cfg.ControlPlaneValues = `
 revision: stable
 `
 		})).
-		Setup(istio.Setup(nil, func(cfg *istio.Config) {
+		Setup(istio.Setup(nil, func(_ resource.Context, cfg *istio.Config) {
 			cfg.ControlPlaneValues = `
 profile: empty
 revision: canary
@@ -57,45 +66,66 @@ components:
 // belong to different control planes.
 func TestMultiRevision(t *testing.T) {
 	framework.NewTest(t).
-		Run(func(ctx framework.TestContext) {
-			stable := namespace.NewOrFail(t, ctx, namespace.Config{
+		Run(func(t framework.TestContext) {
+			stable := namespace.NewOrFail(t, t, namespace.Config{
 				Prefix:   "stable",
 				Inject:   true,
 				Revision: "stable",
 			})
-			canary := namespace.NewOrFail(t, ctx, namespace.Config{
+			canary := namespace.NewOrFail(t, t, namespace.Config{
 				Prefix:   "canary",
 				Inject:   true,
 				Revision: "canary",
 			})
 
-			var client, server echo.Instance
-			echoboot.NewBuilder(ctx).
-				With(&client, echo.Config{
+			echos := deployment.New(t).
+				WithClusters(t.Clusters()...).
+				WithConfig(echo.Config{
 					Service:   "client",
 					Namespace: stable,
 					Ports:     []echo.Port{},
 				}).
-				With(&server, echo.Config{
+				WithConfig(echo.Config{
 					Service:   "server",
 					Namespace: canary,
 					Ports: []echo.Port{
 						{
 							Name:         "http",
 							Protocol:     protocol.HTTP,
-							InstancePort: 8090,
-						}},
+							WorkloadPort: 8090,
+						},
+					},
+				}).
+				WithConfig(echo.Config{
+					Service:    "vm",
+					Namespace:  canary,
+					DeployAsVM: true,
+					Ports:      []echo.Port{},
 				}).
 				BuildOrFail(t)
-			retry.UntilSuccessOrFail(t, func() error {
-				resp, err := client.Call(echo.CallOptions{
-					Target:   server,
-					PortName: "http",
+
+			echotest.New(t, echos).
+				ConditionallyTo(echotest.ReachableDestinations).
+				ToMatch(match.ServiceName(echo.NamespacedName{Name: "server", Namespace: canary})).
+				Run(func(t framework.TestContext, from echo.Instance, to echo.Target) {
+					retry.UntilSuccessOrFail(t, func() error {
+						result, err := from.Call(echo.CallOptions{
+							To: to,
+							Port: echo.Port{
+								Name: "http",
+							},
+							Retry: echo.Retry{
+								NoRetry: true,
+							},
+							Check: check.And(
+								check.OK(),
+								check.ReachedTargetClusters(t),
+							),
+						})
+						return check.And(
+							check.NoError(),
+							check.OK()).Check(result, err)
+					}, retry.Delay(time.Millisecond*100))
 				})
-				if err != nil {
-					return err
-				}
-				return resp.CheckOK()
-			}, retry.Delay(time.Millisecond*100))
 		})
 }

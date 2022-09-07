@@ -15,9 +15,7 @@
 package caclient
 
 import (
-	"context"
 	"fmt"
-	"os"
 	"reflect"
 	"testing"
 
@@ -26,16 +24,10 @@ import (
 
 const mockServerAddress = "localhost:0"
 
-var (
-	fakeCert  = []string{"foo", "bar"}
-	fakeToken = "Bearer fakeToken"
-)
+var fakeCert = []string{"foo", "bar"}
 
 func TestGoogleCAClient(t *testing.T) {
-	os.Setenv("GKE_CLUSTER_URL", "https://container.googleapis.com/v1/projects/testproj/locations/us-central1-c/clusters/cluster1")
-	defer func() {
-		os.Unsetenv("GKE_CLUSTER_URL")
-	}()
+	t.Setenv("GKE_CLUSTER_URL", "https://container.googleapis.com/v1/projects/testproj/locations/us-central1-c/clusters/cluster1")
 
 	testCases := map[string]struct {
 		service      mock.CAService
@@ -67,12 +59,12 @@ func TestGoogleCAClient(t *testing.T) {
 		}
 		defer s.Stop()
 
-		cli, err := NewGoogleCAClient(s.Address, false)
+		cli, err := NewGoogleCAClient(s.Address, false, nil)
 		if err != nil {
 			t.Errorf("Test case [%s]: failed to create ca client: %v", id, err)
 		}
 
-		resp, err := cli.CSRSign(context.Background(), "12345678-1234-1234-1234-123456789012", []byte{01}, fakeToken, 1)
+		resp, err := cli.CSRSign([]byte{0o1}, 1)
 		if err != nil {
 			if err.Error() != tc.expectedErr {
 				t.Errorf("Test case [%s]: error (%s) does not match expected error (%s)", id, err.Error(), tc.expectedErr)
@@ -95,6 +87,10 @@ func TestParseZone(t *testing.T) {
 		"Valid URL": {
 			clusterURL:   "https://container.googleapis.com/v1/projects/testproj1/locations/us-central1-c/clusters/c1",
 			expectedZone: "us-central1-c",
+		},
+		"Hub URL": {
+			clusterURL:   "https://gkehub.googleapis.com/projects/testproject1/locations/global/memberships/test01",
+			expectedZone: "",
 		},
 		"InValid response": {
 			clusterURL:   "aaa",

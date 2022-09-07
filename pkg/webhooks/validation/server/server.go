@@ -19,21 +19,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 
-	"github.com/hashicorp/go-multierror"
-	kubeApiAdmission "k8s.io/api/admission/v1"
+	multierror "github.com/hashicorp/go-multierror"
+	kubeApiAdmissionv1 "k8s.io/api/admission/v1"
+	kubeApiAdmissionv1beta1 "k8s.io/api/admission/v1beta1"
 	kubeApiApps "k8s.io/api/apps/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 
-	"istio.io/pkg/log"
-
 	"istio.io/istio/pilot/pkg/config/kube/crd"
 	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/config/validation"
+	"istio.io/istio/pkg/kube"
+	"istio.io/pkg/log"
 )
 
 var scope = log.RegisterScope("validationServer", "validation webhook server", 0)
@@ -55,6 +57,8 @@ var (
 
 func init() {
 	_ = kubeApiApps.AddToScheme(runtimeScheme)
+	_ = kubeApiAdmissionv1.AddToScheme(runtimeScheme)
+	_ = kubeApiAdmissionv1beta1.AddToScheme(runtimeScheme)
 }
 
 // Options contains the configuration for the Istio Pilot validation
@@ -101,51 +105,36 @@ type Webhook struct {
 }
 
 // New creates a new instance of the admission webhook server.
-func New(p Options) (*Webhook, error) {
-	if p.Mux == nil {
+func New(o Options) (*Webhook, error) {
+	if o.Mux == nil {
 		scope.Error("mux not set correctly")
 		return nil, errors.New("expected mux to be passed, but was not passed")
 	}
 	wh := &Webhook{
-		schemas: p.Schemas,
+		schemas:      o.Schemas,
+		domainSuffix: o.DomainSuffix,
 	}
 
-	p.Mux.HandleFunc("/validate", wh.serveValidate)
-	// old handlers retained backwards compatibility during upgrades
-	p.Mux.HandleFunc("/admitpilot", wh.serveAdmitPilot)
+	o.Mux.HandleFunc("/validate", wh.serveValidate)
+	o.Mux.HandleFunc("/validate/", wh.serveValidate)
 
 	return wh, nil
 }
 
-//Stop the server
-func (wh *Webhook) Stop() {
+func toAdmissionResponse(err error) *kube.AdmissionResponse {
+	return &kube.AdmissionResponse{Result: &metav1.Status{Message: err.Error()}}
 }
 
-var readyHook = func() {}
-
-// Run implements the webhook server
-func (wh *Webhook) Run(stopCh <-chan struct{}) {
-
-	defer func() {
-		wh.Stop()
-	}()
-
-	if readyHook != nil {
-		readyHook()
-	}
-}
-
-func toAdmissionResponse(err error) *kubeApiAdmission.AdmissionResponse {
-	return &kubeApiAdmission.AdmissionResponse{Result: &metav1.Status{Message: err.Error()}}
-}
-
-type admitFunc func(*kubeApiAdmission.AdmissionRequest) *kubeApiAdmission.AdmissionResponse
+type admitFunc func(*kube.AdmissionRequest) *kube.AdmissionResponse
 
 func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	var body []byte
 	if r.Body != nil {
-		if data, err := ioutil.ReadAll(r.Body); err == nil {
+		if data, err := kube.HTTPConfigReader(r); err == nil {
 			body = data
+		} else {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 	}
 	if len(body) == 0 {
@@ -162,33 +151,35 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 		return
 	}
 
-	var reviewResponse *kubeApiAdmission.AdmissionResponse
-	ar := kubeApiAdmission.AdmissionReview{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "admission.k8s.io/v1",
-			Kind:       "AdmissionReview",
-		},
-	}
-	if _, _, err := deserializer.Decode(body, nil, &ar); err != nil {
+	var reviewResponse *kube.AdmissionResponse
+	var obj runtime.Object
+	var ar *kube.AdmissionReview
+	if out, _, err := deserializer.Decode(body, nil, obj); err != nil {
 		reviewResponse = toAdmissionResponse(fmt.Errorf("could not decode body: %v", err))
 	} else {
-		reviewResponse = admit(ar.Request)
-	}
-
-	response := kubeApiAdmission.AdmissionReview{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "admission.k8s.io/v1",
-			Kind:       "AdmissionReview",
-		},
-	}
-	if reviewResponse != nil {
-		response.Response = reviewResponse
-		if ar.Request != nil {
-			response.Response.UID = ar.Request.UID
+		ar, err = kube.AdmissionReviewKubeToAdapter(out)
+		if err != nil {
+			reviewResponse = toAdmissionResponse(fmt.Errorf("could not decode object: %v", err))
+		} else {
+			reviewResponse = admit(ar.Request)
 		}
 	}
 
-	resp, err := json.Marshal(response)
+	response := kube.AdmissionReview{}
+	response.Response = reviewResponse
+	var responseKube runtime.Object
+	var apiVersion string
+	if ar != nil {
+		apiVersion = ar.APIVersion
+		response.TypeMeta = ar.TypeMeta
+		if response.Response != nil {
+			if ar.Request != nil {
+				response.Response.UID = ar.Request.UID
+			}
+		}
+	}
+	responseKube = kube.AdmissionReviewAdapterToKube(&response, apiVersion)
+	resp, err := json.Marshal(responseKube)
 	if err != nil {
 		reportValidationHTTPError(http.StatusInternalServerError)
 		http.Error(w, fmt.Sprintf("could encode response: %v", err), http.StatusInternalServerError)
@@ -200,28 +191,17 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	}
 }
 
-func (wh *Webhook) serveAdmitPilot(w http.ResponseWriter, r *http.Request) {
-	serve(w, r, wh.admitPilot)
-}
-
 func (wh *Webhook) serveValidate(w http.ResponseWriter, r *http.Request) {
 	serve(w, r, wh.validate)
 }
 
-func (wh *Webhook) validate(request *kubeApiAdmission.AdmissionRequest) *kubeApiAdmission.AdmissionResponse {
-	switch request.Kind.Kind {
-	default:
-		return wh.admitPilot(request)
-	}
-}
-
-func (wh *Webhook) admitPilot(request *kubeApiAdmission.AdmissionRequest) *kubeApiAdmission.AdmissionResponse {
+func (wh *Webhook) validate(request *kube.AdmissionRequest) *kube.AdmissionResponse {
 	switch request.Operation {
-	case kubeApiAdmission.Create, kubeApiAdmission.Update:
+	case kube.Create, kube.Update:
 	default:
 		scope.Warnf("Unsupported webhook operation %v", request.Operation)
 		reportValidationFailed(request, reasonUnsupportedOperation)
-		return &kubeApiAdmission.AdmissionResponse{Allowed: true}
+		return &kube.AdmissionResponse{Allowed: true}
 	}
 
 	var obj crd.IstioKind
@@ -235,14 +215,16 @@ func (wh *Webhook) admitPilot(request *kubeApiAdmission.AdmissionRequest) *kubeA
 
 	// TODO(jasonwzm) remove this when multi-version is supported. v1beta1 shares the same
 	// schema as v1lalpha3. Fake conversion and validate against v1alpha3.
-	if gvk.Group == "networking.istio.io" && gvk.Version == "v1beta1" {
+	if gvk.Group == "networking.istio.io" && gvk.Version == "v1beta1" &&
+		// ProxyConfig CR is stored as v1beta1 since it was introduced as v1beta1
+		gvk.Kind != collections.IstioNetworkingV1Beta1Proxyconfigs.Resource().Kind() {
 		gvk.Version = "v1alpha3"
 	}
 	s, exists := wh.schemas.FindByGroupVersionKind(resource.FromKubernetesGVK(&gvk))
 	if !exists {
-		scope.Infof("unrecognized type %v", obj.Kind)
+		scope.Infof("unrecognized type %v", obj.GroupVersionKind())
 		reportValidationFailed(request, reasonUnknownType)
-		return toAdmissionResponse(fmt.Errorf("unrecognized type %v", obj.Kind))
+		return toAdmissionResponse(fmt.Errorf("unrecognized type %v", obj.GroupVersionKind()))
 	}
 
 	out, err := crd.ConvertObject(s, &obj, wh.domainSuffix)
@@ -252,7 +234,8 @@ func (wh *Webhook) admitPilot(request *kubeApiAdmission.AdmissionRequest) *kubeA
 		return toAdmissionResponse(fmt.Errorf("error decoding configuration: %v", err))
 	}
 
-	if err := s.Resource().ValidateProto(out.Name, out.Namespace, out.Spec); err != nil {
+	warnings, err := s.Resource().ValidateConfig(*out)
+	if err != nil {
 		scope.Infof("configuration is invalid: %v", err)
 		reportValidationFailed(request, reasonInvalidConfig)
 		return toAdmissionResponse(fmt.Errorf("configuration is invalid: %v", err))
@@ -264,7 +247,22 @@ func (wh *Webhook) admitPilot(request *kubeApiAdmission.AdmissionRequest) *kubeA
 	}
 
 	reportValidationPass(request)
-	return &kubeApiAdmission.AdmissionResponse{Allowed: true}
+	return &kube.AdmissionResponse{Allowed: true, Warnings: toKubeWarnings(warnings)}
+}
+
+func toKubeWarnings(warn validation.Warning) []string {
+	if warn == nil {
+		return nil
+	}
+	me, ok := warn.(*multierror.Error)
+	if ok {
+		res := []string{}
+		for _, e := range me.Errors {
+			res = append(res, e.Error())
+		}
+		return res
+	}
+	return []string{warn.Error()}
 }
 
 func checkFields(raw []byte, kind string, namespace string, name string) (string, error) {

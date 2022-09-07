@@ -1,4 +1,4 @@
-// Copyright 2020 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"istio.io/pkg/log"
-
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -28,6 +26,8 @@ import (
 	client "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+
+	"istio.io/istio/pkg/kube"
 )
 
 type Controller struct {
@@ -35,10 +35,10 @@ type Controller struct {
 	workQueue     workqueue.RateLimitingInterface
 	podController cache.Controller
 
-	reconciler BrokenPodReconciler
+	reconciler brokenPodReconciler
 }
 
-func NewRepairController(reconciler BrokenPodReconciler) (*Controller, error) {
+func NewRepairController(reconciler brokenPodReconciler) (*Controller, error) {
 	c := &Controller{
 		clientset:  reconciler.client,
 		workQueue:  workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
@@ -55,37 +55,50 @@ func NewRepairController(reconciler BrokenPodReconciler) (*Controller, error) {
 				fieldSelectors []string
 			)
 
-			for _, ls := range []string{options.LabelSelector, reconciler.Filters.LabelSelectors} {
+			for _, ls := range []string{options.LabelSelector, reconciler.cfg.LabelSelectors} {
 				if ls != "" {
 					labelSelectors = append(labelSelectors, ls)
 				}
 			}
-			for _, fs := range []string{options.FieldSelector, reconciler.Filters.FieldSelectors} {
+			for _, fs := range []string{options.FieldSelector, reconciler.cfg.FieldSelectors} {
 				if fs != "" {
 					fieldSelectors = append(fieldSelectors, fs)
 				}
 			}
+			// filter out pod events from different nodes
+			fieldSelectors = append(fieldSelectors, fmt.Sprintf("spec.nodeName=%v", reconciler.cfg.NodeName))
 			options.LabelSelector = strings.Join(labelSelectors, ",")
 			options.FieldSelector = strings.Join(fieldSelectors, ",")
 		},
 	)
 
 	_, c.podController = cache.NewInformer(podListWatch, &v1.Pod{}, 0, cache.ResourceEventHandlerFuncs{
-		AddFunc: func(newObj interface{}) {
-			c.workQueue.AddRateLimited(newObj)
+		AddFunc: func(newObj any) {
+			c.mayAddToWorkQueue(newObj)
 		},
-		UpdateFunc: func(_, newObj interface{}) {
-			c.workQueue.AddRateLimited(newObj)
+		UpdateFunc: func(_, newObj any) {
+			c.mayAddToWorkQueue(newObj)
 		},
 	})
 
 	return c, nil
 }
 
+func (rc *Controller) mayAddToWorkQueue(obj any) {
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		repairLog.Error("Cannot convert object to pod. Skip adding it to the repair working queue.")
+		return
+	}
+	if rc.reconciler.detectPod(*pod) {
+		rc.workQueue.AddRateLimited(obj)
+	}
+}
+
 func (rc *Controller) Run(stopCh <-chan struct{}) {
 	go rc.podController.Run(stopCh)
-	if !cache.WaitForCacheSync(stopCh, rc.podController.HasSynced) {
-		runtime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
+	if !kube.WaitForCacheSync(stopCh, rc.podController.HasSynced) {
+		repairLog.Error("timed out waiting for pod caches to sync")
 		return
 	}
 
@@ -100,9 +113,6 @@ func (rc *Controller) Run(stopCh <-chan struct{}) {
 		time.Second,
 		stopCh,
 	)
-
-	<-stopCh
-	log.Infof("Stopping repair controller.")
 }
 
 // Process the next available item in the work queue.
@@ -118,7 +128,7 @@ func (rc *Controller) processNextItem() bool {
 
 	pod, ok := obj.(*v1.Pod)
 	if !ok {
-		log.Errorf("Error decoding object, invalid type. Dropping.")
+		repairLog.Errorf("Error decoding object, invalid type. Dropping.")
 		rc.workQueue.Forget(obj)
 		// Short-circuit on this item, but return true to keep
 		// processing.
@@ -128,23 +138,23 @@ func (rc *Controller) processNextItem() bool {
 	err := rc.reconciler.ReconcilePod(*pod)
 
 	if err == nil {
-		log.Debugf("Removing %s/%s from work queue", pod.Namespace, pod.Name)
+		repairLog.Debugf("Removing %s/%s from work queue", pod.Namespace, pod.Name)
 		rc.workQueue.Forget(obj)
 	} else if rc.workQueue.NumRequeues(obj) < 50 {
 		if strings.Contains(err.Error(), "the object has been modified; please apply your changes to the latest version and try again") {
-			log.Debugf("Object '%s/%s' modified, requeue for retry", pod.Namespace, pod.Name)
-			log.Infof("Re-adding %s/%s to work queue", pod.Namespace, pod.Name)
+			repairLog.Debugf("Object '%s/%s' modified, requeue for retry", pod.Namespace, pod.Name)
+			repairLog.Infof("Re-adding %s/%s to work queue", pod.Namespace, pod.Name)
 			rc.workQueue.AddRateLimited(obj)
 		} else if strings.Contains(err.Error(), "not found") {
-			log.Debugf("Object '%s/%s' removed, dequeue", pod.Namespace, pod.Name)
+			repairLog.Debugf("Object '%s/%s' removed, dequeue", pod.Namespace, pod.Name)
 			rc.workQueue.Forget(obj)
 		} else {
-			log.Errorf("Error: %s", err)
-			log.Infof("Re-adding %s/%s to work queue", pod.Namespace, pod.Name)
+			repairLog.Errorf("Error: %s", err)
+			repairLog.Infof("Re-adding %s/%s to work queue", pod.Namespace, pod.Name)
 			rc.workQueue.AddRateLimited(obj)
 		}
 	} else {
-		log.Infof("Requeue limit reached, removing %s/%s", pod.Namespace, pod.Name)
+		repairLog.Infof("Requeue limit reached, removing %s/%s", pod.Namespace, pod.Name)
 		rc.workQueue.Forget(obj)
 		runtime.HandleError(err)
 	}

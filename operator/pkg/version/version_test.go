@@ -16,11 +16,11 @@ package version
 
 import (
 	"fmt"
-	"reflect"
 	"testing"
 
-	"github.com/kr/pretty"
 	"gopkg.in/yaml.v2"
+
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 func TestVersion(t *testing.T) {
@@ -78,6 +78,11 @@ func TestVersion(t *testing.T) {
 			yamlStr: ".1.1.1-something",
 			wantErr: `Malformed version: .1.1.1-something`,
 		},
+		{
+			desc:    "Malformed version fail",
+			yamlStr: "istio-testing-distroless",
+			wantErr: `Malformed version: istio-testing-distroless`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -87,8 +92,8 @@ func TestVersion(t *testing.T) {
 			if gotErr, wantErr := errToString(err), tt.wantErr; gotErr != wantErr {
 				t.Fatalf("yaml.Unmarshal(%s): got error: %s, want error: %s", tt.desc, gotErr, wantErr)
 			}
-			if tt.wantErr == "" && !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("%s: got:\n%s\nwant:\n%s\n", tt.desc, pretty.Sprint(got), pretty.Sprint(tt.want))
+			if tt.wantErr == "" {
+				assert.Equal(t, got, tt.want)
 			}
 		})
 	}
@@ -160,7 +165,7 @@ func TestTagToVersionString(t *testing.T) {
 	//}
 	tests := []struct {
 		name string
-		//args    args
+		// args    args
 		want    string
 		wantErr bool
 	}{
@@ -301,7 +306,7 @@ func TestVersionString(t *testing.T) {
 func TestUnmarshalYAML(t *testing.T) {
 	v := &Version{}
 	expectedErr := fmt.Errorf("test error")
-	errReturn := func(interface{}) error { return expectedErr }
+	errReturn := func(any) error { return expectedErr }
 	gotErr := v.UnmarshalYAML(errReturn)
 	if gotErr == nil {
 		t.Errorf("expected error but got nil")

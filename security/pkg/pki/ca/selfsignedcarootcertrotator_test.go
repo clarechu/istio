@@ -29,7 +29,6 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"istio.io/istio/security/pkg/cmd"
-
 	"istio.io/istio/security/pkg/pki/util"
 	certutil "istio.io/istio/security/pkg/util"
 )
@@ -78,7 +77,7 @@ type rootCertItem struct {
 }
 
 func verifyRootCertAndPrivateKey(t *testing.T, shouldMatch bool, itemA, itemB rootCertItem) {
-	isMatched := bytes.Equal(itemA.caSecret.Data[caCertID], itemB.caSecret.Data[caCertID])
+	isMatched := bytes.Equal(itemA.caSecret.Data[CACertFile], itemB.caSecret.Data[CACertFile])
 	if isMatched != shouldMatch {
 		t.Errorf("Verification of root cert in CA secret failed. Want %v got %v", shouldMatch, isMatched)
 	}
@@ -89,8 +88,8 @@ func verifyRootCertAndPrivateKey(t *testing.T, shouldMatch bool, itemA, itemB ro
 
 	// Root cert rotation does not change root private key. Root private key should
 	// remain the same.
-	isMatched = bytes.Equal(itemA.caSecret.Data[caPrivateKeyID], itemB.caSecret.Data[caPrivateKeyID])
-	if isMatched != true {
+	isMatched = bytes.Equal(itemA.caSecret.Data[CAPrivateKeyFile], itemB.caSecret.Data[CAPrivateKeyFile])
+	if !isMatched {
 		t.Errorf("Root private key should not change. Want %v got %v", shouldMatch, isMatched)
 	}
 }
@@ -154,7 +153,7 @@ func TestRootCertRotatorKeepCertFieldsUnchanged(t *testing.T) {
 	rotator.checkAndRotateRootCert()
 	certItem1 := loadCert(rotator)
 
-	if !bytes.Equal(certItem0.caSecret.Data[caPrivateKeyID], certItem1.caSecret.Data[caPrivateKeyID]) {
+	if !bytes.Equal(certItem0.caSecret.Data[CAPrivateKeyFile], certItem1.caSecret.Data[CAPrivateKeyFile]) {
 		t.Errorf("private key should not change")
 	}
 	// verifyRootCertFields verifies that new root cert and private key matches the
@@ -165,7 +164,8 @@ func TestRootCertRotatorKeepCertFieldsUnchanged(t *testing.T) {
 // updateRootCertWithCustomCertOptions generate root cert and private key with
 // custom cert options, and replaces root cert and key in CA secret.
 func updateRootCertWithCustomCertOptions(t *testing.T,
-	rotator *SelfSignedCARootCertRotator, options util.CertOptions) {
+	rotator *SelfSignedCARootCertRotator, options util.CertOptions,
+) {
 	certItem := loadCert(rotator)
 
 	pemCert, pemKey, err := util.GenCertKeyFromOptions(options)
@@ -173,28 +173,28 @@ func updateRootCertWithCustomCertOptions(t *testing.T,
 		t.Fatalf("failed to rotate secret: %v", err)
 	}
 	newSecret := certItem.caSecret
-	newSecret.Data[caCertID] = pemCert
-	newSecret.Data[caPrivateKeyID] = pemKey
+	newSecret.Data[CACertFile] = pemCert
+	newSecret.Data[CAPrivateKeyFile] = pemKey
 	rotator.config.client.Secrets(rotator.config.caStorageNamespace).Update(context.TODO(), newSecret, metav1.UpdateOptions{})
 }
 
 // verifyRootCertFields verifies that certain fields in both new and old root
 // cert and key should not change.
 func verifyRootCertFields(t *testing.T, oldCertItem, newCertItem rootCertItem) {
-	if !bytes.Equal(oldCertItem.caSecret.Data[caPrivateKeyID],
-		newCertItem.caSecret.Data[caPrivateKeyID]) {
+	if !bytes.Equal(oldCertItem.caSecret.Data[CAPrivateKeyFile],
+		newCertItem.caSecret.Data[CAPrivateKeyFile]) {
 		t.Errorf("private key should not change")
 	}
-	oldKeyLen := getPublicKeySizeInBits(oldCertItem.caSecret.Data[caPrivateKeyID])
-	newKeyLen := getPublicKeySizeInBits(newCertItem.caSecret.Data[caPrivateKeyID])
+	oldKeyLen := getPublicKeySizeInBits(oldCertItem.caSecret.Data[CAPrivateKeyFile])
+	newKeyLen := getPublicKeySizeInBits(newCertItem.caSecret.Data[CAPrivateKeyFile])
 
 	if oldKeyLen != newKeyLen {
 		t.Errorf("Public key size should not change, (got %d) vs (expected %d)",
 			newKeyLen, oldKeyLen)
 	}
 
-	oldRootCert, _ := util.ParsePemEncodedCertificate(oldCertItem.caSecret.Data[caCertID])
-	newRootCert, _ := util.ParsePemEncodedCertificate(newCertItem.caSecret.Data[caCertID])
+	oldRootCert, _ := util.ParsePemEncodedCertificate(oldCertItem.caSecret.Data[CACertFile])
+	newRootCert, _ := util.ParsePemEncodedCertificate(newCertItem.caSecret.Data[CACertFile])
 	if oldRootCert.Subject.String() != newRootCert.Subject.String() {
 		t.Errorf("certificate Subject does not match (old: %s) vs (new: %s)",
 			oldRootCert.Subject.String(), newRootCert.Subject.String())
@@ -234,7 +234,7 @@ func TestKeyCertBundleReloadInRootCertRotatorForSigningCitadel(t *testing.T) {
 	oldRootCert := certItem0.rootCertInKeyCertBundle
 	options := util.CertOptions{
 		TTL:           rotator.config.caCertTTL,
-		SignerPrivPem: certItem0.caSecret.Data[caPrivateKeyID],
+		SignerPrivPem: certItem0.caSecret.Data[CAPrivateKeyFile],
 		Org:           rotator.config.org,
 		IsCA:          true,
 		IsSelfSigned:  true,
@@ -246,8 +246,8 @@ func TestKeyCertBundleReloadInRootCertRotatorForSigningCitadel(t *testing.T) {
 		t.Fatalf("failed to rotate secret: %s", ckErr.Error())
 	}
 	newSecret := certItem0.caSecret
-	newSecret.Data[caCertID] = pemCert
-	newSecret.Data[caPrivateKeyID] = pemKey
+	newSecret.Data[CACertFile] = pemCert
+	newSecret.Data[CAPrivateKeyFile] = pemKey
 	rotator.config.client.Secrets(rotator.config.caStorageNamespace).Update(context.TODO(), newSecret, metav1.UpdateOptions{})
 
 	// Change grace period percentage to 0, so that root cert is not going to expire soon.
@@ -256,7 +256,7 @@ func TestKeyCertBundleReloadInRootCertRotatorForSigningCitadel(t *testing.T) {
 	// Verifies that when root cert remaining life is not in grace period time,
 	// root cert is not rotated.
 	certItem1 := loadCert(rotator)
-	if !bytes.Equal(newSecret.Data[caCertID], certItem1.caSecret.Data[caCertID]) {
+	if !bytes.Equal(newSecret.Data[CACertFile], certItem1.caSecret.Data[CACertFile]) {
 		t.Error("root cert in istio-ca-secret should be the same.")
 	}
 	// Verifies that after rotation, the rotator should have reloaded root cert into
@@ -264,7 +264,7 @@ func TestKeyCertBundleReloadInRootCertRotatorForSigningCitadel(t *testing.T) {
 	if bytes.Equal(oldRootCert, rotator.ca.keyCertBundle.GetRootCertPem()) {
 		t.Error("root cert in key cert bundle should be different after rotation.")
 	}
-	if !bytes.Equal(certItem1.caSecret.Data[caCertID], rotator.ca.keyCertBundle.GetRootCertPem()) {
+	if !bytes.Equal(certItem1.caSecret.Data[CACertFile], rotator.ca.keyCertBundle.GetRootCertPem()) {
 		t.Error("root cert in key cert bundle should be the same as root " +
 			"cert in istio-ca-secret after root cert rotation.")
 	}
@@ -294,6 +294,7 @@ func TestRollbackAtRootCertRotatorForSigningCitadel(t *testing.T) {
 // TestRootCertRotatorGoroutineForSigningCitadel verifies that rotator
 // periodically rotates root cert, updates key cert bundle and config map.
 func TestRootCertRotatorGoroutineForSigningCitadel(t *testing.T) {
+	t.Skip("https://github.com/istio/istio/issues/26570")
 	rotator := getRootCertRotator(getDefaultSelfSignedIstioCAOptions(nil))
 
 	// Make a copy of CA secret, a copy of root cert form key cert bundle, and

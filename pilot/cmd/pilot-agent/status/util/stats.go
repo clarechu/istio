@@ -17,10 +17,14 @@ package util
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	multierror "github.com/hashicorp/go-multierror"
+
+	"istio.io/istio/pkg/http"
 )
 
 const (
@@ -30,9 +34,11 @@ const (
 	statLdsSuccess     = "listener_manager.lds.update_success"
 	statServerState    = "server.state"
 	statWorkersStarted = "listener_manager.workers_started"
-	readyStatsRegex    = "^(server.state|listener_manager.workers_started)"
-	updateStatsRegex   = "^(cluster_manager.cds|listener_manager.lds).(update_success|update_rejected)$"
+	readyStatsRegex    = "^(server\\.state|listener_manager\\.workers_started)"
+	updateStatsRegex   = "^(cluster_manager\\.cds|listener_manager\\.lds)\\.(update_success|update_rejected)$"
 )
+
+var readinessTimeout = time.Second * 3 // Default Readiness timeout. It is set the same in helm charts.
 
 type stat struct {
 	name  string
@@ -68,7 +74,9 @@ func GetReadinessStats(localHostAddr string, adminPort uint16) (*uint64, bool, e
 		localHostAddr = "localhost"
 	}
 
-	stats, err := doHTTPGet(fmt.Sprintf("http://%s:%d/stats?usedonly&filter=%s", localHostAddr, adminPort, readyStatsRegex))
+	hostPort := net.JoinHostPort(localHostAddr, strconv.Itoa(int(adminPort)))
+	readinessURL := fmt.Sprintf("http://%s/stats?usedonly&filter=%s", hostPort, readyStatsRegex)
+	stats, err := http.DoHTTPGetWithTimeout(readinessURL, readinessTimeout)
 	if err != nil {
 		return nil, false, err
 	}
@@ -99,7 +107,8 @@ func GetUpdateStatusStats(localHostAddr string, adminPort uint16) (*Stats, error
 		localHostAddr = "localhost"
 	}
 
-	stats, err := doHTTPGet(fmt.Sprintf("http://%s:%d/stats?usedonly&filter=%s", localHostAddr, adminPort, updateStatsRegex))
+	hostPort := net.JoinHostPort(localHostAddr, strconv.Itoa(int(adminPort)))
+	stats, err := http.DoHTTPGet(fmt.Sprintf("http://%s/stats?usedonly&filter=%s", hostPort, updateStatsRegex))
 	if err != nil {
 		return nil, err
 	}

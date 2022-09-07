@@ -18,13 +18,15 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
 
-	"github.com/ghodss/yaml"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/yaml"
+
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 const (
@@ -192,6 +194,21 @@ spec:
           host: c
           subset: v2
         weight: 25`
+	validVirtualService2 = `
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: valid-virtual-service2
+spec:
+  exportTo:
+  - '.'
+  hosts:
+  - d
+  http:
+  - route:
+    - destination:
+        host: c
+        subset: v1`
 	invalidVirtualService = `
 apiVersion: networking.istio.io/v1alpha3
 kind: VirtualService
@@ -207,7 +224,7 @@ spec:
       - destination:
           host: c
           subset: v2
-        weight: 25`
+        weight: -15`
 	invalidVirtualServiceV1Beta1 = `
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
@@ -215,6 +232,16 @@ metadata:
   name: invalid-virtual-service
 spec:
   http:
+`
+	warnDestinationRule = `apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: reviews-cb-policy
+spec:
+  host: reviews.prod.svc.cluster.local
+  trafficPolicy:
+    outlierDetection:
+      consecutiveErrors: 7
 `
 	invalidYAML = `
 (...!)`
@@ -279,6 +306,38 @@ trafficPolicy:
   tls:
     mode: ISTIO_MUTUAL
 `
+	validDeployment = `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helloworld-v1
+  labels:
+    app: helloworld
+    version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: helloworld
+      version: v1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/bootstrapOverride: "istio-custom-bootstrap-config"
+      labels:
+        app: helloworld
+        version: v1
+    spec:
+      containers:
+        - name: helloworld
+          image: docker.io/istio/examples-helloworld-v1
+          resources:
+            requests:
+              cpu: "100m"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+`
 )
 
 func fromYAML(in string) *unstructured.Unstructured {
@@ -294,6 +353,7 @@ func TestValidateResource(t *testing.T) {
 		name  string
 		in    string
 		valid bool
+		warn  bool
 	}{
 		{
 			name:  "valid pilot configuration",
@@ -370,14 +430,30 @@ func TestValidateResource(t *testing.T) {
 			in:    validIstioConfig,
 			valid: true,
 		},
+		{
+			name:  "warning",
+			in:    warnDestinationRule,
+			valid: true,
+			warn:  true,
+		},
+		{
+			name:  "exportTo=.",
+			in:    validVirtualService2,
+			valid: true,
+		},
 	}
 
 	for i, c := range cases {
 		t.Run(fmt.Sprintf("[%v] %v ", i, c.name), func(tt *testing.T) {
+			defer func() { recover() }()
 			v := &validator{}
-			err := v.validateResource("istio-system", fromYAML(c.in))
+			var writer io.Writer
+			warn, err := v.validateResource("istio-system", "", fromYAML(c.in), writer)
 			if (err == nil) != c.valid {
 				tt.Fatalf("unexpected validation result: got %v want %v: err=%v", err == nil, c.valid, err)
+			}
+			if (warn != nil) != c.warn {
+				tt.Fatalf("unexpected validation warning result: got %v want %v: warn=%v", warn != nil, c.warn, warn)
 			}
 		})
 	}
@@ -396,7 +472,7 @@ func buildMultiDocYAML(docs []string) string {
 
 func createTestFile(t *testing.T, data string) (string, io.Closer) {
 	t.Helper()
-	validFile, err := ioutil.TempFile("", "TestValidateCommand")
+	validFile, err := os.CreateTemp("", "TestValidateCommand")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,12 +485,16 @@ func createTestFile(t *testing.T, data string) (string, io.Closer) {
 func TestValidateCommand(t *testing.T) {
 	valid := buildMultiDocYAML([]string{validVirtualService, validVirtualService1})
 	invalid := buildMultiDocYAML([]string{invalidVirtualService, validVirtualService1})
+	warnings := buildMultiDocYAML([]string{invalidVirtualService, validVirtualService1, warnDestinationRule})
 
 	validFilename, closeValidFile := createTestFile(t, valid)
 	defer closeValidFile.Close()
 
 	invalidFilename, closeInvalidFile := createTestFile(t, invalid)
 	defer closeInvalidFile.Close()
+
+	warningFilename, closeWarningFile := createTestFile(t, warnings)
+	defer closeWarningFile.Close()
 
 	invalidYAMLFile, closeInvalidYAMLFile := createTestFile(t, invalidYAML)
 	defer closeInvalidYAMLFile.Close()
@@ -521,11 +601,23 @@ $`),
 			expectedRegexp: regexp.MustCompile(`.*key ".*" already set`),
 			wantError:      true,
 		},
+		{
+			name: "warning",
+			args: []string{"--filename", warningFilename},
+			expectedRegexp: regexp.MustCompile(`(?m)".*" has warnings: 
+	\* DestinationRule//reviews-cb-policy: outlier detection consecutive errors is deprecated, use consecutiveGatewayErrors or consecutive5xxErrors instead
+
+Error: 1 error occurred:
+	\* VirtualService//invalid-virtual-service: weight -15 < 0`),
+			wantError: true,
+		},
 	}
 	istioNamespace := "istio-system"
+	defaultNamespace := ""
 	for i, c := range cases {
-		t.Run(fmt.Sprintf("[%v] %v ", i, c.name), func(tt *testing.T) {
-			validateCmd := NewValidateCommand(&istioNamespace)
+		t.Run(fmt.Sprintf("[%v] %v", i, c.name), func(t *testing.T) {
+			validateCmd := NewValidateCommand(&istioNamespace, &defaultNamespace)
+			validateCmd.SilenceUsage = true
 			validateCmd.SetArgs(c.args)
 
 			// capture output to keep test logs clean
@@ -535,7 +627,7 @@ $`),
 
 			err := validateCmd.Execute()
 			if (err != nil) != c.wantError {
-				tt.Errorf("unexpected validate return status: got %v want %v: \nerr=%v",
+				t.Errorf("unexpected validate return status: got %v want %v: \nerr=%v",
 					err != nil, c.wantError, err)
 			}
 			output := out.String()
@@ -545,4 +637,17 @@ $`),
 			}
 		})
 	}
+}
+
+func TestGetTemplateLabels(t *testing.T) {
+	un := fromYAML(validDeployment)
+
+	labels, err := GetTemplateLabels(un)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, labels, map[string]string{
+		"app":     "helloworld",
+		"version": "v1",
+	})
 }

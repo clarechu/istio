@@ -17,52 +17,107 @@ package aggregate
 import (
 	"sync"
 
-	"istio.io/istio/pilot/pkg/features"
-
-	"github.com/hashicorp/go-multierror"
-
-	"istio.io/pkg/log"
-
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
-)
-
-var (
-	clusterAddressesMutex sync.Mutex
+	"istio.io/istio/pkg/config/mesh"
+	"istio.io/pkg/log"
 )
 
 // The aggregate controller does not implement serviceregistry.Instance since it may be comprised of various
 // providers and clusters.
-var _ model.ServiceDiscovery = &Controller{}
-var _ model.Controller = &Controller{}
+var (
+	_ model.ServiceDiscovery    = &Controller{}
+	_ model.AggregateController = &Controller{}
+)
 
 // Controller aggregates data across different registries and monitors for changes
 type Controller struct {
-	registries []serviceregistry.Instance
+	meshHolder mesh.Holder
+
+	// The lock is used to protect the registries and controller's running status.
 	storeLock  sync.RWMutex
+	registries []*registryEntry
+	// indicates whether the controller has run.
+	// if true, all the registries added later should be run manually.
+	running bool
+
+	handlers          model.ControllerHandlers
+	handlersByCluster map[cluster.ID]*model.ControllerHandlers
+	model.NetworkGatewaysHandler
+}
+
+type registryEntry struct {
+	serviceregistry.Instance
+	// stop if not nil is the per-registry stop chan. If null, the server stop chan should be used to Run the registry.
+	stop <-chan struct{}
+}
+
+type Options struct {
+	MeshHolder mesh.Holder
 }
 
 // NewController creates a new Aggregate controller
-func NewController() *Controller {
+func NewController(opt Options) *Controller {
 	return &Controller{
-		registries: make([]serviceregistry.Instance, 0),
+		registries:        make([]*registryEntry, 0),
+		meshHolder:        opt.MeshHolder,
+		running:           false,
+		handlersByCluster: map[cluster.ID]*model.ControllerHandlers{},
 	}
 }
 
-// AddRegistry adds registries into the aggregated controller
+func (c *Controller) addRegistry(registry serviceregistry.Instance, stop <-chan struct{}) {
+	c.registries = append(c.registries, &registryEntry{Instance: registry, stop: stop})
+
+	// Observe the registry for events.
+	registry.AppendNetworkGatewayHandler(c.NotifyGatewayHandlers)
+	registry.AppendServiceHandler(c.handlers.NotifyServiceHandlers)
+	registry.AppendServiceHandler(func(service *model.Service, event model.Event) {
+		for _, handlers := range c.getClusterHandlers() {
+			handlers.NotifyServiceHandlers(service, event)
+		}
+	})
+}
+
+func (c *Controller) getClusterHandlers() []*model.ControllerHandlers {
+	c.storeLock.Lock()
+	defer c.storeLock.Unlock()
+	out := make([]*model.ControllerHandlers, 0, len(c.handlersByCluster))
+	for _, handlers := range c.handlersByCluster {
+		out = append(out, handlers)
+	}
+	return out
+}
+
+// AddRegistry adds registries into the aggregated controller.
+// If the aggregated controller is already Running, the given registry will never be started.
 func (c *Controller) AddRegistry(registry serviceregistry.Instance) {
 	c.storeLock.Lock()
 	defer c.storeLock.Unlock()
+	c.addRegistry(registry, nil)
+}
 
-	registries := c.registries
-	registries = append(registries, registry)
-	c.registries = registries
+// AddRegistryAndRun adds registries into the aggregated controller and makes sure it is Run.
+// If the aggregated controller is running, the given registry is Run immediately.
+// Otherwise, the given registry is Run when the aggregate controller is Run, using the given stop.
+func (c *Controller) AddRegistryAndRun(registry serviceregistry.Instance, stop <-chan struct{}) {
+	if stop == nil {
+		log.Warnf("nil stop channel passed to AddRegistryAndRun for registry %s/%s", registry.Provider(), registry.Cluster())
+	}
+	c.storeLock.Lock()
+	defer c.storeLock.Unlock()
+	c.addRegistry(registry, stop)
+	if c.running {
+		go registry.Run(stop)
+	}
 }
 
 // DeleteRegistry deletes specified registry from the aggregated controller
-func (c *Controller) DeleteRegistry(clusterID string) {
+func (c *Controller) DeleteRegistry(clusterID cluster.ID, providerID provider.ID) {
 	c.storeLock.Lock()
 	defer c.storeLock.Unlock()
 
@@ -70,15 +125,14 @@ func (c *Controller) DeleteRegistry(clusterID string) {
 		log.Warnf("Registry list is empty, nothing to delete")
 		return
 	}
-	index, ok := c.GetRegistryIndex(clusterID)
+	index, ok := c.getRegistryIndex(clusterID, providerID)
 	if !ok {
-		log.Warnf("Registry is not found in the registries list, nothing to delete")
+		log.Warnf("Registry %s/%s is not found in the registries list, nothing to delete", providerID, clusterID)
 		return
 	}
-	registries := c.registries
-	registries = append(registries[:index], registries[index+1:]...)
-	c.registries = registries
-	log.Infof("Registry for the cluster %s has been deleted.", clusterID)
+	c.registries[index] = nil
+	c.registries = append(c.registries[:index], c.registries[index+1:]...)
+	log.Infof("%s registry for the cluster %s has been deleted.", providerID, clusterID)
 }
 
 // GetRegistries returns a copy of all registries
@@ -86,13 +140,17 @@ func (c *Controller) GetRegistries() []serviceregistry.Instance {
 	c.storeLock.RLock()
 	defer c.storeLock.RUnlock()
 
-	return c.registries
+	// copy registries to prevent race, no need to deep copy here.
+	out := make([]serviceregistry.Instance, len(c.registries))
+	for i := range c.registries {
+		out[i] = c.registries[i]
+	}
+	return out
 }
 
-// GetRegistryIndex returns the index of a registry
-func (c *Controller) GetRegistryIndex(clusterID string) (int, bool) {
+func (c *Controller) getRegistryIndex(clusterID cluster.ID, provider provider.ID) (int, bool) {
 	for i, r := range c.registries {
-		if r.Cluster() == clusterID {
+		if r.Cluster().Equals(clusterID) && r.Provider() == provider {
 			return i, true
 		}
 	}
@@ -100,130 +158,104 @@ func (c *Controller) GetRegistryIndex(clusterID string) (int, bool) {
 }
 
 // Services lists services from all platforms
-func (c *Controller) Services() ([]*model.Service, error) {
-	// smap is a map of hostname (string) to service, used to identify services that
+func (c *Controller) Services() []*model.Service {
+	// smap is a map of hostname (string) to service index, used to identify services that
 	// are installed in multiple clusters.
-	smap := make(map[host.Name]*model.Service)
-
+	smap := make(map[host.Name]int)
+	index := 0
 	services := make([]*model.Service, 0)
-	var errs error
 	// Locking Registries list while walking it to prevent inconsistent results
 	for _, r := range c.GetRegistries() {
-		svcs, err := r.Services()
-		if err != nil {
-			errs = multierror.Append(errs, err)
-			continue
-		}
-		// Race condition: multiple threads may call Services, and multiple services
-		// may modify one of the service's cluster ID
-		clusterAddressesMutex.Lock()
-		if r.Cluster() == "" { // Should we instead check for registry name to be on safe side?
-			// If the service does not have a cluster ID (ServiceEntries, CloudFoundry, etc.)
-			// Do not bother checking for the cluster ID.
-			// DO NOT ASSIGN CLUSTER ID to non-k8s registries. This will prevent service entries with multiple
-			// VIPs or CIDR ranges in the address field
+		svcs := r.Services()
+		if r.Provider() != provider.Kubernetes {
+			index += len(svcs)
 			services = append(services, svcs...)
 		} else {
-			// This is K8S typically
 			for _, s := range svcs {
-				sp, ok := smap[s.Hostname]
+				previous, ok := smap[s.Hostname]
 				if !ok {
 					// First time we see a service. The result will have a single service per hostname
 					// The first cluster will be listed first, so the services in the primary cluster
 					// will be used for default settings. If a service appears in multiple clusters,
 					// the order is less clear.
-					sp = s
-					smap[s.Hostname] = sp
-					services = append(services, sp)
+					smap[s.Hostname] = index
+					index++
+					services = append(services, s)
+				} else {
+					// We must deepcopy before merge, and after merging, the ClusterVips length will be >= 2.
+					// This is an optimization to prevent deepcopy multi-times
+					if len(services[previous].ClusterVIPs.GetAddresses()) < 2 {
+						// Deep copy before merging, otherwise there is a case
+						// a service in remote cluster can be deleted, but the ClusterIP left.
+						services[previous] = services[previous].DeepCopy()
+					}
+					// If it is seen second time, that means it is from a different cluster, update cluster VIPs.
+					mergeService(services[previous], s, r)
 				}
-
-				sp.Mutex.Lock()
-				// If the registry has a cluster ID, keep track of the cluster and the
-				// local address inside the cluster.
-				if sp.ClusterVIPs == nil {
-					sp.ClusterVIPs = make(map[string]string)
-				}
-				sp.ClusterVIPs[r.Cluster()] = s.Address
-				sp.Mutex.Unlock()
 			}
 		}
-		clusterAddressesMutex.Unlock()
 	}
-	return services, errs
+	return services
 }
 
 // GetService retrieves a service by hostname if exists
-// Currently only used to get get gateway service
-// TODO: merge with Services()
-func (c *Controller) GetService(hostname host.Name) (*model.Service, error) {
-	var errs error
+func (c *Controller) GetService(hostname host.Name) *model.Service {
 	var out *model.Service
 	for _, r := range c.GetRegistries() {
-		service, err := r.GetService(hostname)
-		if err != nil {
-			errs = multierror.Append(errs, err)
-			continue
-		}
+		service := r.GetService(hostname)
 		if service == nil {
 			continue
 		}
-		if r.Cluster() == "" { // Should we instead check for registry name to be on safe side?
-			// If the service does not have a cluster ID (ServiceEntries, CloudFoundry, etc.)
-			// Do not bother checking for the cluster ID.
-			// DO NOT ASSIGN CLUSTER ID to non-k8s registries. This will prevent service entries with multiple
-			// VIPs or CIDR ranges in the address field
-			return service, nil
+		if r.Provider() != provider.Kubernetes {
+			return service
 		}
-
-		// This is K8S typically
 		if out == nil {
 			out = service.DeepCopy()
 		} else {
-			service.Mutex.RLock()
-			// ClusterExternalAddresses and ClusterExternalPorts are only used for getting gateway address
-			externalAddrs := service.Attributes.ClusterExternalAddresses[r.Cluster()]
-			if len(externalAddrs) > 0 {
-				if out.Attributes.ClusterExternalAddresses == nil {
-					out.Attributes.ClusterExternalAddresses = make(map[string][]string)
-				}
-				out.Attributes.ClusterExternalAddresses[r.Cluster()] = externalAddrs
-			}
-			externalPorts := service.Attributes.ClusterExternalPorts[r.Cluster()]
-			if len(externalPorts) > 0 {
-				if out.Attributes.ClusterExternalPorts == nil {
-					out.Attributes.ClusterExternalPorts = make(map[string]map[uint32]uint32)
-				}
-				out.Attributes.ClusterExternalPorts[r.Cluster()] = externalPorts
-			}
-			service.Mutex.RUnlock()
+			// If we are seeing the service for the second time, it means it is available in multiple clusters.
+			mergeService(out, service, r)
 		}
 	}
-	return out, errs
+	return out
+}
+
+func mergeService(dst, src *model.Service, srcRegistry serviceregistry.Instance) {
+	// Prefer the k8s HostVIPs where possible
+	clusterID := srcRegistry.Cluster()
+	if srcRegistry.Provider() == provider.Kubernetes || len(dst.ClusterVIPs.GetAddressesFor(clusterID)) == 0 {
+		newAddresses := src.ClusterVIPs.GetAddressesFor(clusterID)
+		dst.ClusterVIPs.SetAddressesFor(clusterID, newAddresses)
+	}
+}
+
+// NetworkGateways merges the service-based cross-network gateways from each registry.
+func (c *Controller) NetworkGateways() []model.NetworkGateway {
+	var gws []model.NetworkGateway
+	for _, r := range c.GetRegistries() {
+		gws = append(gws, r.NetworkGateways()...)
+	}
+	return gws
+}
+
+func (c *Controller) MCSServices() []model.MCSServiceInfo {
+	var out []model.MCSServiceInfo
+	for _, r := range c.GetRegistries() {
+		out = append(out, r.MCSServices()...)
+	}
+	return out
 }
 
 // InstancesByPort retrieves instances for a service on a given port that match
 // any of the supplied labels. All instances match an empty label list.
-func (c *Controller) InstancesByPort(svc *model.Service, port int,
-	labels labels.Collection) ([]*model.ServiceInstance, error) {
-	var instances, tmpInstances []*model.ServiceInstance
-	var errs error
+func (c *Controller) InstancesByPort(svc *model.Service, port int, labels labels.Instance) []*model.ServiceInstance {
+	var instances []*model.ServiceInstance
 	for _, r := range c.GetRegistries() {
-		var err error
-		tmpInstances, err = r.InstancesByPort(svc, port, labels)
-		if err != nil {
-			log.Warnf("get service %s instance from registry %s/%s failed: %v", svc.Hostname, r.Provider(), r.Cluster(), err)
-			errs = multierror.Append(errs, err)
-		} else if len(tmpInstances) > 0 {
-			instances = append(instances, tmpInstances...)
-		}
+		instances = append(instances, r.InstancesByPort(svc, port, labels)...)
 	}
-	if len(instances) > 0 {
-		errs = nil
-	}
-	return instances, errs
+	return instances
 }
 
-func nodeClusterID(node *model.Proxy) string {
+func nodeClusterID(node *model.Proxy) cluster.ID {
 	if node.Metadata == nil || node.Metadata.ClusterID == "" {
 		return ""
 	}
@@ -232,87 +264,71 @@ func nodeClusterID(node *model.Proxy) string {
 
 // Skip the service registry when there won't be a match
 // because the proxy is in a different cluster.
-func skipSearchingRegistryForProxy(nodeClusterID, registryClusterID, selfClusterID string) bool {
-	// We can't trust the default service registry because its always
-	// named `Kubernetes`. Use the `CLUSTER_ID` envvar to find the
-	// local cluster name in these cases.
-	// TODO(https://github.com/istio/istio/issues/22093)
-	if registryClusterID == string(serviceregistry.Kubernetes) {
-		registryClusterID = selfClusterID
-	}
-
-	// We can't be certain either way
-	if registryClusterID == "" || nodeClusterID == "" {
+func skipSearchingRegistryForProxy(nodeClusterID cluster.ID, r serviceregistry.Instance) bool {
+	// Always search non-kube (usually serviceentry) registry.
+	// Check every registry if cluster ID isn't specified.
+	if r.Provider() != provider.Kubernetes || nodeClusterID == "" {
 		return false
 	}
 
-	return registryClusterID != nodeClusterID
+	return !r.Cluster().Equals(nodeClusterID)
 }
 
 // GetProxyServiceInstances lists service instances co-located with a given proxy
-func (c *Controller) GetProxyServiceInstances(node *model.Proxy) ([]*model.ServiceInstance, error) {
+func (c *Controller) GetProxyServiceInstances(node *model.Proxy) []*model.ServiceInstance {
 	out := make([]*model.ServiceInstance, 0)
-	var errs error
-	// It doesn't make sense for a single proxy to be found in more than one registry.
-	// TODO: if otherwise, warning or else what to do about it.
+	nodeClusterID := nodeClusterID(node)
 	for _, r := range c.GetRegistries() {
-		nodeClusterID := nodeClusterID(node)
-		if skipSearchingRegistryForProxy(nodeClusterID, r.Cluster(), features.ClusterName) {
+		if skipSearchingRegistryForProxy(nodeClusterID, r) {
 			log.Debugf("GetProxyServiceInstances(): not searching registry %v: proxy %v CLUSTER_ID is %v",
 				r.Cluster(), node.ID, nodeClusterID)
 			continue
 		}
 
-		instances, err := r.GetProxyServiceInstances(node)
-		if err != nil {
-			errs = multierror.Append(errs, err)
-		} else if len(instances) > 0 {
+		instances := r.GetProxyServiceInstances(node)
+		if len(instances) > 0 {
 			out = append(out, instances...)
-			break
 		}
 	}
 
-	if len(out) > 0 {
-		if errs != nil {
-			log.Debugf("GetProxyServiceInstances() found match but encountered an error: %v", errs)
-		}
-		return out, nil
-	}
-
-	return out, errs
+	return out
 }
 
-func (c *Controller) GetProxyWorkloadLabels(proxy *model.Proxy) (labels.Collection, error) {
-	var out labels.Collection
-	var errs error
-	// It doesn't make sense for a single proxy to be found in more than one registry.
-	// TODO: if otherwise, warning or else what to do about it.
+func (c *Controller) GetProxyWorkloadLabels(proxy *model.Proxy) labels.Instance {
+	clusterID := nodeClusterID(proxy)
 	for _, r := range c.GetRegistries() {
-		wlLabels, err := r.GetProxyWorkloadLabels(proxy)
-		if err != nil {
-			errs = multierror.Append(errs, err)
-		} else if len(wlLabels) > 0 {
-			out = append(out, wlLabels...)
-			break
+		// If proxy clusterID unset, we may find incorrect workload label.
+		// This can not happen in k8s env.
+		if clusterID == "" {
+			lbls := r.GetProxyWorkloadLabels(proxy)
+			if lbls != nil {
+				return lbls
+			}
+		} else if clusterID == r.Cluster() {
+			// find proxy in the specified cluster
+			lbls := r.GetProxyWorkloadLabels(proxy)
+			if lbls != nil {
+				return lbls
+			}
 		}
 	}
 
-	if len(out) > 0 {
-		if errs != nil {
-			log.Warnf("GetProxyWorkloadLabels() found match but encountered an error: %v", errs)
-		}
-		return out, nil
-	}
-
-	return out, errs
+	return nil
 }
 
 // Run starts all the controllers
 func (c *Controller) Run(stop <-chan struct{}) {
-
-	for _, r := range c.GetRegistries() {
-		go r.Run(stop)
+	c.storeLock.Lock()
+	for _, r := range c.registries {
+		// prefer the per-registry stop channel
+		registryStop := stop
+		if s := r.stop; s != nil {
+			registryStop = s
+		}
+		go r.Run(registryStop)
 	}
+	c.running = true
+	c.storeLock.Unlock()
 
 	<-stop
 	log.Info("Registry Aggregator terminated")
@@ -322,50 +338,47 @@ func (c *Controller) Run(stop <-chan struct{}) {
 func (c *Controller) HasSynced() bool {
 	for _, r := range c.GetRegistries() {
 		if !r.HasSynced() {
+			log.Debugf("registry %s is syncing", r.Cluster())
 			return false
 		}
 	}
 	return true
 }
 
-// AppendServiceHandler implements a service catalog operation
-func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) error {
-	for _, r := range c.GetRegistries() {
-		if err := r.AppendServiceHandler(f); err != nil {
-			log.Infof("Fail to append service handler to adapter %s", r.Provider())
-			return err
-		}
-	}
-	return nil
+func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) {
+	c.handlers.AppendServiceHandler(f)
 }
 
-// AppendInstanceHandler implements a service instance catalog operation
-func (c *Controller) AppendInstanceHandler(f func(*model.ServiceInstance, model.Event)) error {
-	for _, r := range c.GetRegistries() {
-		if err := r.AppendInstanceHandler(f); err != nil {
-			log.Infof("Fail to append instance handler to adapter %s", r.Provider())
-			return err
-		}
-	}
-	return nil
+func (c *Controller) AppendWorkloadHandler(f func(*model.WorkloadInstance, model.Event)) {
+	// Currently, it is not used.
+	// Note: take care when you want to enable it, it will register the handlers to all registries
+	// c.handlers.AppendWorkloadHandler(f)
 }
 
-func (c *Controller) AppendWorkloadHandler(f func(*model.WorkloadInstance, model.Event)) error {
-	for _, r := range c.GetRegistries() {
-		if err := r.AppendWorkloadHandler(f); err != nil {
-			log.Infof("Fail to append workload handler to adapter %s", r.Provider())
-			return err
-		}
+func (c *Controller) AppendServiceHandlerForCluster(id cluster.ID, f func(*model.Service, model.Event)) {
+	c.storeLock.Lock()
+	defer c.storeLock.Unlock()
+	handler, ok := c.handlersByCluster[id]
+	if !ok {
+		c.handlersByCluster[id] = &model.ControllerHandlers{}
+		handler = c.handlersByCluster[id]
 	}
-	return nil
+	handler.AppendServiceHandler(f)
 }
 
-// GetIstioServiceAccounts implements model.ServiceAccounts operation
-func (c *Controller) GetIstioServiceAccounts(svc *model.Service, ports []int) []string {
-	for _, r := range c.GetRegistries() {
-		if svcAccounts := r.GetIstioServiceAccounts(svc, ports); svcAccounts != nil {
-			return svcAccounts
-		}
+func (c *Controller) AppendWorkloadHandlerForCluster(id cluster.ID, f func(*model.WorkloadInstance, model.Event)) {
+	c.storeLock.Lock()
+	defer c.storeLock.Unlock()
+	handler, ok := c.handlersByCluster[id]
+	if !ok {
+		c.handlersByCluster[id] = &model.ControllerHandlers{}
+		handler = c.handlersByCluster[id]
 	}
-	return nil
+	handler.AppendWorkloadHandler(f)
+}
+
+func (c *Controller) UnRegisterHandlersForCluster(id cluster.ID) {
+	c.storeLock.Lock()
+	defer c.storeLock.Unlock()
+	delete(c.handlersByCluster, id)
 }

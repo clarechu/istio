@@ -15,17 +15,18 @@
 package codegen
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
 
 	"istio.io/istio/pkg/config/schema/ast"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 func TestStaticCollections(t *testing.T) {
-	var cases = []struct {
+	cases := []struct {
 		packageName string
 		m           *ast.Metadata
 		err         string
@@ -41,7 +42,6 @@ func TestStaticCollections(t *testing.T) {
 						Description:  "describes a really cool foo thing",
 						Group:        "foo.group",
 						Kind:         "fookind",
-						Disabled:     true,
 					},
 					{
 						Name:         "bar",
@@ -49,7 +49,6 @@ func TestStaticCollections(t *testing.T) {
 						Description:  "describes a really cool bar thing",
 						Group:        "bar.group",
 						Kind:         "barkind",
-						Disabled:     false,
 					},
 				},
 				Resources: []*ast.Resource{
@@ -85,6 +84,8 @@ import (
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/resource"
 	"istio.io/istio/pkg/config/validation"
+    "reflect"
+	githubcomgogoprotobuftypes "github.com/gogo/protobuf/types"
 )
 
 var (
@@ -93,13 +94,13 @@ var (
 	Bar = collection.Builder {
 		Name: "bar",
 		VariableName: "Bar",
-		Disabled: false,
 		Resource: resource.Builder {
 			Group: "bar.group",
 			Kind: "barkind",
 			Plural: "barkinds",
 			Version: "v1",
 			Proto: "google.protobuf.Struct",
+			ReflectType: reflect.TypeOf(&githubcomgogoprotobuftypes.Struct{}).Elem(),
 			ProtoPackage: "github.com/gogo/protobuf/types",
 			ClusterScoped: false,
 			ValidateProto: validation.EmptyValidate,
@@ -110,13 +111,13 @@ var (
 	Foo = collection.Builder {
 		Name: "foo",
 		VariableName: "Foo",
-		Disabled: true,
 		Resource: resource.Builder {
 			Group: "foo.group",
 			Kind: "fookind",
 			Plural: "fookinds",
 			Version: "v1",
 			Proto: "google.protobuf.Struct",
+			ReflectType: reflect.TypeOf(&githubcomgogoprotobuftypes.Struct{}).Elem(),
 			ProtoPackage: "github.com/gogo/protobuf/types",
 			ClusterScoped: true,
 			ValidateProto: validation.EmptyValidate,
@@ -138,12 +139,17 @@ var (
 	Kube = collection.NewSchemasBuilder().
 		Build()
 
+	// Builtin contains only native Kubernetes collections. This differs from Kube, which has
+  // Kubernetes controlled CRDs
+	Builtin = collection.NewSchemasBuilder().
+		Build()
+
 	// Pilot contains only collections used by Pilot.
 	Pilot = collection.NewSchemasBuilder().
 		Build()
 
-	// PilotServiceApi contains only collections used by Pilot, including experimental Service Api.
-	PilotServiceApi = collection.NewSchemasBuilder().
+	// PilotGatewayAPI contains only collections used by Pilot, including experimental Service Api.
+	PilotGatewayAPI = collection.NewSchemasBuilder().
 		Build()
 
 	// Deprecated contains only collections used by that will soon be used by nothing.
@@ -158,15 +164,16 @@ var (
 		t.Run("", func(t *testing.T) {
 			g := NewWithT(t)
 
-			s, err := StaticCollections(c.packageName, c.m)
+			s, err := StaticCollections(c.packageName, c.m, func(name string) bool {
+				return true
+			}, "")
 			if c.err != "" {
 				g.Expect(err).NotTo(BeNil())
 				g.Expect(err.Error()).To(Equal(s))
 			} else {
 				g.Expect(err).To(BeNil())
-				if diff := cmp.Diff(strings.TrimSpace(s), strings.TrimSpace(c.output)); diff != "" {
-					t.Fatal(diff)
-				}
+				fmt.Println(strings.TrimSpace(c.output))
+				assert.Equal(t, strings.TrimSpace(s), strings.TrimSpace(c.output))
 			}
 		})
 	}

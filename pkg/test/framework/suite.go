@@ -16,9 +16,7 @@ package framework
 
 import (
 	"errors"
-	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -29,15 +27,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
 	"gopkg.in/yaml.v2"
 
-	"istio.io/pkg/log"
-
+	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/test/echo"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/environment/kube"
+	"istio.io/istio/pkg/test/framework/config"
 	ferrors "istio.io/istio/pkg/test/framework/errors"
 	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
+	"istio.io/istio/pkg/test/prow"
 	"istio.io/istio/pkg/test/scopes"
+	"istio.io/istio/pkg/test/util/file"
+	"istio.io/pkg/log"
 )
 
 // test.Run uses 0, 1, 2 exit codes. Use different exit codes for our framework.
@@ -66,7 +70,11 @@ var (
 		// These are also used for istio.io/istio, but make help to satisfy
 		// the feature label enforcement when running with BUILD_WITH_CONTAINER=1.
 		"^/work/tests/integration/",
-		"^/work/")
+		"^/work/",
+
+		// Outside of standard Istio  GOPATH
+		".*/istio/tests/integration/",
+	)
 )
 
 // getSettingsFunc is a function used to extract the default settings for the Suite.
@@ -81,20 +89,40 @@ type Suite interface {
 	EnvironmentFactory(fn resource.EnvironmentFactory) Suite
 	// Label all the tests in suite with the given labels
 	Label(labels ...label.Instance) Suite
+	// SkipIf skips the suite if the function returns true
+	SkipIf(reason string, fn resource.ShouldSkipFn) Suite
 	// Skip marks a suite as skipped with the given reason. This will prevent any setup functions from occurring.
 	Skip(reason string) Suite
 	// RequireMinClusters ensures that the current environment contains at least the given number of clusters.
 	// Otherwise it stops test execution.
+	//
+	// Deprecated: Tests should not make assumptions about number of clusters.
 	RequireMinClusters(minClusters int) Suite
 	// RequireMaxClusters ensures that the current environment contains at least the given number of clusters.
 	// Otherwise it stops test execution.
+	//
+	// Deprecated: Tests should not make assumptions about number of clusters.
 	RequireMaxClusters(maxClusters int) Suite
 	// RequireSingleCluster is a utility method that requires that there be exactly 1 cluster in the environment.
+	//
+	// Deprecated: All new tests should support multiple clusters.
 	RequireSingleCluster() Suite
-	// RequireEnvironmentVersion validates the environment meets a minimum version
-	RequireEnvironmentVersion(version string) Suite
+	// RequireMultiPrimary ensures that each cluster is running a control plane.
+	//
+	// Deprecated: All new tests should work for any control plane topology.
+	RequireMultiPrimary() Suite
+	// SkipExternalControlPlaneTopology skips the tests in external plane and config cluster topology
+	SkipExternalControlPlaneTopology() Suite
+	// RequireExternalControlPlaneTopology requires the environment to be external control plane topology
+	RequireExternalControlPlaneTopology() Suite
+	// RequireMinVersion validates the environment meets a minimum version
+	RequireMinVersion(minorVersion uint) Suite
+	// RequireMaxVersion validates the environment meets a maximum version
+	RequireMaxVersion(minorVersion uint) Suite
 	// Setup runs enqueues the given setup function to run before test execution.
 	Setup(fn resource.SetupFn) Suite
+	// SetupParallel runs the given setup functions in parallel before test execution.
+	SetupParallel(fns ...resource.SetupFn) Suite
 	// Run the suite. This method calls os.Exit and does not return.
 	Run()
 }
@@ -103,6 +131,7 @@ type Suite interface {
 type suiteImpl struct {
 	testID      string
 	skipMessage string
+	skipFn      resource.ShouldSkipFn
 	mRun        mRunFn
 	osExit      func(int)
 	labels      label.Set
@@ -182,6 +211,15 @@ func (s *suiteImpl) Label(labels ...label.Instance) Suite {
 
 func (s *suiteImpl) Skip(reason string) Suite {
 	s.skipMessage = reason
+	s.skipFn = func(ctx resource.Context) bool {
+		return true
+	}
+	return s
+}
+
+func (s *suiteImpl) SkipIf(reason string, fn resource.ShouldSkipFn) Suite {
+	s.skipMessage = reason
+	s.skipFn = fn
 	return s
 }
 
@@ -220,19 +258,85 @@ func (s *suiteImpl) RequireMaxClusters(maxClusters int) Suite {
 }
 
 func (s *suiteImpl) RequireSingleCluster() Suite {
+	// nolint: staticcheck
 	return s.RequireMinClusters(1).RequireMaxClusters(1)
 }
 
-func (s *suiteImpl) RequireEnvironmentVersion(version string) Suite {
+func (s *suiteImpl) RequireMultiPrimary() Suite {
 	fn := func(ctx resource.Context) error {
-		ver, err := ctx.Clusters()[0].GetKubernetesVersion()
-		if err != nil {
-			return fmt.Errorf("failed to get Kubernetes version: %v", err)
+		for _, c := range ctx.Clusters() {
+			if !c.IsPrimary() {
+				s.Skip(fmt.Sprintf("Cluster %s is not using a local control plane",
+					c.Name()))
+			}
 		}
-		serverVersion := fmt.Sprintf("%s.%s", ver.Major, ver.Minor)
-		if serverVersion < version {
-			s.Skip(fmt.Sprintf("Required Kubernetes version (%v) is greater than current: %v",
-				version, serverVersion))
+		return nil
+	}
+
+	s.requireFns = append(s.requireFns, fn)
+	return s
+}
+
+func (s *suiteImpl) SkipExternalControlPlaneTopology() Suite {
+	fn := func(ctx resource.Context) error {
+		for _, c := range ctx.Clusters() {
+			if c.IsConfig() && !c.IsPrimary() {
+				s.Skip(fmt.Sprintf("Cluster %s is a config cluster, we can't run external control plane topology",
+					c.Name()))
+			}
+		}
+		return nil
+	}
+	s.requireFns = append(s.requireFns, fn)
+	return s
+}
+
+func (s *suiteImpl) RequireExternalControlPlaneTopology() Suite {
+	fn := func(ctx resource.Context) error {
+		for _, c := range ctx.Clusters() {
+			if c.IsConfig() && !c.IsPrimary() {
+				// the test environment is an external control plane topology, the test can go on
+				return nil
+			}
+		}
+		// the test environment is not an external control plane topology, skip the test
+		s.Skip("Not an external control plane topology, skip this test")
+		return nil
+	}
+	s.requireFns = append(s.requireFns, fn)
+	return s
+}
+
+func (s *suiteImpl) RequireMinVersion(minorVersion uint) Suite {
+	fn := func(ctx resource.Context) error {
+		for _, c := range ctx.Clusters().Kube() {
+			ver, err := c.GetKubernetesVersion()
+			if err != nil {
+				return fmt.Errorf("failed to get Kubernetes version: %v", err)
+			}
+			if !kubelib.IsAtLeastVersion(c, minorVersion) {
+				s.Skip(fmt.Sprintf("Required Kubernetes version (1.%v) is greater than current: %v",
+					minorVersion, ver.String()))
+			}
+		}
+		return nil
+	}
+
+	s.requireFns = append(s.requireFns, fn)
+	return s
+}
+
+func (s *suiteImpl) RequireMaxVersion(minorVersion uint) Suite {
+	fn := func(ctx resource.Context) error {
+		for _, c := range ctx.Clusters().Kube() {
+			ver, err := c.GetKubernetesVersion()
+			if err != nil {
+				return fmt.Errorf("failed to get Kubernetes version: %v", err)
+			}
+			if !kubelib.IsLessThanVersion(c, minorVersion+1) {
+				s.Skip(fmt.Sprintf("Maximum Kubernetes version (1.%v) is less than current: %v",
+					minorVersion, ver.String()))
+			}
 		}
 		return nil
 	}
@@ -246,11 +350,25 @@ func (s *suiteImpl) Setup(fn resource.SetupFn) Suite {
 	return s
 }
 
+func (s *suiteImpl) SetupParallel(fns ...resource.SetupFn) Suite {
+	s.setupFns = append(s.setupFns, func(ctx resource.Context) error {
+		g := multierror.Group{}
+		for _, fn := range fns {
+			fn := fn
+			g.Go(func() error {
+				return fn(ctx)
+			})
+		}
+		return g.Wait().ErrorOrNil()
+	})
+	return s
+}
+
 func (s *suiteImpl) runSetupFn(fn resource.SetupFn, ctx SuiteContext) (err error) {
 	defer func() {
 		// Dump if the setup function fails
 		if err != nil && ctx.Settings().CIMode {
-			rt.Dump()
+			rt.Dump(ctx)
 		}
 	}()
 	err = fn(ctx)
@@ -261,8 +379,11 @@ func (s *suiteImpl) Run() {
 	s.osExit(s.run())
 }
 
-func (s *suiteImpl) isSkipped() bool {
-	return s.skipMessage != ""
+func (s *suiteImpl) isSkipped(ctx SuiteContext) bool {
+	if s.skipFn != nil && s.skipFn(ctx) {
+		return true
+	}
+	return false
 }
 
 func (s *suiteImpl) doSkip(ctx *suiteContext) int {
@@ -286,9 +407,8 @@ func (s *suiteImpl) run() (errLevel int) {
 	}
 
 	ctx := rt.suiteContext()
-
 	// Skip the test if its explicitly skipped
-	if s.isSkipped() {
+	if s.isSkipped(ctx) {
 		return s.doSkip(ctx)
 	}
 
@@ -305,7 +425,7 @@ func (s *suiteImpl) run() (errLevel int) {
 
 	defer func() {
 		if errLevel != 0 && ctx.Settings().CIMode {
-			rt.Dump()
+			rt.Dump(ctx)
 		}
 
 		if err := rt.Close(); err != nil {
@@ -325,13 +445,20 @@ func (s *suiteImpl) run() (errLevel int) {
 	}
 
 	// Check if one of the setup functions ended up skipping the suite.
-	if s.isSkipped() {
+	if s.isSkipped(ctx) {
 		return s.doSkip(ctx)
 	}
 
 	defer func() {
 		end := time.Now()
 		scopes.Framework.Infof("=== Suite %q run time: %v ===", ctx.Settings().TestID, end.Sub(start))
+
+		ctx.RecordTraceEvent("suite-runtime", end.Sub(start).Seconds())
+		ctx.RecordTraceEvent("echo-calls", echo.GlobalEchoRequests.Load())
+		ctx.RecordTraceEvent("yaml-apply", GlobalYAMLWrites.Load())
+		traceFile := filepath.Join(ctx.Settings().BaseDir, "trace.yaml")
+		scopes.Framework.Infof("Wrote trace to %v", prow.ArtifactsURL(traceFile))
+		_ = appendToFile(ctx.marshalTraceEvent(), traceFile)
 	}()
 
 	attempt := 0
@@ -342,12 +469,11 @@ func (s *suiteImpl) run() (errLevel int) {
 		if errLevel == 0 {
 			scopes.Framework.Infof("=== DONE: Test Run: '%s' ===", ctx.Settings().TestID)
 			break
-		} else {
-			scopes.Framework.Infof("=== FAILED: Test Run: '%s' (exitCode: %v) ===",
-				ctx.Settings().TestID, errLevel)
-			if attempt <= ctx.settings.Retries {
-				scopes.Framework.Warnf("=== RETRY: Test Run: '%s' ===", ctx.Settings().TestID)
-			}
+		}
+		scopes.Framework.Infof("=== FAILED: Test Run: '%s' (exitCode: %v) ===",
+			ctx.Settings().TestID, errLevel)
+		if attempt <= ctx.settings.Retries {
+			scopes.Framework.Warnf("=== RETRY: Test Run: '%s' ===", ctx.Settings().TestID)
 		}
 	}
 	s.writeOutput()
@@ -376,7 +502,7 @@ func isMulticluster(ctx resource.Context) bool {
 	return false
 }
 
-func clusters(ctx resource.Context) []resource.Cluster {
+func clusters(ctx resource.Context) []cluster.Cluster {
 	if ctx.Environment() != nil {
 		return ctx.Environment().Clusters()
 	}
@@ -385,7 +511,11 @@ func clusters(ctx resource.Context) []resource.Cluster {
 
 func (s *suiteImpl) writeOutput() {
 	// the ARTIFACTS env var is set by prow, and uploaded to GCS as part of the job artifact
-	artifactsPath := os.Getenv("ARTIFACTS")
+	artifactsPath, err := file.NormalizePath(os.Getenv("ARTIFACTS"))
+	if err != nil {
+		artifactsPath = os.Getenv("ARTIFACTS")
+		log.Warnf("failed normalizing %s: %v", artifactsPath, err)
+	}
 	if artifactsPath != "" {
 		ctx := rt.suiteContext()
 		ctx.outcomeMu.RLock()
@@ -400,7 +530,7 @@ func (s *suiteImpl) writeOutput() {
 		if err != nil {
 			log.Errorf("failed writing test suite outcome to yaml: %s", err)
 		}
-		err = ioutil.WriteFile(path.Join(artifactsPath, out.Name+".yaml"), outbytes, 0644)
+		err = os.WriteFile(path.Join(artifactsPath, out.Name+".yaml"), outbytes, 0o644)
 		if err != nil {
 			log.Errorf("failed writing test suite outcome to file: %s", err)
 		}
@@ -422,7 +552,7 @@ func (s *suiteImpl) runSetupFns(ctx SuiteContext) (err error) {
 			return err
 		}
 
-		if s.isSkipped() {
+		if s.isSkipped(ctx) {
 			return nil
 		}
 	}
@@ -476,16 +606,13 @@ func newEnvironment(ctx resource.Context) (resource.Environment, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.Minikube {
-		return nil, fmt.Errorf("istio.test.kube.minikube is deprecated; set --istio.test.kube.loadbalancer=false instead")
-	}
 	return kube.New(ctx, s)
 }
 
 func getSettings(testID string) (*resource.Settings, error) {
 	// Parse flags and init logging.
-	if !flag.Parsed() {
-		flag.Parse()
+	if !config.Parsed() {
+		config.Parse()
 	}
 
 	return resource.SettingsFromCommandLine(testID)
@@ -498,4 +625,20 @@ func mustCompileAll(patterns ...string) []*regexp.Regexp {
 	}
 
 	return out
+}
+
+func appendToFile(contents []byte, file string) error {
+	f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		_ = f.Close()
+	}()
+
+	if _, err = f.Write(contents); err != nil {
+		return err
+	}
+	return nil
 }

@@ -16,7 +16,6 @@ package mesh
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -67,11 +66,14 @@ func addManifestDiffFlags(cmd *cobra.Command, diffArgs *manifestDiffArgs) {
 			"e.g. Service:*:istiod->Service:*:istio-control - rename istiod service into istio-control")
 }
 
-func manifestDiffCmd(rootArgs *rootArgs, diffArgs *manifestDiffArgs) *cobra.Command {
+func manifestDiffCmd(rootArgs *RootArgs, diffArgs *manifestDiffArgs) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "diff <file|dir> <file|dir>",
 		Short: "Compare manifests and generate diff",
-		Long:  "The diff subcommand compares manifests from two files or directories.",
+		Long: "The diff subcommand compares manifests from two files or directories. The output is a list of\n" +
+			"changed paths with the value changes shown as OLD-VALUE -> NEW-VALUE.\n" +
+			"List order changes are shown as [OLD-INDEX->NEW-INDEX], with ? used where a list item is added or\n" +
+			"removed.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) != 2 {
 				return fmt.Errorf("diff requires two files or directories")
@@ -102,20 +104,22 @@ func manifestDiffCmd(rootArgs *rootArgs, diffArgs *manifestDiffArgs) *cobra.Comm
 				os.Exit(1)
 			}
 			return nil
-		}}
+		},
+	}
 	return cmd
 }
 
-//compareManifestsFromFiles compares two manifest files
-func compareManifestsFromFiles(rootArgs *rootArgs, args []string, verbose bool,
-	renameResources, selectResources, ignoreResources string) (bool, error) {
+// compareManifestsFromFiles compares two manifest files
+func compareManifestsFromFiles(rootArgs *RootArgs, args []string, verbose bool,
+	renameResources, selectResources, ignoreResources string,
+) (bool, error) {
 	initLogsOrExit(rootArgs)
 
-	a, err := ioutil.ReadFile(args[0])
+	a, err := os.ReadFile(args[0])
 	if err != nil {
 		return false, fmt.Errorf("could not read %q: %v", args[0], err)
 	}
-	b, err := ioutil.ReadFile(args[1])
+	b, err := os.ReadFile(args[1])
 	if err != nil {
 		return false, fmt.Errorf("could not read %q: %v", args[1], err)
 	}
@@ -138,9 +142,10 @@ func yamlFileFilter(path string) bool {
 	return filepath.Ext(path) == YAMLSuffix
 }
 
-//compareManifestsFromDirs compares manifests from two directories
-func compareManifestsFromDirs(rootArgs *rootArgs, verbose bool, dirName1, dirName2,
-	renameResources, selectResources, ignoreResources string) (bool, error) {
+// compareManifestsFromDirs compares manifests from two directories
+func compareManifestsFromDirs(rootArgs *RootArgs, verbose bool, dirName1, dirName2,
+	renameResources, selectResources, ignoreResources string,
+) (bool, error) {
 	initLogsOrExit(rootArgs)
 
 	mf1, err := util.ReadFilesWithFilter(dirName1, yamlFileFilter)

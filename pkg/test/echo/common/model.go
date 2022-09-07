@@ -18,6 +18,7 @@ import "istio.io/istio/pkg/config/protocol"
 
 // TLSSettings defines TLS configuration for Echo server
 type TLSSettings struct {
+	// If not empty, RootCert supplies the extra root cert that will be appended to the system cert pool.
 	RootCert   string
 	ClientCert string
 	Key        string
@@ -25,6 +26,13 @@ type TLSSettings struct {
 	// This needed for integration tests, as we are connecting using a port-forward (127.0.0.1), so
 	// any DNS certs will not validate.
 	Hostname string
+	// If set to true, the cert will be provisioned by proxy, and extra cert volume will be mounted.
+	ProxyProvision bool
+	// AcceptAnyALPN, if true, will make the server accept ANY ALPNs. This comes at the expense of
+	// allowing h2 negotiation and being able to detect the negotiated ALPN (as there is none), because
+	// Golang doesn't like us doing this (https://github.com/golang/go/issues/46310).
+	// This is useful when the server is simulating Envoy which does unconventional things with ALPN.
+	AcceptAnyALPN bool
 }
 
 // Port represents a network port where a service is listening for
@@ -45,7 +53,28 @@ type Port struct {
 
 	// TLS determines if the port will use TLS.
 	TLS bool
+
+	// ServerFirst if a port will be server first
+	ServerFirst bool
+
+	// InstanceIP determines if echo will listen on the instance IP, or wildcard
+	InstanceIP bool
+
+	// LocalhostIP determines if echo will listen on the localhost IP; otherwise, it will listen on wildcard
+	LocalhostIP bool
+
+	// XDSServer, for gRPC servers, will use the xds.NewGRPCServer constructor to rely on XDS configuration.
+	// If this flag is set but the environment variable feature gates aren't, we should fail due to gRPC internals.
+	XDSServer bool
+
+	// XDSTestBootstrap allows settings per-endpoint bootstrap without using the GRPC_XDS_BOOTSTRAP env var
+	XDSTestBootstrap []byte
+
+	// XDSReadinessTLS determines if the XDS server should expect a TLS server, used for readiness probes
+	XDSReadinessTLS bool
 }
 
 // PortList is a set of ports
 type PortList []*Port
+
+var ServerFirstMagicString = "server-first-protocol\n"

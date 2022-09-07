@@ -1,3 +1,6 @@
+//go:build !agent
+// +build !agent
+
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,366 +18,585 @@
 package xds
 
 import (
-	"bytes"
-	"reflect"
+	"context"
+	"fmt"
+	"net"
 	"strings"
-	"text/template"
+	"time"
 
-	"github.com/Masterminds/sprig"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
-	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
-	envoy_extensions_filters_network_tcp_proxy_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/any"
-
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
+	k8stesting "k8s.io/client-go/testing"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
-
-	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
-	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-
-	"istio.io/istio/pilot/pkg/config/kube/crd"
-	"istio.io/istio/pilot/pkg/config/memory"
+	"istio.io/istio/pilot/pkg/autoregistration"
+	"istio.io/istio/pilot/pkg/config/kube/gateway"
+	"istio.io/istio/pilot/pkg/config/kube/ingress"
+	kubesecrets "istio.io/istio/pilot/pkg/credentials/kube"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/plugin"
-	"istio.io/istio/pilot/pkg/networking/util"
-	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
+	"istio.io/istio/pilot/pkg/networking/core/v1alpha3"
+	"istio.io/istio/pilot/pkg/serviceregistry"
 	kube "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
-	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/istio/pilot/test/xdstest"
+	"istio.io/istio/pkg/adsc"
+	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/keepalive"
+	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
 type FakeOptions struct {
-	// If provided, these objects will be used directly
+	// If provided, sets the name of the "default" or local cluster to the similaed pilots. (Defaults to opts.DefaultClusterName)
+	DefaultClusterName cluster.ID
+	// If provided, the minor version will be overridden for calls to GetKubernetesVersion to 1.minor
+	KubernetesVersion string
+	// If provided, a service registry with the name of each map key will be created with the given objects.
+	KubernetesObjectsByCluster map[cluster.ID][]runtime.Object
+	// If provided, these objects will be used directly for the default cluster ("Kubernetes" or DefaultClusterName)
 	KubernetesObjects []runtime.Object
-	// If provided, the yaml string will be parsed and used as objects
+	// If provided, a service registry with the name of each map key will be created with the given objects.
+	KubernetesObjectStringByCluster map[cluster.ID]string
+	// If provided, the yaml string will be parsed and used as objects for the default cluster ("Kubernetes" or DefaultClusterName)
 	KubernetesObjectString string
+	// Endpoint mode for the Kubernetes service registry
+	KubernetesEndpointMode kube.EndpointMode
 	// If provided, these configs will be used directly
-	Configs []model.Config
+	Configs []config.Config
 	// If provided, the yaml string will be parsed and used as configs
 	ConfigString string
 	// If provided, the ConfigString will be treated as a go template, with this as input params
-	ConfigTemplateInput interface{}
+	ConfigTemplateInput any
 	// If provided, this mesh config will be used
-	MeshConfig   *meshconfig.MeshConfig
-	MeshNetworks *meshconfig.MeshNetworks
+	MeshConfig      *meshconfig.MeshConfig
+	NetworksWatcher mesh.NetworksWatcher
+
+	// Callback to modify the server before it is started
+	DiscoveryServerModifier func(s *DiscoveryServer)
+	// Callback to modify the kube client before it is started
+	KubeClientModifier func(c kubelib.Client)
+
+	// ListenerBuilder, if specified, allows making the server use the given
+	// listener instead of a buffered conn.
+	ListenerBuilder func() (net.Listener, error)
+
+	// Time to debounce
+	// By default, set to 0s to speed up tests
+	DebounceTime time.Duration
+
+	// EnableFakeXDSUpdater will use a XDSUpdater that can be used to watch events
+	EnableFakeXDSUpdater       bool
+	DisableSecretAuthorization bool
+	Services                   []*model.Service
+	Gateways                   []model.NetworkGateway
 }
 
 type FakeDiscoveryServer struct {
-	t           test.Failer
-	Store       model.ConfigStore
-	Discovery   *DiscoveryServer
-	PushContext *model.PushContext
-	Env         *model.Environment
+	*v1alpha3.ConfigGenTest
+	t            test.Failer
+	Discovery    *DiscoveryServer
+	Listener     net.Listener
+	BufListener  *bufconn.Listener
+	kubeClient   kubelib.Client
+	KubeRegistry *kube.FakeController
+	XdsUpdater   model.XDSUpdater
 }
 
-func getKubernetesObjects(t test.Failer, opts FakeOptions) []runtime.Object {
-	if len(opts.KubernetesObjects) > 0 {
-		return opts.KubernetesObjects
+func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServer {
+	stop := test.NewStop(t)
+
+	m := opts.MeshConfig
+	if m == nil {
+		m = mesh.DefaultMeshConfig()
 	}
 
-	objects := make([]runtime.Object, 0)
-	if len(opts.KubernetesObjectString) > 0 {
-		decode := scheme.Codecs.UniversalDeserializer().Decode
-		objectStrs := strings.Split(opts.KubernetesObjectString, "---")
-		for _, s := range objectStrs {
-			o, _, err := decode([]byte(s), nil, nil)
-			if err != nil {
-				t.Fatalf("failed deserializing kubernetes object: %v", err)
-			}
-			objects = append(objects, o)
+	// Init with a dummy environment, since we have a circular dependency with the env creation.
+	s := NewDiscoveryServer(model.NewEnvironment(), "pilot-123", map[string]string{})
+	s.InitGenerators(s.Env, "istio-system", nil)
+	t.Cleanup(func() {
+		s.JwtKeyResolver.Close()
+		s.pushQueue.ShutDown()
+	})
+
+	serviceHandler := func(svc *model.Service, _ model.Event) {
+		pushReq := &model.PushRequest{
+			Full: true,
+			ConfigsUpdated: map[model.ConfigKey]struct{}{{
+				Kind:      kind.ServiceEntry,
+				Name:      string(svc.Hostname),
+				Namespace: svc.Attributes.Namespace,
+			}: {}},
+			Reason: []model.TriggerReason{model.ServiceUpdate},
 		}
+		s.ConfigUpdate(pushReq)
+	}
+
+	if opts.DefaultClusterName == "" {
+		opts.DefaultClusterName = "Kubernetes"
+	}
+	k8sObjects := getKubernetesObjects(t, opts)
+	var defaultKubeClient kubelib.Client
+	var defaultKubeController *kube.FakeController
+	var registries []serviceregistry.Instance
+	if opts.NetworksWatcher != nil {
+		opts.NetworksWatcher.AddNetworksHandler(func() {
+			s.ConfigUpdate(&model.PushRequest{
+				Full:   true,
+				Reason: []model.TriggerReason{model.NetworksTrigger},
+			})
+		})
+	}
+	var xdsUpdater model.XDSUpdater = s
+	if opts.EnableFakeXDSUpdater {
+		evChan := make(chan FakeXdsEvent, 1000)
+		xdsUpdater = &FakeXdsUpdater{
+			Events:   evChan,
+			Delegate: s,
+		}
+	}
+	creds := kubesecrets.NewMulticluster(opts.DefaultClusterName)
+	s.Generators[v3.SecretType] = NewSecretGen(creds, s.Cache, opts.DefaultClusterName, nil)
+	s.Generators[v3.ExtensionConfigurationType].(*EcdsGenerator).SetCredController(creds)
+	for k8sCluster, objs := range k8sObjects {
+		client := kubelib.NewFakeClientWithVersion(opts.KubernetesVersion, objs...)
+		if opts.KubeClientModifier != nil {
+			opts.KubeClientModifier(client)
+		}
+		k8s, _ := kube.NewFakeControllerWithOptions(t, kube.FakeControllerOptions{
+			ServiceHandler:  serviceHandler,
+			Client:          client,
+			ClusterID:       k8sCluster,
+			DomainSuffix:    "cluster.local",
+			XDSUpdater:      xdsUpdater,
+			NetworksWatcher: opts.NetworksWatcher,
+			Mode:            opts.KubernetesEndpointMode,
+			Stop:            stop,
+			SkipRun:         true,
+		})
+		// start default client informers after creating ingress/secret controllers
+		if defaultKubeClient == nil || k8sCluster == opts.DefaultClusterName {
+			defaultKubeClient = client
+			defaultKubeController = k8s
+		} else {
+			client.RunAndWait(stop)
+		}
+		registries = append(registries, k8s)
+		if err := creds.ClusterAdded(&multicluster.Cluster{ID: k8sCluster, Client: client}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if opts.DisableSecretAuthorization {
+		disableAuthorizationForSecret(defaultKubeClient.Kube().(*fake.Clientset))
+	}
+	ingr := ingress.NewController(defaultKubeClient, mesh.NewFixedWatcher(m), kube.Options{
+		DomainSuffix: "cluster.local",
+	})
+	defaultKubeClient.RunAndWait(stop)
+
+	var gwc *gateway.Controller
+	cg := v1alpha3.NewConfigGenTest(t, v1alpha3.TestOptions{
+		Configs:             opts.Configs,
+		ConfigString:        opts.ConfigString,
+		ConfigTemplateInput: opts.ConfigTemplateInput,
+		MeshConfig:          opts.MeshConfig,
+		NetworksWatcher:     opts.NetworksWatcher,
+		ServiceRegistries:   registries,
+		PushContextLock:     &s.updateMutex,
+		ConfigStoreCaches:   []model.ConfigStoreController{ingr},
+		CreateConfigStore: func(c model.ConfigStoreController) model.ConfigStoreController {
+			g := gateway.NewController(defaultKubeClient, c, kube.Options{
+				DomainSuffix: "cluster.local",
+			})
+			gwc = g
+			return gwc
+		},
+		SkipRun:   true,
+		ClusterID: defaultKubeController.Cluster(),
+		Services:  opts.Services,
+		Gateways:  opts.Gateways,
+	})
+	cg.ServiceEntryRegistry.AppendServiceHandler(serviceHandler)
+	s.updateMutex.Lock()
+	s.Env = cg.Env()
+	s.Env.GatewayAPIController = gwc
+	if err := s.Env.InitNetworksManager(s); err != nil {
+		t.Fatal(err)
+	}
+	// Disable debounce to reduce test times
+	s.debounceOptions.debounceAfter = opts.DebounceTime
+	s.MemRegistry = cg.MemRegistry
+	s.MemRegistry.XdsUpdater = s
+	s.updateMutex.Unlock()
+
+	// Setup config handlers
+	// TODO code re-use from server.go
+	configHandler := func(_, curr config.Config, event model.Event) {
+		pushReq := &model.PushRequest{
+			Full: true,
+			ConfigsUpdated: map[model.ConfigKey]struct{}{{
+				Kind:      kind.FromGvk(curr.GroupVersionKind),
+				Name:      curr.Name,
+				Namespace: curr.Namespace,
+			}: {}},
+			Reason: []model.TriggerReason{model.ConfigUpdate},
+		}
+		s.ConfigUpdate(pushReq)
+	}
+	schemas := collections.Pilot.All()
+	if features.EnableGatewayAPI {
+		schemas = collections.PilotGatewayAPI.All()
+	}
+	for _, schema := range schemas {
+		// This resource type was handled in external/servicediscovery.go, no need to rehandle here.
+		if schema.Resource().GroupVersionKind() == collections.IstioNetworkingV1Alpha3Serviceentries.
+			Resource().GroupVersionKind() {
+			continue
+		}
+		if schema.Resource().GroupVersionKind() == collections.IstioNetworkingV1Alpha3Workloadentries.
+			Resource().GroupVersionKind() {
+			continue
+		}
+
+		cg.Store().RegisterEventHandler(schema.Resource().GroupVersionKind(), configHandler)
+	}
+	for _, registry := range registries {
+		k8s, ok := registry.(*kube.FakeController)
+		// this closely matches what we do in serviceregistry/kube/controller/multicluster.go
+		if !ok || k8s.Cluster() != cg.ServiceEntryRegistry.Cluster() {
+			continue
+		}
+		cg.ServiceEntryRegistry.AppendWorkloadHandler(k8s.WorkloadInstanceHandler)
+		k8s.AppendWorkloadHandler(cg.ServiceEntryRegistry.WorkloadInstanceHandler)
+	}
+	s.WorkloadEntryController = autoregistration.NewController(cg.Store(), "test", keepalive.Infinity)
+
+	if opts.DiscoveryServerModifier != nil {
+		opts.DiscoveryServerModifier(s)
+	}
+
+	var listener net.Listener
+	if opts.ListenerBuilder != nil {
+		var err error
+		if listener, err = opts.ListenerBuilder(); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		// Start in memory gRPC listener
+		buffer := 1024 * 1024
+		listener = bufconn.Listen(buffer)
+	}
+
+	grpcServer := grpc.NewServer()
+	s.Register(grpcServer)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil && !(err == grpc.ErrServerStopped || err.Error() == "closed") {
+			t.Fatal(err)
+		}
+	}()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+	// Start the discovery server
+	s.Start(stop)
+	cg.ServiceEntryRegistry.XdsUpdater = s
+	// Now that handlers are added, get everything started
+	cg.Run()
+	kubelib.WaitForCacheSync(stop,
+		cg.Registry.HasSynced,
+		cg.Store().HasSynced)
+	cg.ServiceEntryRegistry.ResyncEDS()
+
+	// Send an update. This ensures that even if there are no configs provided, the push context is
+	// initialized.
+	s.ConfigUpdate(&model.PushRequest{Full: true})
+
+	processStartTime = time.Now()
+
+	// Wait until initial updates are committed
+	c := s.InboundUpdates.Load()
+	retry.UntilOrFail(t, func() bool {
+		return s.CommittedUpdates.Load() >= c
+	}, retry.Delay(time.Millisecond))
+
+	// Mark ourselves ready
+	s.CachesSynced()
+
+	bufListener, _ := listener.(*bufconn.Listener)
+	fake := &FakeDiscoveryServer{
+		t:             t,
+		Discovery:     s,
+		Listener:      listener,
+		BufListener:   bufListener,
+		ConfigGenTest: cg,
+		kubeClient:    defaultKubeClient,
+		KubeRegistry:  defaultKubeController,
+		XdsUpdater:    xdsUpdater,
+	}
+
+	return fake
+}
+
+func (f *FakeDiscoveryServer) KubeClient() kubelib.Client {
+	return f.kubeClient
+}
+
+func (f *FakeDiscoveryServer) PushContext() *model.PushContext {
+	f.Discovery.updateMutex.RLock()
+	defer f.Discovery.updateMutex.RUnlock()
+	return f.Env().PushContext
+}
+
+// ConnectADS starts an ADS connection to the server. It will automatically be cleaned up when the test ends
+func (f *FakeDiscoveryServer) ConnectADS() *AdsTest {
+	conn, err := grpc.Dial("buffcon",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return f.BufListener.Dial()
+		}))
+	if err != nil {
+		f.t.Fatalf("failed to connect: %v", err)
+	}
+	return NewAdsTest(f.t, conn)
+}
+
+// ConnectDeltaADS starts a Delta ADS connection to the server. It will automatically be cleaned up when the test ends
+func (f *FakeDiscoveryServer) ConnectDeltaADS() *DeltaAdsTest {
+	conn, err := grpc.Dial("buffcon",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return f.BufListener.Dial()
+		}))
+	if err != nil {
+		f.t.Fatalf("failed to connect: %v", err)
+	}
+	return NewDeltaAdsTest(f.t, conn)
+}
+
+// Connect starts an ADS connection to the server using adsc. It will automatically be cleaned up when the test ends
+// watch can be configured to determine the resources to watch initially, and wait can be configured to determine what
+// resources we should initially wait for.
+func (f *FakeDiscoveryServer) Connect(p *model.Proxy, watch []string, wait []string) *adsc.ADSC {
+	f.t.Helper()
+	p = f.SetupProxy(p)
+	initialWatch := []*discovery.DiscoveryRequest{}
+	if watch == nil {
+		initialWatch = []*discovery.DiscoveryRequest{{TypeUrl: v3.ClusterType}}
+	} else {
+		for _, typeURL := range watch {
+			initialWatch = append(initialWatch, &discovery.DiscoveryRequest{TypeUrl: typeURL})
+		}
+	}
+	if wait == nil {
+		initialWatch = []*discovery.DiscoveryRequest{{TypeUrl: v3.ClusterType}}
+	}
+	adscConn, err := adsc.New("buffcon", &adsc.Config{
+		IP:                       p.IPAddresses[0],
+		NodeType:                 string(p.Type),
+		Meta:                     p.Metadata.ToStruct(),
+		Locality:                 p.Locality,
+		Namespace:                p.ConfigNamespace,
+		InitialDiscoveryRequests: initialWatch,
+		GrpcOpts: []grpc.DialOption{
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return f.BufListener.Dial()
+			}),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		},
+	})
+	if err != nil {
+		f.t.Fatalf("Error connecting: %v", err)
+	}
+	if err := adscConn.Run(); err != nil {
+		f.t.Fatalf("ADSC: failed running: %v", err)
+	}
+
+	if len(wait) > 0 {
+		_, err = adscConn.Wait(10*time.Second, wait...)
+		if err != nil {
+			f.t.Fatalf("Error getting initial for %v config: %v", wait, err)
+		}
+	}
+	f.t.Cleanup(func() {
+		adscConn.Close()
+	})
+	return adscConn
+}
+
+func (f *FakeDiscoveryServer) Endpoints(p *model.Proxy) []*endpoint.ClusterLoadAssignment {
+	loadAssignments := make([]*endpoint.ClusterLoadAssignment, 0)
+	for _, c := range xdstest.ExtractEdsClusterNames(f.Clusters(p)) {
+		loadAssignments = append(loadAssignments, f.Discovery.generateEndpoints(NewEndpointBuilder(c, p, f.PushContext())))
+	}
+	return loadAssignments
+}
+
+func getKubernetesObjects(t test.Failer, opts FakeOptions) map[cluster.ID][]runtime.Object {
+	objects := map[cluster.ID][]runtime.Object{}
+
+	if len(opts.KubernetesObjects) > 0 {
+		objects[opts.DefaultClusterName] = append(objects[opts.DefaultClusterName], opts.KubernetesObjects...)
+	}
+	if len(opts.KubernetesObjectString) > 0 {
+		parsed, err := kubernetesObjectsFromString(opts.KubernetesObjectString)
+		if err != nil {
+			t.Fatalf("failed parsing KubernetesObjectString: %v", err)
+		}
+		objects[opts.DefaultClusterName] = append(objects[opts.DefaultClusterName], parsed...)
+	}
+	for k8sCluster, objectStr := range opts.KubernetesObjectStringByCluster {
+		parsed, err := kubernetesObjectsFromString(objectStr)
+		if err != nil {
+			t.Fatalf("failed parsing KubernetesObjectStringByCluster for %s: %v", k8sCluster, err)
+		}
+		objects[k8sCluster] = append(objects[k8sCluster], parsed...)
+	}
+	for k8sCluster, clusterObjs := range opts.KubernetesObjectsByCluster {
+		objects[k8sCluster] = append(objects[k8sCluster], clusterObjs...)
+	}
+
+	if len(objects) == 0 {
+		return map[cluster.ID][]runtime.Object{opts.DefaultClusterName: {}}
 	}
 
 	return objects
 }
 
-func getConfigs(t test.Failer, opts FakeOptions) []model.Config {
-	if len(opts.Configs) > 0 {
-		return opts.Configs
-	}
-	configStr := opts.ConfigString
-	if opts.ConfigTemplateInput != nil {
-		tmpl := template.Must(template.New("").Funcs(sprig.TxtFuncMap()).Parse(opts.ConfigString))
-		var buf bytes.Buffer
-		if err := tmpl.Execute(&buf, opts.ConfigTemplateInput); err != nil {
-			t.Fatalf("failed to execute template: %v", err)
-		}
-		configStr = buf.String()
-	}
-	configs, badKinds, err := crd.ParseInputs(configStr)
-	if err != nil {
-		t.Fatalf("failed to read config: %v", err)
-	}
-	if len(badKinds) != 0 {
-		t.Fatalf("Got unknown resources: %v", badKinds)
-	}
-	// setup default namespace if not defined
-	for i, c := range configs {
-		if c.Namespace == "" {
-			c.Namespace = "default"
-		}
-		configs[i] = c
-	}
-	return configs
-}
-
-func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServer {
-	stop := make(chan struct{})
-	t.Cleanup(func() {
-		close(stop)
-	})
-	configs := getConfigs(t, opts)
-	k8sObjects := getKubernetesObjects(t, opts)
-	configStore := memory.MakeWithLedger(collections.Pilot, &model.DisabledLedger{}, true)
-	env := &model.Environment{}
-	plugins := []string{plugin.Authn, plugin.Authz, plugin.Health}
-	s := NewDiscoveryServer(env, plugins)
-	go func() {
-		for {
-			select {
-			// Read and drop events. This prevents the channel from getting backed up
-			// In the future, we can likely track these for use in tests
-			case <-s.pushChannel:
-			case <-stop:
-				return
-			}
-		}
-	}()
-	configController := memory.NewSyncController(configStore)
-	go configController.Run(stop)
-
-	m := opts.MeshConfig
-	if m == nil {
-		def := mesh.DefaultMeshConfig()
-		m = &def
-	}
-
-	serviceDiscovery := aggregate.NewController()
-	env.PushContext = model.NewPushContext()
-	env.ServiceDiscovery = serviceDiscovery
-	env.IstioConfigStore = model.MakeIstioStore(configStore)
-	env.Watcher = mesh.NewFixedWatcher(m)
-	env.NetworksWatcher = mesh.NewFixedNetworksWatcher(opts.MeshNetworks)
-
-	se := serviceentry.NewServiceDiscovery(configController, model.MakeIstioStore(configStore), s)
-	serviceDiscovery.AddRegistry(se)
-	k8s, _ := kube.NewFakeControllerWithOptions(kube.FakeControllerOptions{
-		Objects:         k8sObjects,
-		ClusterID:       "Kubernetes",
-		DomainSuffix:    "cluster.local",
-		XDSUpdater:      s,
-		NetworksWatcher: env,
-	})
-	serviceDiscovery.AddRegistry(k8s)
-	for _, cfg := range configs {
-		if _, err := configStore.Create(cfg); err != nil {
-			t.Fatalf("failed to create config %v: %v", cfg.Name, err)
-		}
-	}
-	if err := s.UpdateServiceShards(env.PushContext); err != nil {
-		t.Fatal(err)
-	}
-	se.ResyncEDS()
-	if err := k8s.ResyncEndpoints(); err != nil {
-		t.Fatal(err)
-	}
-	if err := env.PushContext.InitContext(env, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	fake := &FakeDiscoveryServer{
-		t:           t,
-		Store:       configController,
-		Discovery:   s,
-		PushContext: env.PushContext,
-		Env:         env,
-	}
-	return fake
-}
-
-// SetupProxy initializes a proxy for the current environment. This should generally be used when creating
-// any proxy. For example, `p := SetupProxy(&model.Proxy{...})`.
-func (f *FakeDiscoveryServer) SetupProxy(p *model.Proxy) *model.Proxy {
-	// Setup defaults
-	if p == nil {
-		p = &model.Proxy{}
-	}
-	if p.Metadata == nil {
-		p.Metadata = &model.NodeMetadata{}
-	}
-	if p.Metadata.IstioVersion == "" {
-		p.Metadata.IstioVersion = "1.8.0"
-		p.IstioVersion = model.ParseIstioVersion(p.Metadata.IstioVersion)
-	}
-	if p.Type == "" {
-		p.Type = model.SidecarProxy
-	}
-	if p.ID == "" {
-		p.ID = "app.test"
-	}
-	if len(p.IPAddresses) == 0 {
-		p.IPAddresses = []string{"1.1.1.1"}
-	}
-	// Initialize data structures
-	p.SetSidecarScope(f.Discovery.Env.PushContext)
-	p.SetGatewaysForProxy(f.Discovery.Env.PushContext)
-	if err := p.SetServiceInstances(f.Discovery.Env.ServiceDiscovery); err != nil {
-		f.t.Fatal(err)
-	}
-	p.DiscoverIPVersions()
-	return p
-}
-
-func (f *FakeDiscoveryServer) Listeners(p *model.Proxy) []*listener.Listener {
-	return f.Discovery.ConfigGenerator.BuildListeners(p, f.PushContext)
-}
-
-func (f *FakeDiscoveryServer) Clusters(p *model.Proxy) []*cluster.Cluster {
-	return f.Discovery.ConfigGenerator.BuildClusters(p, f.PushContext)
-}
-
-func (f *FakeDiscoveryServer) Endpoints(p *model.Proxy) []*endpoint.ClusterLoadAssignment {
-	loadAssignments := make([]*endpoint.ClusterLoadAssignment, 0)
-	for _, c := range ExtractEdsClusterNames(f.Clusters(p)) {
-		loadAssignments = append(loadAssignments, f.Discovery.generateEndpoints(createEndpointBuilder(c, p, f.PushContext)))
-	}
-	return loadAssignments
-}
-
-func (f *FakeDiscoveryServer) Routes(p *model.Proxy) []*route.RouteConfiguration {
-	return f.Discovery.ConfigGenerator.BuildHTTPRoutes(p, f.PushContext, ExtractRoutesFromListeners(f.Listeners(p)))
-}
-
-func ToDiscoveryResponse(p interface{}) *discovery.DiscoveryResponse {
-	slice := InterfaceSlice(p)
-	if len(slice) == 0 {
-		return &discovery.DiscoveryResponse{}
-	}
-	resources := make([]*any.Any, 0, len(slice))
-	for _, v := range slice {
-		resources = append(resources, util.MessageToAny(v.(proto.Message)))
-	}
-	return &discovery.DiscoveryResponse{
-		Resources: resources,
-		TypeUrl:   resources[0].TypeUrl,
-	}
-}
-
-func InterfaceSlice(slice interface{}) []interface{} {
-	s := reflect.ValueOf(slice)
-	if s.Kind() != reflect.Slice {
-		panic("InterfaceSlice() given a non-slice type")
-	}
-
-	ret := make([]interface{}, s.Len())
-
-	for i := 0; i < s.Len(); i++ {
-		ret[i] = s.Index(i).Interface()
-	}
-
-	return ret
-}
-
-func ExtractRoutesFromListeners(ll []*listener.Listener) []string {
-	routes := []string{}
-	for _, l := range ll {
-		for _, fc := range l.FilterChains {
-			for _, filter := range fc.Filters {
-				if filter.Name == wellknown.HTTPConnectionManager {
-					filter.GetTypedConfig()
-					hcon := &hcm.HttpConnectionManager{}
-					if err := ptypes.UnmarshalAny(filter.GetTypedConfig(), hcon); err != nil {
-						panic(err)
-					}
-					switch r := hcon.GetRouteSpecifier().(type) {
-					case *hcm.HttpConnectionManager_Rds:
-						routes = append(routes, r.Rds.RouteConfigName)
-					}
-				}
-			}
-		}
-	}
-	return routes
-}
-
-func ExtractListenerNames(ll []*listener.Listener) []string {
-	res := []string{}
-	for _, l := range ll {
-		res = append(res, l.Name)
-	}
-	return res
-}
-
-func ExtractListener(name string, ll []*listener.Listener) *listener.Listener {
-	for _, l := range ll {
-		if l.Name == name {
-			return l
-		}
-	}
-	return nil
-}
-
-func ExtractTCPProxy(t test.Failer, fcs *listener.FilterChain) *envoy_extensions_filters_network_tcp_proxy_v3.TcpProxy {
-	for _, fc := range fcs.Filters {
-		if fc.Name == wellknown.TCPProxy {
-			tcpProxy := &envoy_extensions_filters_network_tcp_proxy_v3.TcpProxy{}
-			if fc.GetTypedConfig() != nil {
-				if err := ptypes.UnmarshalAny(fc.GetTypedConfig(), tcpProxy); err != nil {
-					t.Fatalf("failed to unmarshal tcp proxy")
-				}
-			}
-			return tcpProxy
-		}
-	}
-	return nil
-}
-
-func ExtractEndpoints(endpoints []*endpoint.ClusterLoadAssignment) map[string][]string {
-	got := map[string][]string{}
-	for _, cla := range endpoints {
-		if cla == nil {
+func kubernetesObjectsFromString(s string) ([]runtime.Object, error) {
+	var objects []runtime.Object
+	decode := scheme.Codecs.UniversalDeserializer().Decode
+	objectStrs := strings.Split(s, "---")
+	for _, s := range objectStrs {
+		if len(strings.TrimSpace(s)) == 0 {
 			continue
 		}
-		for _, ep := range cla.Endpoints {
-			for _, lb := range ep.LbEndpoints {
-				if lb.GetEndpoint().Address.GetSocketAddress() != nil {
-					got[cla.ClusterName] = append(got[cla.ClusterName], lb.GetEndpoint().Address.GetSocketAddress().Address)
-				} else {
-					got[cla.ClusterName] = append(got[cla.ClusterName], lb.GetEndpoint().Address.GetPipe().Path)
-				}
-			}
+		o, _, err := decode([]byte(s), nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed deserializing kubernetes object: %v", err)
 		}
+		objects = append(objects, o)
+	}
+	return objects, nil
+}
+
+type FakeXdsEvent struct {
+	Kind      string
+	Host      string
+	Namespace string
+	Endpoints int
+	PushReq   *model.PushRequest
+}
+
+type FakeXdsUpdater struct {
+	// Events tracks notifications received by the updater
+	Events   chan FakeXdsEvent
+	Delegate model.XDSUpdater
+}
+
+var _ model.XDSUpdater = &FakeXdsUpdater{}
+
+func (fx *FakeXdsUpdater) EDSUpdate(s model.ShardKey, hostname string, namespace string, entry []*model.IstioEndpoint) {
+	fx.Events <- FakeXdsEvent{Kind: "eds", Host: hostname, Namespace: namespace, Endpoints: len(entry)}
+	if fx.Delegate != nil {
+		fx.Delegate.EDSUpdate(s, hostname, namespace, entry)
+	}
+}
+
+func (fx *FakeXdsUpdater) EDSCacheUpdate(s model.ShardKey, hostname string, namespace string, entry []*model.IstioEndpoint) {
+	fx.Events <- FakeXdsEvent{Kind: "edscache", Host: hostname, Namespace: namespace, Endpoints: len(entry)}
+	if fx.Delegate != nil {
+		fx.Delegate.EDSCacheUpdate(s, hostname, namespace, entry)
+	}
+}
+
+func (fx *FakeXdsUpdater) ConfigUpdate(req *model.PushRequest) {
+	fx.Events <- FakeXdsEvent{Kind: "xds", PushReq: req}
+	if fx.Delegate != nil {
+		fx.Delegate.ConfigUpdate(req)
+	}
+}
+
+func (fx *FakeXdsUpdater) ProxyUpdate(c cluster.ID, p string) {
+	fx.Events <- FakeXdsEvent{Kind: "proxy update"}
+	if fx.Delegate != nil {
+		fx.Delegate.ProxyUpdate(c, p)
+	}
+}
+
+func (fx *FakeXdsUpdater) SvcUpdate(s model.ShardKey, hostname string, namespace string, e model.Event) {
+	fx.Events <- FakeXdsEvent{Kind: "svcupdate", Host: hostname, Namespace: namespace}
+	if fx.Delegate != nil {
+		fx.Delegate.SvcUpdate(s, hostname, namespace, e)
+	}
+}
+
+func (fx *FakeXdsUpdater) RemoveShard(_ model.ShardKey) {
+	fx.Events <- FakeXdsEvent{Kind: "removeshard"}
+	fx.ConfigUpdate(&model.PushRequest{Full: true})
+}
+
+func (fx *FakeXdsUpdater) WaitDurationOrFail(t test.Failer, duration time.Duration, types ...string) *FakeXdsEvent {
+	t.Helper()
+	got := fx.WaitDuration(duration, types...)
+	if got == nil {
+		t.Fatal("missing event")
 	}
 	return got
 }
 
-func ExtractClusterEndpoints(clusters []*cluster.Cluster) map[string][]string {
-	cla := []*endpoint.ClusterLoadAssignment{}
-	for _, c := range clusters {
-		cla = append(cla, c.LoadAssignment)
+func (fx *FakeXdsUpdater) WaitOrFail(t test.Failer, types ...string) *FakeXdsEvent {
+	t.Helper()
+	got := fx.Wait(types...)
+	if got == nil {
+		t.Fatal("missing event")
 	}
-	return ExtractEndpoints(cla)
+	return got
 }
 
-func ExtractEdsClusterNames(cl []*cluster.Cluster) []string {
-	res := []string{}
-	for _, c := range cl {
-		switch v := c.ClusterDiscoveryType.(type) {
-		case *cluster.Cluster_Type:
-			if v.Type != cluster.Cluster_EDS {
-				continue
+func (fx *FakeXdsUpdater) WaitDuration(duration time.Duration, types ...string) *FakeXdsEvent {
+	for {
+		select {
+		case e := <-fx.Events:
+			for _, et := range types {
+				if e.Kind == et {
+					return &e
+				}
 			}
+			continue
+		case <-time.After(duration):
+			return nil
 		}
-		res = append(res, c.Name)
 	}
-	return res
+}
+
+func (fx *FakeXdsUpdater) Wait(types ...string) *FakeXdsEvent {
+	return fx.WaitDuration(1*time.Second, types...)
+}
+
+// disableAuthorizationForSecret makes the authorization check always pass. Should be used only for tests.
+func disableAuthorizationForSecret(fake *fake.Clientset) {
+	fake.Fake.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &authorizationv1.SubjectAccessReview{
+			Status: authorizationv1.SubjectAccessReviewStatus{
+				Allowed: true,
+			},
+		}, nil
+	})
 }

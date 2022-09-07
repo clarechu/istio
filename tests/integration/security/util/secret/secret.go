@@ -1,3 +1,6 @@
+//go:build integ
+// +build integ
+
 //  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,14 +21,12 @@ import (
 	"crypto/x509"
 	"fmt"
 
-	"istio.io/istio/pkg/test"
+	v1 "k8s.io/api/core/v1"
 
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/security/pkg/k8s/chiron"
-	"istio.io/istio/security/pkg/k8s/controller"
 	"istio.io/istio/security/pkg/pki/ca"
 	"istio.io/istio/security/pkg/pki/util"
-
-	v1 "k8s.io/api/core/v1"
 )
 
 // ExamineDNSSecretOrFail calls ExamineDNSSecret and fails t if an error occurs.
@@ -45,7 +46,7 @@ func ExamineDNSSecret(secret *v1.Secret, expectedID string) error {
 			chiron.IstioDNSSecretType, secret.Type)
 	}
 
-	for _, key := range []string{ca.CertChainID, ca.RootCertID, ca.PrivateKeyID} {
+	for _, key := range []string{ca.CertChainFile, ca.RootCertFile, ca.PrivateKeyFile} {
 		if _, exists := secret.Data[key]; !exists {
 			return fmt.Errorf("%v does not exist in the data section", key)
 		}
@@ -58,8 +59,8 @@ func ExamineDNSSecret(secret *v1.Secret, expectedID string) error {
 		Host:        expectedID,
 	}
 
-	if err := util.VerifyCertificate(secret.Data[controller.PrivateKeyID],
-		secret.Data[controller.CertChainID], secret.Data[controller.RootCertID],
+	if err := util.VerifyCertificate(secret.Data[ca.PrivateKeyFile],
+		secret.Data[ca.CertChainFile], secret.Data[ca.RootCertFile],
 		verifyFields); err != nil {
 		return fmt.Errorf("certificate verification failed: %v", err)
 	}

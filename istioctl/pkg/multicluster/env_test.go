@@ -16,17 +16,17 @@ package multicluster
 
 import (
 	"bytes"
-	"io/ioutil"
+	"os"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/clientcmd/api/latest"
+
+	"istio.io/istio/pkg/kube"
 )
 
 var fakeKubeconfigData = `apiVersion: v1
@@ -51,7 +51,7 @@ users:
 func createFakeKubeconfigFileOrDie(t *testing.T) (string, *api.Config) {
 	t.Helper()
 
-	f, err := ioutil.TempFile("", "fakeKubeconfigForEnvironment")
+	f, err := os.CreateTemp("", "fakeKubeconfigForEnvironment")
 	if err != nil {
 		t.Fatalf("could not create fake kubeconfig file: %v", err)
 	}
@@ -95,14 +95,14 @@ func createFakeKubeconfigFileOrDie(t *testing.T) (string, *api.Config) {
 type fakeEnvironment struct {
 	KubeEnvironment
 
-	client                  *fake.Clientset
+	client                  kube.CLIClient
 	injectClientCreateError error
 	kubeconfig              string
 	wOut                    bytes.Buffer
 	wErr                    bytes.Buffer
 }
 
-func newFakeEnvironmentOrDie(t *testing.T, config *api.Config, objs ...runtime.Object) *fakeEnvironment {
+func newFakeEnvironmentOrDie(t *testing.T, minor string, config *api.Config, objs ...runtime.Object) *fakeEnvironment {
 	t.Helper()
 
 	var wOut, wErr bytes.Buffer
@@ -114,7 +114,7 @@ func newFakeEnvironmentOrDie(t *testing.T, config *api.Config, objs ...runtime.O
 			stderr:     &wErr,
 			kubeconfig: "unused",
 		},
-		client:     fake.NewSimpleClientset(objs...),
+		client:     kube.NewFakeClientWithVersion(minor, objs...),
 		kubeconfig: "unused",
 		wOut:       wOut,
 		wErr:       wErr,
@@ -123,16 +123,16 @@ func newFakeEnvironmentOrDie(t *testing.T, config *api.Config, objs ...runtime.O
 	return f
 }
 
-func (f *fakeEnvironment) CreateClientSet(context string) (kubernetes.Interface, error) {
+func (f *fakeEnvironment) CreateClient(_ string) (kube.CLIClient, error) {
 	if f.injectClientCreateError != nil {
 		return nil, f.injectClientCreateError
 	}
 	return f.client, nil
 }
 
-func (f *fakeEnvironment) Poll(interval, timeout time.Duration, condition ConditionFunc) error {
+func (f *fakeEnvironment) Poll(_, _ time.Duration, condition ConditionFunc) error {
 	// TODO - add hooks to inject fake timeouts
-	condition()
+	_, _ = condition()
 	return nil
 }
 

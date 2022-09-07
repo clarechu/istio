@@ -23,15 +23,12 @@ import (
 	"testing"
 	"time"
 
+	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	prometheus_model "github.com/prometheus/common/model"
 	v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
-
 	"istio.io/istio/pkg/kube"
-	testKube "istio.io/istio/pkg/test/kube"
-
-	prometheus_model "github.com/prometheus/common/model"
 )
 
 // mockPromAPI lets us mock calls to Prometheus API
@@ -39,8 +36,8 @@ type mockPromAPI struct {
 	cannedResponse map[string]prometheus_model.Value
 }
 
-func mockExecClientAuthNoPilot(_, _, _ string) (kube.ExtendedClient, error) {
-	return &testKube.MockClient{}, nil
+func mockExecClientAuthNoPilot(_, _, _ string) (kube.CLIClient, error) {
+	return &kube.MockClient{}, nil
 }
 
 func TestMetricsNoPrometheus(t *testing.T) {
@@ -72,7 +69,7 @@ func TestMetrics(t *testing.T) {
 	cases := []testCase{
 		{ // case 0
 			args:           strings.Split("experimental metrics details", " "),
-			expectedRegexp: regexp.MustCompile("Error: could not build port forwarder for prometheus"),
+			expectedRegexp: regexp.MustCompile("could not build metrics for workload"),
 			wantException:  true,
 		},
 	}
@@ -84,8 +81,8 @@ func TestMetrics(t *testing.T) {
 	}
 }
 
-func mockPortForwardClientAuthPrometheus(_, _, _ string) (kube.ExtendedClient, error) {
-	return &testKube.MockClient{
+func mockPortForwardClientAuthPrometheus(_, _, _ string) (kube.CLIClient, error) {
+	return &kube.MockClient{
 		DiscoverablePods: map[string]map[string]*v1.PodList{
 			"istio-system": {
 				"app=prometheus": {
@@ -111,24 +108,24 @@ var _ promv1.API = mockPromAPI{}
 func TestPrintMetrics(t *testing.T) {
 	mockProm := mockPromAPI{
 		cannedResponse: map[string]prometheus_model.Value{
-			"sum(rate(istio_requests_total{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\"}[1m]))": prometheus_model.Vector{ // nolint: lll
+			"sum(rate(istio_requests_total{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\"}[1m0s]))": prometheus_model.Vector{ // nolint: lll
 				&prometheus_model.Sample{Value: 0.04},
 			},
-			"sum(rate(istio_requests_total{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\",response_code=~\"[45][0-9]{2}\"}[1m]))": prometheus_model.Vector{}, // nolint: lll
-			"histogram_quantile(0.500000, sum(rate(istio_request_duration_seconds_bucket{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\"}[1m])) by (le))": prometheus_model.Vector{ // nolint: lll
-				&prometheus_model.Sample{Value: 0.0025},
+			"sum(rate(istio_requests_total{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\",response_code=~\"[45][0-9]{2}\"}[1m0s]))": prometheus_model.Vector{}, // nolint: lll
+			"histogram_quantile(0.500000, sum(rate(istio_request_duration_milliseconds_bucket{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\"}[1m0s])) by (le))": prometheus_model.Vector{ // nolint: lll
+				&prometheus_model.Sample{Value: 2.5},
 			},
-			"histogram_quantile(0.900000, sum(rate(istio_request_duration_seconds_bucket{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\"}[1m])) by (le))": prometheus_model.Vector{ // nolint: lll
-				&prometheus_model.Sample{Value: 0.0045},
+			"histogram_quantile(0.900000, sum(rate(istio_request_duration_milliseconds_bucket{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\"}[1m0s])) by (le))": prometheus_model.Vector{ // nolint: lll
+				&prometheus_model.Sample{Value: 4.5},
 			},
-			"histogram_quantile(0.990000, sum(rate(istio_request_duration_seconds_bucket{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\"}[1m])) by (le))": prometheus_model.Vector{ // nolint: lll
-				&prometheus_model.Sample{Value: 0.00495},
+			"histogram_quantile(0.990000, sum(rate(istio_request_duration_milliseconds_bucket{destination_workload=~\"details.*\", destination_workload_namespace=~\".*\",reporter=\"destination\"}[1m0s])) by (le))": prometheus_model.Vector{ // nolint: lll
+				&prometheus_model.Sample{Value: 4.95},
 			},
 		},
 	}
 	workload := "details"
 
-	sm, err := metrics(mockProm, workload)
+	sm, err := metrics(mockProm, workload, time.Minute)
 	if err != nil {
 		t.Fatalf("Unwanted exception %v", err)
 	}
@@ -142,7 +139,7 @@ func TestPrintMetrics(t *testing.T) {
                                    details        0.040        0.000          2ms          4ms          4ms
 `
 	if output != expectedOutput {
-		t.Fatalf("Unexpected output; got: %q\nwant: %q", output, expectedOutput)
+		t.Fatalf("Unexpected output; got:\n %q\nwant:\n %q", output, expectedOutput)
 	}
 }
 
@@ -170,12 +167,7 @@ func (client mockPromAPI) Flags(ctx context.Context) (promv1.FlagsResult, error)
 	return nil, nil
 }
 
-func (client mockPromAPI) LabelValues(_ context.Context, _ string,
-	_ time.Time, _ time.Time) (prometheus_model.LabelValues, promv1.Warnings, error) {
-	return nil, nil, nil
-}
-
-func (client mockPromAPI) Query(ctx context.Context, query string, ts time.Time) (prometheus_model.Value, promv1.Warnings, error) {
+func (client mockPromAPI) Query(ctx context.Context, query string, ts time.Time, opts ...promv1.Option) (prometheus_model.Value, promv1.Warnings, error) {
 	canned, ok := client.cannedResponse[query]
 	if !ok {
 		return prometheus_model.Vector{}, nil, nil
@@ -183,16 +175,31 @@ func (client mockPromAPI) Query(ctx context.Context, query string, ts time.Time)
 	return canned, nil, nil
 }
 
-func (client mockPromAPI) QueryRange(ctx context.Context, query string, r promv1.Range) (prometheus_model.Value, promv1.Warnings, error) {
+func (client mockPromAPI) TSDB(ctx context.Context) (promv1.TSDBResult, error) {
+	return promv1.TSDBResult{}, nil
+}
+
+func (client mockPromAPI) QueryRange(
+	ctx context.Context,
+	query string,
+	r promv1.Range,
+	opts ...promv1.Option,
+) (prometheus_model.Value, promv1.Warnings, error) {
 	canned, ok := client.cannedResponse[query]
 	if !ok {
 		return prometheus_model.Vector{}, nil, nil
 	}
 	return canned, nil, nil
+}
+
+func (client mockPromAPI) WalReplay(ctx context.Context) (promv1.WalReplayStatus, error) {
+	// TODO implement me
+	panic("implement me")
 }
 
 func (client mockPromAPI) Series(ctx context.Context, matches []string,
-	startTime time.Time, endTime time.Time) ([]prometheus_model.LabelSet, promv1.Warnings, error) {
+	startTime time.Time, endTime time.Time,
+) ([]prometheus_model.LabelSet, promv1.Warnings, error) {
 	return nil, nil, nil
 }
 
@@ -208,10 +215,6 @@ func (client mockPromAPI) Targets(ctx context.Context) (promv1.TargetsResult, er
 	return promv1.TargetsResult{}, nil
 }
 
-func (client mockPromAPI) LabelNames(ctx context.Context, startTime time.Time, endTime time.Time) ([]string, promv1.Warnings, error) {
-	return nil, nil, nil
-}
-
 func (client mockPromAPI) TargetsMetadata(ctx context.Context, matchTarget string, metric string, limit string) ([]promv1.MetricMetadata, error) {
 	return nil, nil
 }
@@ -221,5 +224,21 @@ func (client mockPromAPI) Runtimeinfo(ctx context.Context) (promv1.RuntimeinfoRe
 }
 
 func (client mockPromAPI) Metadata(ctx context.Context, metric string, limit string) (map[string][]promv1.Metadata, error) {
+	return nil, nil
+}
+
+func (client mockPromAPI) LabelNames(ctx context.Context, matches []string, startTime time.Time, endTime time.Time) ([]string, promv1.Warnings, error) {
+	return nil, nil, nil
+}
+
+func (client mockPromAPI) LabelValues(context.Context, string, []string, time.Time, time.Time) (prometheus_model.LabelValues, promv1.Warnings, error) {
+	return nil, nil, nil
+}
+
+func (client mockPromAPI) Buildinfo(ctx context.Context) (promv1.BuildinfoResult, error) {
+	return promv1.BuildinfoResult{}, nil
+}
+
+func (client mockPromAPI) QueryExemplars(ctx context.Context, query string, startTime time.Time, endTime time.Time) ([]promv1.ExemplarQueryResult, error) {
 	return nil, nil
 }

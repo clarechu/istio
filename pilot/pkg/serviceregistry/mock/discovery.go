@@ -20,37 +20,55 @@ import (
 	"time"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/host"
-	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/protocol"
-	"istio.io/istio/pkg/spiffe"
 )
 
-var (
-	// PortHTTPName is the HTTP port name
-	PortHTTPName = "http"
+// PortHTTPName is the HTTP port name
+var PortHTTPName = "http"
 
-	// Locality for mock endpoints
-	Locality = model.Locality{
-		Label:     "region/zone",
-		ClusterID: "",
+type ServiceArgs struct {
+	Hostname        host.Name
+	Address         string
+	ServiceAccounts []string
+	ClusterID       cluster.ID
+}
+
+func MakeServiceInstance(service *model.Service, port *model.Port, version int, locality model.Locality) *model.ServiceInstance {
+	if service.External() {
+		return nil
 	}
-)
 
-// NewDiscovery builds a memory ServiceDiscovery
-func NewDiscovery(services map[host.Name]*model.Service, versions int) *ServiceDiscovery {
-	return &ServiceDiscovery{
-		services: services,
-		versions: versions,
+	// we make port 80 same as endpoint port, otherwise, it's distinct
+	target := port.Port
+	if target != 80 {
+		target += 1000
+	}
+
+	return &model.ServiceInstance{
+		Endpoint: &model.IstioEndpoint{
+			Address:         MakeIP(service, version),
+			EndpointPort:    uint32(target),
+			ServicePortName: port.Name,
+			Labels:          map[string]string{"version": fmt.Sprintf("v%d", version)},
+			Locality:        locality,
+		},
+		Service:     service,
+		ServicePort: port,
 	}
 }
 
 // MakeService creates a memory service
-func MakeService(hostname host.Name, address string) *model.Service {
+func MakeService(args ServiceArgs) *model.Service {
 	return &model.Service{
 		CreationTime: time.Now(),
-		Hostname:     hostname,
-		Address:      address,
+		Hostname:     args.Hostname,
+		ClusterVIPs: model.AddressMap{
+			Addresses: map[cluster.ID][]string{args.ClusterID: {args.Address}},
+		},
+		DefaultAddress:  args.Address,
+		ServiceAccounts: args.ServiceAccounts,
 		Ports: []*model.Port{
 			{
 				Name:     PortHTTPName,
@@ -84,10 +102,10 @@ func MakeService(hostname host.Name, address string) *model.Service {
 // MakeExternalHTTPService creates memory external service
 func MakeExternalHTTPService(hostname host.Name, isMeshExternal bool, address string) *model.Service {
 	return &model.Service{
-		CreationTime: time.Now(),
-		Hostname:     hostname,
-		Address:      address,
-		MeshExternal: isMeshExternal,
+		CreationTime:   time.Now(),
+		Hostname:       hostname,
+		DefaultAddress: address,
+		MeshExternal:   isMeshExternal,
 		Ports: []*model.Port{{
 			Name:     "http",
 			Port:     80,
@@ -99,40 +117,15 @@ func MakeExternalHTTPService(hostname host.Name, isMeshExternal bool, address st
 // MakeExternalHTTPSService creates memory external service
 func MakeExternalHTTPSService(hostname host.Name, isMeshExternal bool, address string) *model.Service {
 	return &model.Service{
-		CreationTime: time.Now(),
-		Hostname:     hostname,
-		Address:      address,
-		MeshExternal: isMeshExternal,
+		CreationTime:   time.Now(),
+		Hostname:       hostname,
+		DefaultAddress: address,
+		MeshExternal:   isMeshExternal,
 		Ports: []*model.Port{{
 			Name:     "https",
 			Port:     443,
 			Protocol: protocol.HTTPS,
 		}},
-	}
-}
-
-// newServiceInstance creates a memory instance, version enumerates endpoints
-func newServiceInstance(service *model.Service, port *model.Port, version int, locality model.Locality) *model.ServiceInstance {
-	if service.External() {
-		return nil
-	}
-
-	// we make port 80 same as endpoint port, otherwise, it's distinct
-	target := port.Port
-	if target != 80 {
-		target += 1000
-	}
-
-	return &model.ServiceInstance{
-		Endpoint: &model.IstioEndpoint{
-			Address:         MakeIP(service, version),
-			EndpointPort:    uint32(target),
-			ServicePortName: port.Name,
-			Labels:          map[string]string{"version": fmt.Sprintf("v%d", version)},
-			Locality:        locality,
-		},
-		Service:     service,
-		ServicePort: port,
 	}
 }
 
@@ -142,125 +135,28 @@ func MakeIP(service *model.Service, version int) string {
 	if service.External() {
 		return ""
 	}
-	ip := net.ParseIP(service.Address).To4()
+	ip := net.ParseIP(service.DefaultAddress).To4()
 	ip[2] = byte(1)
 	ip[3] = byte(version)
 	return ip.String()
 }
 
-// ServiceDiscovery is a memory discovery interface
-type ServiceDiscovery struct {
-	services                      map[host.Name]*model.Service
-	versions                      int
-	WantGetProxyServiceInstances  []*model.ServiceInstance
-	ServicesError                 error
-	GetServiceError               error
-	InstancesError                error
-	GetProxyServiceInstancesError error
+type Controller struct {
+	serviceHandler model.ControllerHandlers
 }
 
-// Services implements discovery interface
-func (sd *ServiceDiscovery) Services() ([]*model.Service, error) {
-	if sd.ServicesError != nil {
-		return nil, sd.ServicesError
-	}
-	out := make([]*model.Service, 0, len(sd.services))
-	for _, service := range sd.services {
-		out = append(out, service)
-	}
-	return out, sd.ServicesError
+func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) {
+	c.serviceHandler.AppendServiceHandler(f)
 }
 
-// GetService implements discovery interface
-func (sd *ServiceDiscovery) GetService(hostname host.Name) (*model.Service, error) {
-	if sd.GetServiceError != nil {
-		return nil, sd.GetServiceError
-	}
-	val := sd.services[hostname]
-	return val, sd.GetServiceError
-}
-
-// InstancesByPort implements discovery interface
-func (sd *ServiceDiscovery) InstancesByPort(svc *model.Service, num int,
-	labels labels.Collection) ([]*model.ServiceInstance, error) {
-	if sd.InstancesError != nil {
-		return nil, sd.InstancesError
-	}
-	if _, ok := sd.services[svc.Hostname]; !ok {
-		return nil, sd.InstancesError
-	}
-	out := make([]*model.ServiceInstance, 0)
-	if svc.External() {
-		return out, sd.InstancesError
-	}
-	if port, ok := svc.Ports.GetByPort(num); ok {
-		for v := 0; v < sd.versions; v++ {
-			if labels.HasSubsetOf(map[string]string{"version": fmt.Sprintf("v%d", v)}) {
-				out = append(out, newServiceInstance(svc, port, v, Locality))
-			}
-		}
-	}
-	return out, sd.InstancesError
-}
-
-// GetProxyServiceInstances implements discovery interface
-func (sd *ServiceDiscovery) GetProxyServiceInstances(node *model.Proxy) ([]*model.ServiceInstance, error) {
-	if sd.GetProxyServiceInstancesError != nil {
-		return nil, sd.GetProxyServiceInstancesError
-	}
-	if sd.WantGetProxyServiceInstances != nil {
-		return sd.WantGetProxyServiceInstances, nil
-	}
-	out := make([]*model.ServiceInstance, 0)
-	for _, service := range sd.services {
-		if !service.External() {
-			for v := 0; v < sd.versions; v++ {
-				// Only one IP for memory discovery?
-				if node.IPAddresses[0] == MakeIP(service, v) {
-					for _, port := range service.Ports {
-						out = append(out, newServiceInstance(service, port, v, Locality))
-					}
-				}
-			}
-
-		}
-	}
-	return out, sd.GetProxyServiceInstancesError
-}
-
-func (sd *ServiceDiscovery) GetProxyWorkloadLabels(proxy *model.Proxy) (labels.Collection, error) {
-	if sd.GetProxyServiceInstancesError != nil {
-		return nil, sd.GetProxyServiceInstancesError
-	}
-	// no useful labels from the ServiceInstances created by newServiceInstance()
-	return nil, nil
-}
-
-// GetIstioServiceAccounts gets the Istio service accounts for a service hostname.
-func (sd *ServiceDiscovery) GetIstioServiceAccounts(svc *model.Service, ports []int) []string {
-	if svc.Hostname == "world.default.svc.cluster.local" {
-		return []string{
-			spiffe.MustGenSpiffeURI("default", "serviceaccount1"),
-			spiffe.MustGenSpiffeURI("default", "serviceaccount2"),
-		}
-	}
-	return make([]string, 0)
-}
-
-type Controller struct{}
-
-func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) error {
-	return nil
-}
-
-func (c *Controller) AppendInstanceHandler(f func(*model.ServiceInstance, model.Event)) error {
-	return nil
-}
-
-func (c *Controller) AppendWorkloadHandler(f func(*model.WorkloadInstance, model.Event)) error {
-	return nil
-}
+func (c *Controller) AppendWorkloadHandler(func(*model.WorkloadInstance, model.Event)) {}
 
 func (c *Controller) Run(<-chan struct{}) {}
 
 func (c *Controller) HasSynced() bool { return true }
+
+func (c *Controller) OnServiceEvent(s *model.Service, e model.Event) {
+	for _, h := range c.serviceHandler.GetServiceHandlers() {
+		h(s, e)
+	}
+}

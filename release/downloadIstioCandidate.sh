@@ -15,31 +15,31 @@
 # limitations under the License.
 
 #
-# Early version of a downloader/installer for Istio
-#
 # This file will be fetched as: curl -L https://git.io/getLatestIstio | sh -
 # so it should be pure bourne shell, not bash (and not reference other scripts)
 #
 # The script fetches the latest Istio release candidate and untars it.
-# It's derived from ../downloadIstio.sh which is for stable releases but lets
-# users do curl -L https://git.io/getLatestIstio | ISTIO_VERSION=0.3.6 sh -
-# for instance to change the version fetched.
+# You can pass variables on the command line to download a specific version
+# or to override the processor architecture. For example, to download
+# Istio 1.6.8 for the x86_64 architecture,
+# run curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.6.8 TARGET_ARCH=x86_64 sh -.
 
-# This is the latest release candidate (matches ../istio.VERSION after basic
-# sanity checks)
+set -e
 
+# Determines the operating system.
 OS="$(uname)"
-if [ "x${OS}" = "xDarwin" ] ; then
+if [ "${OS}" = "Darwin" ] ; then
   OSEXT="osx"
 else
-  # TODO we should check more/complain if not likely to work, etc...
   OSEXT="linux"
 fi
 
-if [ "x${ISTIO_VERSION}" = "x" ] ; then
-  ISTIO_VERSION=$(curl -L -s https://api.github.com/repos/istio/istio/releases | \
-                  grep tag_name | sed "s/ *\"tag_name\": *\"\\(.*\\)\",*/\\1/" | \
-		  grep -v -E "(alpha|beta|rc)\.[0-9]$" | sort -t"." -k 1,1 -k 2,2 -k 3,3 -k 4,4 | tail -n 1)
+# Determine the latest Istio version by version number ignoring alpha, beta, and rc versions.
+if [ "${ISTIO_VERSION}" = "" ] ; then
+  ISTIO_VERSION="$(curl -sL https://github.com/istio/istio/releases | \
+                  grep -o 'releases/[0-9]*.[0-9]*.[0-9]*/' | sort -V | \
+                  tail -1 | awk -F'/' '{ print $2}')"
+  ISTIO_VERSION="${ISTIO_VERSION##*/}"
 fi
 
 LOCAL_ARCH=$(uname -m)
@@ -47,21 +47,15 @@ if [ "${TARGET_ARCH}" ]; then
     LOCAL_ARCH=${TARGET_ARCH}
 fi
 
-case "${LOCAL_ARCH}" in 
-  x86_64)
+case "${LOCAL_ARCH}" in
+  x86_64|amd64)
     ISTIO_ARCH=amd64
     ;;
-  armv8*)
-    ISTIO_ARCH=arm64
-    ;;
-  aarch64*)
+  armv8*|aarch64*|arm64)
     ISTIO_ARCH=arm64
     ;;
   armv*)
     ISTIO_ARCH=armv7
-    ;;
-  amd64|arm64)
-    ISTIO_ARCH=${LOCAL_ARCH}
     ;;
   *)
     echo "This system's architecture, ${LOCAL_ARCH}, isn't supported"
@@ -69,34 +63,64 @@ case "${LOCAL_ARCH}" in
     ;;
 esac
 
-if [ "x${ISTIO_VERSION}" = "x" ] ; then
+if [ "${ISTIO_VERSION}" = "" ] ; then
   printf "Unable to get latest Istio version. Set ISTIO_VERSION env var and re-run. For example: export ISTIO_VERSION=1.0.4"
-  exit;
+  exit 1;
 fi
 
 NAME="istio-$ISTIO_VERSION"
 URL="https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istio-${ISTIO_VERSION}-${OSEXT}.tar.gz"
 ARCH_URL="https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istio-${ISTIO_VERSION}-${OSEXT}-${ISTIO_ARCH}.tar.gz"
 
-printf "Downloading %s from %s ..." "$NAME" "$URL"
-if ! curl -fsLO "$URL"
-then
-  printf "Failed.\n\nTrying with TARGET_ARCH. Downloading %s from %s ...\n" "$NAME" "$ARCH_URL"
-  if ! curl -fsLO "$ARCH_URL"
-  then
-    printf "\n\n"
-    printf "Unable to download Istio %s at this moment!\n" "$ISTIO_VERSION"
-    printf "Please verify the version you are trying to download.\n\n"
-    exit
-  else
-    filename="istio-${ISTIO_VERSION}-${OSEXT}-${ISTIO_ARCH}.tar.gz"
-    tar -xzf "${filename}"
-    rm "${filename}"
+with_arch() {
+  printf "\nDownloading %s from %s ...\n" "$NAME" "$ARCH_URL"
+  if ! curl -o /dev/null -sIf "$ARCH_URL"; then
+    printf "\n%s is not found, please specify a valid ISTIO_VERSION and TARGET_ARCH\n" "$ARCH_URL"
+    exit 1
   fi
-else
+  curl -fsLO "$ARCH_URL"
+  filename="istio-${ISTIO_VERSION}-${OSEXT}-${ISTIO_ARCH}.tar.gz"
+  tar -xzf "${filename}"
+  rm "${filename}"
+}
+
+without_arch() {
+  printf "\nDownloading %s from %s ..." "$NAME" "$URL"
+  if ! curl -o /dev/null -sIf "$URL"; then
+    printf "\n%s is not found, please specify a valid ISTIO_VERSION\n" "$URL"
+    exit 1
+  fi
+  curl -fsLO "$URL"
   filename="istio-${ISTIO_VERSION}-${OSEXT}.tar.gz"
   tar -xzf "${filename}"
   rm "${filename}"
+}
+
+# Istio 1.6 and above support arch
+# Istio 1.5 and below do not have arch support
+ARCH_SUPPORTED="1.6"
+# Istio 1.10 and above support arch for osx arm64
+ARCH_SUPPORTED_OSX="1.10"
+
+if [ "${OS}" = "Linux" ] ; then
+  # This checks if ISTIO_VERSION is less than ARCH_SUPPORTED (version-sort's before it)
+  if [ "$(printf '%s\n%s' "${ARCH_SUPPORTED}" "${ISTIO_VERSION}" | sort -V | head -n 1)" = "${ISTIO_VERSION}" ]; then
+    without_arch
+  else
+    with_arch
+  fi
+elif [ "${OS}" = "Darwin" ] ; then
+  # This checks if ISTIO_VERSION is less than ARCH_SUPPORTED_OSX (version-sort's before it) or ISTIO_ARCH not equal to arm64
+  if [ "$(printf '%s\n%s' "${ARCH_SUPPORTED_OSX}" "${ISTIO_VERSION}" | sort -V | head -n 1)" = "${ISTIO_VERSION}" ] || [ "${ISTIO_ARCH}" != "arm64" ]; then
+    without_arch
+  else
+    with_arch
+  fi
+else
+  printf "\n\n"
+  printf "Unable to download Istio %s at this moment!\n" "$ISTIO_VERSION"
+  printf "Please verify the version you are trying to download.\n\n"
+  exit 1
 fi
 
 printf ""
@@ -106,13 +130,13 @@ printf "Istio has been successfully downloaded into the %s folder on your system
 printf "\n"
 BINDIR="$(cd "$NAME/bin" && pwd)"
 printf "Next Steps:\n"
-printf "See https://istio.io/docs/setup/kubernetes/install/ to add Istio to your Kubernetes cluster.\n"
+printf "See https://istio.io/latest/docs/setup/install/ to add Istio to your Kubernetes cluster.\n"
 printf "\n"
 printf "To configure the istioctl client tool for your workstation,\n"
 printf "add the %s directory to your environment path variable with:\n" "$BINDIR"
 printf "\t export PATH=\"\$PATH:%s\"\n" "$BINDIR"
 printf "\n"
-printf "Begin the Istio pre-installation verification check by running:\n"
-printf "\t istioctl verify-install \n"
+printf "Begin the Istio pre-installation check by running:\n"
+printf "\t istioctl x precheck \n"
 printf "\n"
-printf "Need more information? Visit https://istio.io/docs/setup/kubernetes/install/ \n"
+printf "Need more information? Visit https://istio.io/latest/docs/setup/install/ \n"
